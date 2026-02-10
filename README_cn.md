@@ -64,7 +64,7 @@ Lsglang已验证的大部分原版MOE模型
 | float16 | bfloat16/float16| 
 | fp8模型 | fp8、fp8+bfloat16、fp8+W4A16 | 
 | awq 4bit对称量化模型 <sup>注1</sup>| W4A16 | 
-W
+
 注1：https://hf-mirror.com/cyankiwi 提供AWQ 4bit对称量化模型
 
 ## 性能参考
