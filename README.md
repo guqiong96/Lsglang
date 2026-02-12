@@ -165,8 +165,8 @@ If you have already installed Lsglang and need to update to the latest version, 
 git fetch && git reset --hard origin/main && git clean -fd # This command is suitable for regular users; users who want to keep local modifications should know how to handle it in advance
 
 # Install PyTorch 2.9.1
-pip uninstall torchaudio triton torchvision torch
-pip install torchaudio triton torchvision torch==2.9.1
+pip uninstall torchaudio triton torchvision torch xformers sglang
+pip install torchaudio triton torchvision xformers torch==2.9.1
 
 # Qwen3-VL GLM4.6V requires xformers
 
@@ -176,6 +176,7 @@ pip uninstall sglang lk_moe
 # Compile and install
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 pip install nvidia-cudnn-cu12==9.16.0.29
+rm -rf ~/.cache/flashinfer
 ```
 
 ## Optimization

@@ -173,8 +173,8 @@ pip install nvidia-cudnn-cu12==9.16.0.29
 git fetch && git reset --hard origin/main && git clean -fd # 此命令适合普通用户，如果保留本地修改内容的用户应知道提前做处理
 
 # 安装PyTorch 2.9.1 
-pip uninstall torchaudio triton torchvision torch
-pip install torchaudio triton torchvision torch==2.9.1
+pip uninstall torchaudio triton torchvision torch xformers sglang
+pip install torchaudio triton torchvision xformers torch==2.9.1
 
 # Qwen3-VL GLM4.6V 需要安装 xformers
 
@@ -184,6 +184,7 @@ pip uninstall sglang lk_moe
 # 编译安装  
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 pip install nvidia-cudnn-cu12==9.16.0.29
+rm -rf ~/.cache/flashinfer
  
 ```
  
