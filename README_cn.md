@@ -15,6 +15,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 
 ## 使用说明 [[English]](./README.md)
 - [版本变更](#版本变更)
+- [如何运行GLM5](#如何运行GLM5)
 - [支持的模型](#支持的模型)
 - [性能参考](#性能参考)
 - [运行命令](#运行命令)
@@ -30,6 +31,32 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
  
 ```
 
+## 如何运行GLM5
+
+1、安装或更新Lsglang到最新版本[按照文档内的安装步骤或更新步骤]
+
+2、安装最新的transformers
+```bash  
+git clone https://github.com/huggingface/transformers.git
+cd transformers
+pip uninstall transformers -y
+pip install -e ".[torch]" --no-cache-dir
+```
+
+3、运行
+```bash 
+LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
+    --model "/home/guqiong/Models/GLM-5-FP8" \
+    --served-model-name "GLM-5-FP8" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45
+```
+
 ## 支持的模型
 
 Lsglang已验证的大部分原版MOE模型
@@ -41,6 +68,7 @@ Lsglang已验证的大部分原版MOE模型
 | Qwen3-Coder-30B-A3B-Instruct | ✅ 已测试通过 |
 | Qwen3-VL-30B-A3B-Instruct | ✅ 已测试通过 | 
 | MiniMax-M2.1 | ✅ 已测试通过 |
+| GLM-5 | ✅ 已测试通过 |
 | GLM-4.7 | ✅ 已测试通过 |
 | GLM-4.7-Flash  | ✅ 已测试通过 |
 | GLM-4.6V | ✅ 已测试通过 |
@@ -146,7 +174,7 @@ git clone https://github.com/guqiong96/Lsglang.git
 cd Lsglang
 
 # 安装PyTorch 2.9.1
-pip install torch==2.9.1 xformers
+pip install torch==2.9.1
   
 ```
  
@@ -173,8 +201,8 @@ pip install nvidia-cudnn-cu12==9.16.0.29
 git fetch && git reset --hard origin/main && git clean -fd # 此命令适合普通用户，如果保留本地修改内容的用户应知道提前做处理
 
 # 安装PyTorch 2.9.1 
-pip uninstall torchaudio triton torchvision torch xformers sglang
-pip install torchaudio triton torchvision xformers torch==2.9.1
+pip uninstall torchaudio triton torchvision torch sglang
+pip install torchaudio triton torchvision torch==2.9.1
 
 # Qwen3-VL GLM4.6V 需要安装 xformers
 

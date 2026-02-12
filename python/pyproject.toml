@@ -75,7 +75,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "lk_moe==1.7.5",
+  "lk_moe==1.7.6",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py

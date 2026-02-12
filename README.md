@@ -15,6 +15,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 ## Usage Guide [[中文]](./README_cn.md)
 - [Version Changes](#version-changes)
+- [How to Run GLM5](#how-to-run-glm5)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
 - [Run Commands](#run-commands)
@@ -27,6 +28,33 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 ```bash
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
+```
+
+
+## How to Run GLM5
+
+1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
+
+2、Install the latest transformers
+```bash  
+git clone https://github.com/huggingface/transformers.git
+cd transformers
+pip uninstall transformers -y
+pip install -e ".[torch]" --no-cache-dir
+```
+
+3、Run GLM5
+```bash 
+LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
+    --model "/home/guqiong/Models/GLM-5-FP8" \
+    --served-model-name "GLM-5-FP8" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45
 ```
 
 ## Supported Models
@@ -141,7 +169,7 @@ git clone https://github.com/guqiong96/Lsglang.git
 cd Lsglang
 
 # Install PyTorch 2.9.1
-pip install torch==2.9.1 xformers
+pip install torch==2.9.1
 ```
 
 ### 4. Install Lsglang
@@ -165,8 +193,8 @@ If you have already installed Lsglang and need to update to the latest version, 
 git fetch && git reset --hard origin/main && git clean -fd # This command is suitable for regular users; users who want to keep local modifications should know how to handle it in advance
 
 # Install PyTorch 2.9.1
-pip uninstall torchaudio triton torchvision torch xformers sglang
-pip install torchaudio triton torchvision xformers torch==2.9.1
+pip uninstall torchaudio triton torchvision torch sglang
+pip install torchaudio triton torchvision torch==2.9.1
 
 # Qwen3-VL GLM4.6V requires xformers
 
