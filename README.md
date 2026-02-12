@@ -43,7 +43,7 @@ pip uninstall transformers -y
 pip install -e ".[torch]" --no-cache-dir
 ```
 
-3、Run GLM5
+3、Run GLM5 [SM90 architecture and above]
 ```bash 
 LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
     --model "/home/guqiong/Models/GLM-5-FP8" \
