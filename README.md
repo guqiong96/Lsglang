@@ -55,6 +55,7 @@ LK_THREADS=44 \
 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/GLM-5-FP8" \
     --served-model-name "GLM-5-FP8" \
@@ -150,6 +151,7 @@ LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREAD
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | None | MoE expert layers resident in GPU memory `0`: layer 0, `0-1`: layers 0 to 1, `0,9`: layers 0 and 9 | After reserving enough KV Cache memory, allocating multiple layers can increase performance and reduce corresponding memory usage, including layer 0 for acceleration |
 | `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable CPU power saving mode | Recommended value: `0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`: fast model loading, `1`: slow model loading to avoid OOM | Recommended value: use `0` when memory is sufficient, use `1` when memory is tight |
+| `LVLLM_MOE_QUANT_ON_GPU` | Performance Parameter | 0 | `0`：enable CPU expert quantization, `1`：enable GPU expert quantization | enable if GPU memory is abundant (only effective at loading time, inference will not occupy extra GPU memory)，accelerate model loading speed |
 
 ## Installation Steps
 

@@ -4218,6 +4218,9 @@ def is_lk_moe_feature_enabled() -> bool:
 def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
 
+def is_lk_moe_quant_on_gpu() -> bool:
+    return get_bool_env_var("LVLLM_MOE_QUANT_ON_GPU")
+
 def is_lk_moe_use_gpu_prefill() -> bool:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
 

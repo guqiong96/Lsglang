@@ -55,6 +55,7 @@ LK_THREADS=44 \
 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/GLM-5-FP8" \
     --served-model-name "GLM-5-FP8" \
@@ -155,7 +156,7 @@ LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREAD
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
 | `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 0 | `0`：快速加载模型，`1`：慢速加载模型可避免OOM | 建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1` |
-
+| `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | 0 | `0`：不启用GPU专家量化，`1`：启用GPU专家量化 | 显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度 |
 
 ## 安装步骤
 
