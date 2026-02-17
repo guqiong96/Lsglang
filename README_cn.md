@@ -17,10 +17,10 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 - [版本变更](#版本变更)
 - [如何运行Qwen3.5](#如何运行qwen35)
 - [如何运行GLM5](#如何运行glm5)
+- [如何运行MiniMax-M2.5](#如何运行minimax-m25)
 - [支持的模型](#支持的模型)
 - [性能参考](#性能参考)
-- [运行命令](#运行命令)
-- [配置文件](#配置文件)
+- [配置参数](#配置参数)
 - [安装步骤](#安装步骤) 
 - [更新](#更新)
 - [优化](#优化)
@@ -28,6 +28,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 ## 版本变更
  
 ```bash  
+2026-02-26: Lsglang-v1.0.3 - 修复已知问题，增加新模型支持   
 2026-02-10：Lsglang-v1.0.0 -  来自LvLLM项目[https://github.com/guqiong96/Lvllm]的移植，验证了BF16、F16原版模型、FP8原版模型、AWQ 4bit对称量化模型。
  
 ```
@@ -61,7 +62,7 @@ python -m sglang.launch_server \
     --max-total-tokens 16384 \
     --mem-fraction-static 0.90 
 
-    
+
     # Multi-Token Prediction (MTP) \
     # --reasoning-parser qwen3 \
     # --speculative-algo NEXTN \
@@ -73,6 +74,37 @@ python -m sglang.launch_server \
 
 ```
 
+## 如何运行MiniMax-M2.5
+ 
+```bash 
+# 未启用GPU预填充
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --served-model-name MiniMax-M2.5 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --enable-p2p-check \
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser minimax-m2 \
+    --reasoning-parser minimax-append-think
+
+    # --fp8-gemm-backend "triton" \
+```
 
 ## 如何运行glm5
 
@@ -173,39 +205,7 @@ Lsglang已验证的大部分原版MOE模型
 
 注1：开启GPU预填充，输入长度32K-64K
 
-## 运行命令
- 
-```bash 
-# 未启用GPU预填充
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 OMP_NUM_THREADS=44 \
-LVLLM_MOE_USE_WEIGHT=INT4 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
-LVLLM_MOE_QUANT_ON_GPU=1 \
-NCCL_SOCKET_IFNAME=lo \
-NCCL_IB_DISABLE=1 \
-GLOO_SOCKET_IFNAME=lo \
-NCCL_SOCKET_TIMEOUT=600000 \
-python -m sglang.launch_server \
-    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
-    --served-model-name MiniMax-M2.5 \
-    --host 0.0.0.0 \
-    --port 8070 \
-    --trust-remote-code \
-    --tensor-parallel-size 2 \
-    --max-running-requests 4 \
-    --enable-p2p-check \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
-    --mem-fraction-static 0.90 \
-    --tool-call-parser minimax-m2 \
-    --reasoning-parser minimax-append-think
-
-    # --fp8-gemm-backend "triton" \
-```
-
- 
+## 配置参数
 
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
 |--------|------|--------|------|------|
@@ -339,6 +339,16 @@ LK_POWER_SAVING=1 # 开启后推理时降低CPU温度，性能轻微降低
 ### FP8模型权重运行时格式
 ```bash
 LVLLM_MOE_USE_WEIGHT=INT4 # 模型MoE专家权重使用W4A16推理，其余部分依旧为FP8，开启几乎不影响精度， 速度排序：INT4 > TO_DTYPE > KEEP
+```
+
+### 模型加载
+```bash
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 # 慢速加载模型可避免OOM，建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1`
+```
+
+### 模型加载专家量化
+```bash
+LVLLM_MOE_QUANT_ON_GPU=1 # 启用GPU专家量化，建议值：显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度
 ```
 
 

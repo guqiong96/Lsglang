@@ -16,11 +16,11 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Usage Guide [[中文]](./README_cn.md)
 - [Version Changes](#version-changes)
 - [How to Run Qwen3.5](#how-to-run-qwen35)
+- [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
 - [How to Run GLM5](#how-to-run-glm5)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
-- [Run Commands](#run-commands)
-- [Configuration Files](#configuration-files)
+- [Configuration Parameters](#configuration-parameters)
 - [Installation Steps](#installation-steps)
 - [Update](#update)
 - [Optimization](#optimization)
@@ -28,6 +28,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
+2026-02-26: Lsglang-v1.0.3 - fix known issues, support new models  
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
 
@@ -61,7 +62,7 @@ python -m sglang.launch_server \
     --max-total-tokens 16384 \
     --mem-fraction-static 0.90
 
-    
+
     # Multi-Token Prediction (MTP) \
     # --reasoning-parser qwen3 \
     # --speculative-algo NEXTN \
@@ -71,6 +72,39 @@ python -m sglang.launch_server \
     # Processing Ultra-Long Texts
     # --json-model-override-args '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' 
 
+```
+
+## how-to-run-minimax-m2.5
+
+```bash 
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
+LVLLM_MOE_QUANT_ON_GPU=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --served-model-name "MiniMax-M2.5" \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --enable-p2p-check \
+    --chunked-prefill-size 16384 \
+    --max-total-tokens 16384 \
+    --mem-fraction-static 0.90
+    
+# --fp8-gemm-backend triton \
+```
+
+```bash
+# When encountering performance issues, try binding threads to NUMA nodes and reducing the number of threads
 ```
 
 
@@ -164,40 +198,7 @@ Note 1: https://hf-mirror.com/cyankiwi provides AWQ 4-bit symmetric quantization
 
 Note 1: GPU prefill enabled, input length 32K-64K
 
-## Run Commands
-
-```bash
-# Without GPU prefill
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 OMP_NUM_THREADS=44 \
-LVLLM_MOE_USE_WEIGHT=INT4 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
-LVLLM_MOE_QUANT_ON_GPU=0 \
-NCCL_SOCKET_IFNAME=lo \
-NCCL_IB_DISABLE=1 \
-GLOO_SOCKET_IFNAME=lo \
-NCCL_SOCKET_TIMEOUT=600000 \
-python -m sglang.launch_server \
-    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
-    --served-model-name "MiniMax-M2.5" \
-    --host 0.0.0.0 \
-    --port 8070 \
-    --trust-remote-code \
-    --tensor-parallel-size 2 \
-    --max-running-requests 4 \
-    --enable-p2p-check \
-    --chunked-prefill-size 16384 \
-    --max-total-tokens 16384 \
-    --mem-fraction-static 0.90
-    
-# --fp8-gemm-backend triton \
-```
-
-```bash
-# When encountering performance issues, try binding threads to NUMA nodes and reducing the number of threads
-```
-
+## Configuration Parameters
 | Environment Variable | Type | Default | Description | Remarks |
 |----------------------|------|---------|-------------|---------|
 | `LVLLM_MOE_NUMA_ENABLED` | Core Parameter | `0` | Whether to enable hybrid inference: `1`-enable, `0`-disable | Set to `0` to disable hybrid inference, behavior is the same as sglang |
@@ -327,4 +328,13 @@ LK_POWER_SAVING=1 # Reduce CPU temperature during inference, slight performance 
 ### FP8 Model Weight Runtime Format
 ```bash
 LVLLM_MOE_USE_WEIGHT=INT4 # MoE expert weights use W4A16 inference, other parts remain FP8, almost no impact on accuracy, speed order: INT4 > TO_DTYPE > KEEP
+```
+### Model Loading with NUMA Interleaving
+```bash
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 # Slow model loading can prevent OOM. Recommended values: use `0` when memory is sufficient during model file loading, use `1` when memory is limited.
+```
+
+### Model Loading with GPU Expert Quantization
+```bash
+LVLLM_MOE_QUANT_ON_GPU=1 # Enable GPU expert quantization, recommended values: enable when sufficient GPU memory is available (only effective during model loading, not during inference), speed up model loading
 ```
