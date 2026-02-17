@@ -74,7 +74,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
  
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
 
 if is_flashinfer_available():
     from flashinfer import fp4_quantize
@@ -98,6 +97,7 @@ import threading
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.common import MoeComputeStrategy
 from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 if is_lk_moe_feature_enabled():
     import  lk_moe
     GGML_TYPE_TO_TORCH_DTYPE = {
@@ -1034,7 +1034,7 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id,
                 )
         else:
-            if get_is_capture_mode(): 
+            if get_is_capture_mode() or not is_lk_moe_use_gpu_prefill(): 
                 return self.forward_impl(hidden_states, topk_output)
             elif hidden_states.size(0) < get_gpu_prefill_min_batch_size():
                 return self.forward_impl(hidden_states, topk_output)
@@ -1275,16 +1275,13 @@ class FusedMoE(torch.nn.Module):
             logger.info(f"Initialized lk_moe with {self.moe_runner_config.num_local_experts} experts for layer {self.layer_id} [" + 
             ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
             return
-        try:  
-            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
-            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod 
-           
+        try:
+       
             find_weight = False  
             with torch.no_grad():
-                if isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod) \
-                    and hasattr(self.quant_method, 'strategy'):
+                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod):
     
-                    self._process_compressed_tensors_weights(self.quant_method.strategy)
+                    self._process_compressed_tensors_weights()
                     find_weight = True 
                      
                  
@@ -1293,20 +1290,17 @@ class FusedMoE(torch.nn.Module):
                     if strategy == MoeComputeStrategy.KEEP:
                         self._process_fp8_weights(self.quant_method.block_quant)
                     elif strategy == MoeComputeStrategy.TO_DTYPE:
-                        self._process_block_weights()
+                        if self.quant_method.block_quant:
+                            self._process_block_weights()
+                        else:
+                            self._process_channel_weights() 
                     else:
-                        self._process_block_weights_quant(strategy)
+                        if self.quant_method.block_quant:
+                            self._process_block_weights_quant(strategy)
+                        else:
+                            self._process_channel_weights_quant(strategy)
                     find_weight = True
                     
-                if isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
-                    strategy = get_moe_compute_strategy()
-                    if strategy == MoeComputeStrategy.KEEP:
-                        self._process_fp8_weights(False)
-                    elif strategy == MoeComputeStrategy.TO_DTYPE:
-                        self._process_channel_weights() 
-                    else:
-                        self._process_channel_weights_quant(strategy)
-                    find_weight = True
                 if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
                     self._process_regular_weights()
                     find_weight = True
@@ -1411,7 +1405,7 @@ class FusedMoE(torch.nn.Module):
                                             requires_grad=False
                                         ))
                                 
-                if isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod) \
+                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) \
                     and hasattr(self.quant_method, 'strategy'):
                     param_names = [
                         "w13_weight_packed",
@@ -1530,31 +1524,20 @@ class FusedMoE(torch.nn.Module):
         
         return scale_expanded
      
-    def _process_compressed_tensors_weights(self, strategy: str): 
+    def _process_compressed_tensors_weights(self): 
          
         w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
         w2_weight = self.w2_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
         w13_scale = self.w13_weight_scale.cpu().transpose(1, 2).contiguous()
-        w2_scale = self.w2_weight_scale.cpu().transpose(1, 2).contiguous() 
-        
-        from compressed_tensors.quantization import QuantizationStrategy
-      
-        if strategy == QuantizationStrategy.GROUP:
-           pass
-            
-        elif strategy == QuantizationStrategy.BLOCK:
-            pass
-        else:
-            raise ValueError("compressed Weights are not supported for lk moe ...")
-        
+        w2_scale = self.w2_weight_scale.cpu().transpose(1, 2).contiguous()  
  
         
         hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
         scale_ggml_type = self.get_ggml_type_from_dtype(w13_scale.dtype)
-        
-        group_size = self.quant_method.group_size        # 32
-        num_bits = self.quant_method.num_bits            # 4
-        packed_factor = self.quant_method.packed_factor  # 8 （bit)
+        weights_config = self.quant_method.quantization_config.config['config_groups']['group_0']['weights']
+        group_size = weights_config['group_size']        # 32
+        num_bits = weights_config['num_bits']            # 4
+        packed_factor = 8  # 8 （bit)
          
  
         weights_per_container = packed_factor // num_bits  # 2
@@ -2605,6 +2588,8 @@ def moe_cleanup(layer_idx: int, hidden_states: torch.Tensor,
             forward_context: MoEForwardContext): 
     if get_is_capture_mode(): 
         return
+    if not is_lk_moe_use_gpu_prefill(): 
+        return
     if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
         return
     
@@ -2640,6 +2625,8 @@ def moe_cleanup(layer_idx: int, hidden_states: torch.Tensor,
 def moe_prefetch(layer_idx: int, hidden_states: torch.Tensor, 
                 forward_context: MoEForwardContext, gpu_prefetch_window: int): 
     if get_is_capture_mode():
+        return
+    if not is_lk_moe_use_gpu_prefill(): 
         return
     
     if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
@@ -2913,7 +2900,7 @@ def moe_prepare_gpu_prefill(layer, forward_context: MoEForwardContext, device: t
             with torch.cuda.stream(prefetch_stream):
                 if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
                     moe_prepare_gpu_prefill_regular(layer, forward_context, device)
-                elif isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod) :
+                elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod) :
                     moe_prepare_gpu_prefill_wna16(layer, forward_context, device)
                 elif isinstance(layer.quant_method, Fp8MoEMethod):
                     moe_prepare_gpu_prefill_fp8(layer, forward_context, device)
@@ -2930,7 +2917,7 @@ def moe_clean_gpu_prefill(layer):
     with torch.no_grad():
         if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
             moe_clean_gpu_prefill_regular(layer)
-        elif isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod):
+        elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod):
             moe_clean_gpu_prefill_wna16(layer)
         elif isinstance(layer.quant_method, Fp8MoEMethod):
             moe_clean_gpu_prefill_fp8(layer)
@@ -2940,6 +2927,8 @@ def moe_clean_gpu_prefill(layer):
 def moe_wait_prefetch(layer, forward_context: MoEForwardContext):
     if get_is_capture_mode():
         return
+    if not is_lk_moe_use_gpu_prefill(): 
+        return 
     if not hasattr(forward_context, '_prefetch_events'):
         return 
     layer_id = id(layer)

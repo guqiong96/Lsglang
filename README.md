@@ -15,6 +15,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 ## Usage Guide [[中文]](./README_cn.md)
 - [Version Changes](#version-changes)
+- [How to Run Qwen3.5](#how-to-run-qwen35)
 - [How to Run GLM5](#how-to-run-glm5)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
@@ -30,8 +31,50 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
 
+## how-to-run-qwen35
 
-## How to Run GLM5
+1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
+
+2、Run Qwen3.5-397B-A17B
+```bash
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Qwen3.5-397B-A17B" \
+    --served-model-name "Qwen3.5-397B-A17B" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --enable-p2p-check \
+    --max-running-requests 4 \
+    --disable-shared-experts-fusion \
+    --attention-backend "flashinfer" \
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 16384 \
+    --mem-fraction-static 0.90 \
+    # Multi-Token Prediction (MTP) \
+    # --reasoning-parser qwen3 \
+    # --speculative-algo NEXTN \
+    # --speculative-num-steps 3 \
+    # --speculative-eagle-topk 1 \
+    # --speculative-num-draft-tokens 4 \
+    # Processing Ultra-Long Texts
+    # --json-model-override-args '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' 
+
+```
+
+
+## how-to-run-glm5
+
+[SM90 SM100 architecture]
 
 1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
 
@@ -45,35 +88,28 @@ pip install -e ".[torch]" --no-cache-dir
 
 3、Run GLM5 [SM90 SM100 architecture]
 ```bash 
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
+LVLLM_MOE_QUANT_ON_GPU=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
 NCCL_SOCKET_TIMEOUT=600000 \
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 \
-OMP_NUM_THREADS=44 \
-LVLLM_MOE_USE_WEIGHT=INT4 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/GLM-5-FP8" \
-    --served-model-name "GLM-5-FP8" \
-    --host "0.0.0.0" \
-    --port "8070" \
+    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --served-model-name "MiniMax-M2.5" \
+    --host 0.0.0.0 \
+    --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --enable-p2p-check \
     --max-running-requests 4 \
-    --tool-call-parser glm47 \
-    --reasoning-parser glm45 \
-    --fp8-gemm-backend "triton" \
-    # --nsa-prefill-backend "tilelang" \
-    # --nsa-decode-backend "tilelang" \
-    --disable-shared-experts-fusion \
-    --attention-backend "flashinfer" \
-    --chunked-prefill-size 40000 \
-    --max-total-tokens 40000 \
+    --enable-p2p-check \
+    # --fp8-gemm-backend "triton" \
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 32768 \
     --mem-fraction-static 0.90
 ```
 
@@ -83,6 +119,7 @@ Most verified original MoE models in Lsglang:
 
 | Model Name | Status |
 |------------|--------|
+| Qwen3.5-397B-A17B | ✅ Tested |
 | Qwen3-Coder-Next | ✅ Tested |
 | Qwen3-Next-80B-A3B-Instruct | ✅ Tested |
 | Qwen3-Coder-30B-A3B-Instruct | ✅ Tested |
@@ -125,16 +162,30 @@ Note 1: GPU prefill enabled, input length 32K-64K
 
 ```bash
 # Without GPU prefill
-LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/Kimi-K2.5" \
-    --served-model-name "Kimi-K2.5" \
-    --host "0.0.0.0" \
-    --port "8070" \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
+LVLLM_MOE_QUANT_ON_GPU=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --served-model-name "MiniMax-M2.5" \
+    --host 0.0.0.0 \
+    --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
-    --tool-call-parser kimi_k2 \
-    --reasoning-parser kimi_k2
+    --enable-p2p-check \
+    --chunked-prefill-size 16384 \
+    --max-total-tokens 16384 \
+    --mem-fraction-static 0.90
+    
+# --fp8-gemm-backend triton \
 ```
 
 ```bash

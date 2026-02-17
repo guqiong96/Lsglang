@@ -26,37 +26,7 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int, tp_size: int):
         with _mp_set_executable(executable=executable, debug_str=debug_str):
             yield
     elif is_numa_interleave_enabled():
-        try:
-            result = subprocess.run(['numactl', '--hardware'], capture_output=True, text=True)
-            match = re.search(r'available: (\d+) nodes', result.stdout)
-            num_numa_nodes = int(match.group(1)) if match else 1
-        except:
-            num_numa_nodes = 1
-         
-        num_gpus = tp_size
-        
-        if num_numa_nodes >= num_gpus: 
-            nodes_per_gpu = num_numa_nodes // num_gpus
-            start_node = gpu_id * nodes_per_gpu
-            if gpu_id == num_gpus - 1:
-                end_node = num_numa_nodes - 1
-            else:
-                end_node = start_node + nodes_per_gpu - 1
-            
-            if start_node == end_node:
-                numa_config = str(start_node)
-            else:
-                numa_config = f"{start_node}-{end_node}"
-            mode = "Exclusive Nodes"
-        else: 
-            gpus_per_node = num_gpus // num_numa_nodes
-            node_id = gpu_id // gpus_per_node
-            node_id = min(node_id, num_numa_nodes - 1)
-            numa_config = str(node_id)
-            mode = "Shared Nodes"
-        
-        logger.info(f"gpu_id: {gpu_id}, tp_size: {tp_size}, numa_config: {numa_config}, mode: {mode}")
-        numactl_args = f"--cpunodebind={numa_config} --membind={numa_config}"
+        numactl_args = "--interleave=all"
         executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
         with _mp_set_executable(executable=executable, debug_str=debug_str):
             yield

@@ -15,7 +15,8 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 
 ## 使用说明 [[English]](./README.md)
 - [版本变更](#版本变更)
-- [如何运行GLM5](#如何运行GLM5)
+- [如何运行Qwen3.5](#如何运行qwen35)
+- [如何运行GLM5](#如何运行glm5)
 - [支持的模型](#支持的模型)
 - [性能参考](#性能参考)
 - [运行命令](#运行命令)
@@ -30,8 +31,50 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 2026-02-10：Lsglang-v1.0.0 -  来自LvLLM项目[https://github.com/guqiong96/Lvllm]的移植，验证了BF16、F16原版模型、FP8原版模型、AWQ 4bit对称量化模型。
  
 ```
+## 如何运行qwen35
 
-## 如何运行GLM5 [SM90 SM100 架构]
+1、安装或更新Lsglang到最新版本[按照文档内的安装步骤或更新步骤]
+
+2、运行
+```bash
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Qwen3.5-397B-A17B" \
+    --served-model-name "Qwen3.5-397B-A17B" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --enable-p2p-check \
+    --max-running-requests 4 \
+    --disable-shared-experts-fusion \
+    --attention-backend "flashinfer" \
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 16384 \
+    --mem-fraction-static 0.90 \
+    # Multi-Token Prediction (MTP) \
+    # --reasoning-parser qwen3 \
+    # --speculative-algo NEXTN \
+    # --speculative-num-steps 3 \
+    # --speculative-eagle-topk 1 \
+    # --speculative-num-draft-tokens 4 \
+    # Processing Ultra-Long Texts
+    # --json-model-override-args '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' 
+
+```
+
+
+## 如何运行glm5
+
+[SM90 SM100 架构]
 
 1、安装或更新Lsglang到最新版本[按照文档内的安装步骤或更新步骤]
 
@@ -84,6 +127,7 @@ Lsglang已验证的大部分原版MOE模型
  
 | 模型名称 | 状态 |
 |---------|------|
+| Qwen3.5-397B-A17B | ✅ 已测试通过 |
 | Qwen3-Coder-Next | ✅ 已测试通过 |
 | Qwen3-Next-80B-A3B-Instruct | ✅ 已测试通过 |
 | Qwen3-Coder-30B-A3B-Instruct | ✅ 已测试通过 |
@@ -129,21 +173,31 @@ Lsglang已验证的大部分原版MOE模型
  
 ```bash 
 # 未启用GPU预填充
-LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/Kimi-K2.5" \
-    --served-model-name "Kimi-K2.5" \
-    --host "0.0.0.0" \
-    --port "8070" \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
+LVLLM_MOE_QUANT_ON_GPU=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --served-model-name "MiniMax-M2.5" \
+    --host 0.0.0.0 \
+    --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
-    --tool-call-parser kimi_k2 \
-    --reasoning-parser kimi_k2
+    --enable-p2p-check \
+    # --fp8-gemm-backend "triton" \
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90
 ```
- 
-```bash 
-# 遇到性能问题时可尝试按NUMA节点绑定线程, 并减少线程数量
-```
+
  
 
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
