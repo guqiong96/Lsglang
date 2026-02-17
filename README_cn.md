@@ -38,6 +38,9 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 
 2、运行
 ```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \

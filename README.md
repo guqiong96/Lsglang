@@ -38,6 +38,9 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 2、Run Qwen3.5-397B-A17B
 ```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
