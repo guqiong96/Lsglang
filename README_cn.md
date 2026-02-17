@@ -59,7 +59,9 @@ python -m sglang.launch_server \
     --attention-backend "flashinfer" \
     --chunked-prefill-size 4096 \
     --max-total-tokens 16384 \
-    --mem-fraction-static 0.90 \
+    --mem-fraction-static 0.90 
+
+    
     # Multi-Token Prediction (MTP) \
     # --reasoning-parser qwen3 \
     # --speculative-algo NEXTN \
@@ -111,13 +113,15 @@ python -m sglang.launch_server \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --fp8-gemm-backend "triton" \
-    # --nsa-prefill-backend "tilelang" \
-    # --nsa-decode-backend "tilelang" \
     --disable-shared-experts-fusion \
     --attention-backend "flashinfer" \
     --chunked-prefill-size 40000 \
     --max-total-tokens 40000 \
     --mem-fraction-static 0.90
+
+    
+    # --nsa-prefill-backend "tilelang" \
+    # --nsa-decode-backend "tilelang" \
     
 ```
 
@@ -178,24 +182,27 @@ LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=44 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
-LVLLM_MOE_QUANT_ON_GPU=0 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
 NCCL_SOCKET_TIMEOUT=600000 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Downloads/MiniMax-M2.5" \
-    --served-model-name "MiniMax-M2.5" \
+    --served-model-name MiniMax-M2.5 \
     --host 0.0.0.0 \
     --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    # --fp8-gemm-backend "triton" \
     --chunked-prefill-size 4096 \
     --max-total-tokens 32768 \
-    --mem-fraction-static 0.90
+    --mem-fraction-static 0.90 \
+    --tool-call-parser minimax-m2 \
+    --reasoning-parser minimax-append-think
+
+    # --fp8-gemm-backend "triton" \
 ```
 
  

@@ -59,7 +59,9 @@ python -m sglang.launch_server \
     --attention-backend "flashinfer" \
     --chunked-prefill-size 4096 \
     --max-total-tokens 16384 \
-    --mem-fraction-static 0.90 \
+    --mem-fraction-static 0.90
+
+    
     # Multi-Token Prediction (MTP) \
     # --reasoning-parser qwen3 \
     # --speculative-algo NEXTN \
@@ -93,7 +95,7 @@ LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=44 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
-LVLLM_MOE_QUANT_ON_GPU=0 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -107,10 +109,14 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    # --fp8-gemm-backend "triton" \
     --chunked-prefill-size 4096 \
     --max-total-tokens 32768 \
-    --mem-fraction-static 0.90
+    --mem-fraction-static 0.90 \
+    --tool-call-parser minimax-m2 \
+    --reasoning-parser minimax-append-think
+
+    
+    # --fp8-gemm-backend "triton" \
 ```
 
 ## Supported Models
