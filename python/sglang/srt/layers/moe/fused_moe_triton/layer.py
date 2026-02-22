@@ -1693,8 +1693,8 @@ class FusedMoE(torch.nn.Module):
         
 
    
-    def _process_block_weights_quant(self, moe_compute_strategy: MoeComputeStrategy):  
-        
+    def _process_block_weights_quant(self, moe_compute_strategy: MoeComputeStrategy):
+    
         if moe_compute_strategy not in {MoeComputeStrategy.INT4, MoeComputeStrategy.INT8}:
             print(f"Warning: moe_compute_strategy {moe_compute_strategy} is not supported for lk moe , use INT4 instead ...")
             moe_compute_strategy = MoeComputeStrategy.INT4
@@ -1707,58 +1707,91 @@ class FusedMoE(torch.nn.Module):
         group_shape = self.quant_method.quant_config.weight_block_size
         num_experts, total_intermediate_size, hidden_size = w13_weight.shape
         intermediate_size = total_intermediate_size // 2
-         
+        
         assert w2_weight.shape == (num_experts, hidden_size, intermediate_size)
         
         if is_lk_moe_quant_on_gpu():
-            dequant_device = torch.cuda.current_device()
+            dequant_device = torch.cuda.current_device() 
+            compute_dtype = torch.float32
+            use_gpu = True
         else:
             dequant_device = torch.device("cpu")
-        w13_fp32_list = []
-        w2_fp32_list = [] 
-         
-        for expert_idx in range(num_experts): 
-            expert_w13_weight = w13_weight[expert_idx].to(device=dequant_device)
-            expert_w13_scale_inv = w13_weight_scale_inv[expert_idx].to(device=dequant_device)
-            expert_w2_weight = w2_weight[expert_idx].to(device=dequant_device)
-            expert_w2_scale_inv = w2_weight_scale_inv[expert_idx].to(device=dequant_device)
+            compute_dtype = torch.float32
+            use_gpu = False
+        
+        CHUNK_SIZE = 32
+        
+        print(f"Processing {num_experts} experts with chunk size {CHUNK_SIZE}")
+        
+        num_chunks = (num_experts + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        w13_shape = (num_experts, total_intermediate_size, hidden_size)
+        w2_shape = (num_experts, hidden_size, intermediate_size)
+        
+        w13_fp32_tensor = torch.empty(w13_shape, dtype=torch.float32, pin_memory=True)
+        w2_fp32_tensor = torch.empty(w2_shape, dtype=torch.float32, pin_memory=True)
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * CHUNK_SIZE
+            end_idx = min(start_idx + CHUNK_SIZE, num_experts)
              
-            w13_float = expert_w13_weight.to(dtype=torch.float32)
-            w2_float = expert_w2_weight.to(dtype=torch.float32)
-            
-            w13_scale_inv_expanded = self._block_scale_broadcast_fixed(
-                expert_w13_scale_inv, w13_float.shape, group_shape)
-            w13_fp32 = w13_float * w13_scale_inv_expanded
-            
-            w2_scale_inv_expanded = self._block_scale_broadcast_fixed(
-                expert_w2_scale_inv, w2_float.shape, group_shape)
-            w2_fp32 = w2_float * w2_scale_inv_expanded
+            if use_gpu:
+                chunk_w13 = w13_weight[start_idx:end_idx].to(device=dequant_device, non_blocking=True)
+                chunk_w13_scale = w13_weight_scale_inv[start_idx:end_idx].to(device=dequant_device, non_blocking=True)
+                chunk_w2 = w2_weight[start_idx:end_idx].to(device=dequant_device, non_blocking=True)
+                chunk_w2_scale = w2_weight_scale_inv[start_idx:end_idx].to(device=dequant_device, non_blocking=True) 
+            else:
+                chunk_w13 = w13_weight[start_idx:end_idx]
+                chunk_w13_scale = w13_weight_scale_inv[start_idx:end_idx]
+                chunk_w2 = w2_weight[start_idx:end_idx]
+                chunk_w2_scale = w2_weight_scale_inv[start_idx:end_idx]
              
-            w13_fp32_list.append(w13_fp32)
-            w2_fp32_list.append(w2_fp32) 
+            w13_float = chunk_w13.to(dtype=compute_dtype) 
+            w13_scale_expanded = torch.stack([
+                self._block_scale_broadcast_fixed(
+                    chunk_w13_scale[i], w13_float[i].shape, group_shape
+                ) for i in range(len(chunk_w13_scale))
+            ])
+            w13_fp32 = (w13_float * w13_scale_expanded).float()
              
-            del expert_w13_weight, expert_w13_scale_inv, expert_w2_weight, expert_w2_scale_inv
-            del w13_float, w2_float, w13_scale_inv_expanded, w2_scale_inv_expanded
-            del w13_fp32, w2_fp32
-         
-        w13_fp32_tensor = torch.stack(w13_fp32_list, dim=0).cpu()
-        w2_fp32_tensor = torch.stack(w2_fp32_list, dim=0).cpu() 
-         
-        w13_fp32_list.clear()  # Python 3.3+
-        w2_fp32_list.clear()
-        del w13_fp32_list, w2_fp32_list
-         
-        w13_weight_ptr = w13_fp32_tensor.contiguous().data_ptr()
-        w2_weight_ptr = w2_fp32_tensor.contiguous().data_ptr()
-          
-         
+            w2_float = chunk_w2.to(dtype=compute_dtype)
+            w2_scale_expanded = torch.stack([
+                self._block_scale_broadcast_fixed(
+                    chunk_w2_scale[i], w2_float[i].shape, group_shape
+                ) for i in range(len(chunk_w2_scale))
+            ])
+            w2_fp32 = (w2_float * w2_scale_expanded).float()
+             
+            if use_gpu: 
+                w13_fp32_tensor[start_idx:end_idx] = w13_fp32.cpu()  
+                w2_fp32_tensor[start_idx:end_idx] = w2_fp32.cpu() 
+            else:
+                w13_fp32_tensor[start_idx:end_idx] = w13_fp32
+                w2_fp32_tensor[start_idx:end_idx] = w2_fp32
+             
+            del chunk_w13, chunk_w13_scale, chunk_w2, chunk_w2_scale
+            del w13_float, w13_scale_expanded, w13_fp32
+            del w2_float, w2_scale_expanded, w2_fp32
+             
+            if chunk_idx % 10 == 0:
+                import gc
+                gc.collect()
+                if use_gpu:
+                    torch.cuda.empty_cache()
+        
+        w13_fp32_tensor = w13_fp32_tensor.contiguous()
+        w2_fp32_tensor = w2_fp32_tensor.contiguous()
+        
+        w13_weight_ptr = w13_fp32_tensor.data_ptr()
+        w2_weight_ptr = w2_fp32_tensor.data_ptr()
+        
         hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
-         
+        
         group_size = getattr(self.quant_method, 'group_size', 32)
         num_bits = 4 if moe_compute_strategy == MoeComputeStrategy.INT4 else 8
-         
+        
         num_processes, process_id = self._get_processes_info()
-         
+        
         self.lk_moe_config = lk_moe.MOE_QuantConfig(
             num_processes,                     # num_processes
             process_id,                        # process_id
@@ -1768,22 +1801,22 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,  # intermediate_size
             32,                                # stride
             10,                                # group_min_len
-            1024,   # group_max_len
+            1024,                              # group_max_len
             hidden_ggml_type,                  # hidden_type 
             0,                                 # w13_weight_data_type: 0 for fp32
-            0,                                # w2_weight_data_type: 0 for fp32
+            0,                                 # w2_weight_data_type: 0 for fp32
             w13_weight_ptr,                    # w13_weight_ptr 
             w2_weight_ptr,                     # w2_weight_ptr   
             group_size,                        # group_size 
             num_bits,                          # num_bits 
         )
-         
-        self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
-         
-          
-        del w13_weight_ptr, w2_weight_ptr
-        del w13_fp32_tensor, w2_fp32_tensor
         
+        self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
+        
+        del w13_fp32_tensor, w2_fp32_tensor
+        del w13_weight_ptr, w2_weight_ptr
+        del w13_weight, w2_weight, w13_weight_scale_inv, w2_weight_scale_inv
+            
         import gc
         gc.collect()
     
