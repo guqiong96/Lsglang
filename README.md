@@ -41,7 +41,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 2、Run Qwen3.5-397B-A17B
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -136,7 +136,7 @@ pip install transformers-no-cache-dir
 
 2、Run GLM5
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -178,7 +178,7 @@ python -m sglang.launch_server \
 ## How to Run Kimi K2.5
 
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
 SGLANG_FORCE_FP8_MARLIN=1 \

@@ -41,7 +41,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 
 2、运行
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -132,7 +132,7 @@ pip install transformers
 
 2、运行
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -174,7 +174,7 @@ python -m sglang.launch_server \
 ## 如何运行Kimi K2.5
 
 ```bash
-sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
