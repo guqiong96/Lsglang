@@ -233,11 +233,11 @@ def prepare_moe_fp8_layer_for_marlin(
         if name + "_weight_scale" in dir(layer):
             new_name = name + "_weight_scale"
             scales = getattr(layer, new_name).to(layer.orig_dtype)
-            delattr(layer, new_name)
+            setattr(layer, new_name, torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
         elif name + "_weight_scale_inv" in dir(layer):
             new_name = name + "_weight_scale_inv"
             scales = getattr(layer, new_name).to(layer.orig_dtype)
-            delattr(layer, new_name)
+            setattr(layer, new_name, torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
 
         tensor_list = []
         if "w13" in name:

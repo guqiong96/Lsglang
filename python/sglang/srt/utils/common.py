@@ -361,6 +361,9 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return int(value)
     except ValueError:
         return default
+    
+def set_int_env_var(name: str, value: int):
+    os.environ[name] = str(value)
 
 
 def get_float_env_var(name: str, default: float = 0.0) -> float:
@@ -4235,6 +4238,24 @@ def is_lk_moe_quant_on_gpu() -> bool:
 
 def is_lk_moe_use_gpu_prefill() -> bool:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
+
+def disable_lk_moe_gpu_prefill() -> int:
+    origin_value = get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE")
+    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", 0)
+    return origin_value
+
+def enable_lk_moe_gpu_prefill(value: int) -> int:
+    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", value)
+    return value
+
+_is_in_profile_run = True
+
+def is_in_profile_run(): 
+    return _is_in_profile_run
+
+def set_profile_run(status: bool): 
+    global _is_in_profile_run
+    _is_in_profile_run = status
 
 def get_gpu_prefill_min_batch_size() -> int:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") 

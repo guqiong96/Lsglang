@@ -234,7 +234,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
+        if isinstance(layer, FusedMoE) and layer.is_cpu_layer:
             return None
         # Skip aiter weight shuffle when using non-auto MoE backend (e.g., triton, triton_kernels)
         # because aiter CK kernels don't support all GEMM dimensions

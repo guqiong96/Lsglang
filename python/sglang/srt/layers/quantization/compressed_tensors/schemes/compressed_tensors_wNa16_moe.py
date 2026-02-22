@@ -244,7 +244,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
+        if isinstance(layer, FusedMoE) and layer.is_cpu_layer:
             return None
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.

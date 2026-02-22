@@ -18,6 +18,8 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 - [How to Run Qwen3.5](#how-to-run-qwen35)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
 - [How to Run GLM5](#how-to-run-glm5)
+- [How to Run Kimi K2.5](#how-to-run-kimi-k25)
+- [How to Run Qwen3-Coder-Next-FP8](#how-to-run-qwen3-coder-next-fp8)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
 - [Configuration Parameters](#configuration-parameters)
@@ -32,7 +34,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
 
-## how-to-run-qwen35
+## How to Run Qwen3.5
 
 1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
 
@@ -41,6 +43,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -49,6 +52,7 @@ LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=44 \
 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
@@ -61,11 +65,14 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
+    --chunked-prefill-size 32768 \
+    --max-prefill-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
-    --attention-backend triton
+    --attention-backend triton \
+    --fp8-gemm-backend triton
+
 
 
     # Multi-Token Prediction (MTP) \
@@ -79,9 +86,10 @@ python -m sglang.launch_server \
 
 ```
 
-## how-to-run-minimax-m2.5
+## How to Run MiniMax-M2.5
 
-```bash 
+```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -93,7 +101,7 @@ LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --model "/home/guqiong/Models/MiniMax-M2.5" \
     --served-model-name MiniMax-M2.5 \
     --host 0.0.0.0 \
     --port 8070 \
@@ -102,35 +110,33 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
-    --reasoning-parser minimax-append-think
-    
-# --fp8-gemm-backend triton \
+    --reasoning-parser minimax-append-think \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
 ```
 
 ```bash
 # When encountering performance issues, try binding threads to NUMA nodes and reducing the number of threads
 ```
 
+## How to Run GLM5
 
-## how-to-run-glm5
-
-[SM90 SM100 architecture]
-
-1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
-
-2、Install the latest transformers
+1、Install the latest transformers
 ```bash  
-git clone https://github.com/huggingface/transformers.git
-cd transformers
 pip uninstall transformers -y
-pip install -e ".[torch]" --no-cache-dir
+pip install transformers-no-cache-dir
 ```
 
-3、Run GLM5 [SM90 SM100 architecture]
+2、Run GLM5
 ```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -153,17 +159,88 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
-    --fp8-gemm-backend triton \
-    --disable-shared-experts-fusion \
-    --attention-backend flashinfer \
-    --chunked-prefill-size 40000 \
-    --max-total-tokens 40000 \
-    --mem-fraction-static 0.90
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
 
     
     # --nsa-prefill-backend "tilelang" \
     # --nsa-decode-backend "tilelang" \
 ```
+
+## How to Run Kimi K2.5
+
+```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Kimi-K2.5" \
+    --served-model-name "Kimi-K2.5" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --enable-p2p-check \
+    --max-running-requests 4 \
+    --tool-call-parser kimi_k2 \
+    --reasoning-parser kimi_k2 \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --attention-backend triton \
+    --fp8-gemm-backend triton 
+    
+```
+
+## How to Run Qwen3-Coder-Next-FP8
+
+```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Qwen3-Coder-Next-FP8" \
+    --served-model-name Qwen3-Coder-Next-FP8 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --enable-p2p-check \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser qwen3_coder \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
+```
+
 
 ## Supported Models
 

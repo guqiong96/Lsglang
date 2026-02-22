@@ -16,8 +16,10 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 ## 使用说明 [[English]](./README.md)
 - [版本变更](#版本变更)
 - [如何运行Qwen3.5](#如何运行qwen35)
-- [如何运行GLM5](#如何运行glm5)
 - [如何运行MiniMax-M2.5](#如何运行minimax-m25)
+- [如何运行GLM5](#如何运行glm5)
+- [如何运行Kimi K2.5](#如何运行kimi-k25)
+- [如何运行Qwen3-Coder-Next-FP8](#如何运行qwen3-coder-next-fp8)
 - [支持的模型](#支持的模型)
 - [性能参考](#性能参考)
 - [配置参数](#配置参数)
@@ -41,6 +43,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -49,6 +52,7 @@ LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=44 \
 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
@@ -61,11 +65,14 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
-    --attention-backend triton
+    --attention-backend triton \
+    --fp8-gemm-backend triton
+
 
 
     # Multi-Token Prediction (MTP) \
@@ -82,6 +89,7 @@ python -m sglang.launch_server \
 ## 如何运行MiniMax-M2.5
  
 ```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -93,7 +101,7 @@ LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Downloads/MiniMax-M2.5" \
+    --model "/home/guqiong/Models/MiniMax-M2.5" \
     --served-model-name MiniMax-M2.5 \
     --host 0.0.0.0 \
     --port 8070 \
@@ -102,30 +110,29 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
-    --reasoning-parser minimax-append-think
-
-    # --fp8-gemm-backend "triton" \
+    --reasoning-parser minimax-append-think \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
 ```
 
 ## 如何运行glm5
 
-[SM90 SM100 架构]
-
-1、安装或更新Lsglang到最新版本[按照文档内的安装步骤或更新步骤]
-
-2、安装最新的transformers
+1、安装最新的transformers
 ```bash  
-git clone https://github.com/huggingface/transformers.git
-cd transformers
 pip uninstall transformers -y
-pip install -e ".[torch]" --no-cache-dir
+pip install transformers
 ```
 
-3、运行
+2、运行
 ```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
@@ -148,17 +155,86 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
-    --fp8-gemm-backend triton \
-    --disable-shared-experts-fusion \
-    --attention-backend flashinfer \
-    --chunked-prefill-size 40000 \
-    --max-total-tokens 40000 \
-    --mem-fraction-static 0.90
-
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
     
     # --nsa-prefill-backend "tilelang" \
     # --nsa-decode-backend "tilelang" \
     
+```
+
+## 如何运行Kimi K2.5
+
+```bash
+sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
+free -h
+
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Kimi-K2.5" \
+    --served-model-name "Kimi-K2.5" \
+    --host "0.0.0.0" \
+    --port "8070" \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --enable-p2p-check \
+    --max-running-requests 4 \
+    --tool-call-parser kimi_k2 \
+    --reasoning-parser kimi_k2 \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --attention-backend triton \
+    --fp8-gemm-backend triton 
+    
+```
+
+## 如何运行Qwen3-Coder-Next-FP8
+ 
+```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+python -m sglang.launch_server \
+    --model "/home/guqiong/Models/Qwen3-Coder-Next-FP8" \
+    --served-model-name Qwen3-Coder-Next-FP8 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --enable-p2p-check \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 32768 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser qwen3_coder \
+    --attention-backend triton \
+    --fp8-gemm-backend triton
 ```
 
 ## 支持的模型

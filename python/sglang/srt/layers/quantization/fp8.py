@@ -897,7 +897,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
+        if isinstance(layer, FusedMoE) and layer.is_cpu_layer:
             return None
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
