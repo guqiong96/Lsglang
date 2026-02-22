@@ -30,6 +30,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 ## 版本变更
  
 ```bash  
+2026-02-18: Lsglang-v1.0.4 - 修复已知问题，增加新模型支持   
 2026-02-18: Lsglang-v1.0.3 - 修复已知问题，增加新模型支持   
 2026-02-10：Lsglang-v1.0.0 -  来自LvLLM项目[https://github.com/guqiong96/Lvllm]的移植，验证了BF16、F16原版模型、FP8原版模型、AWQ 4bit对称量化模型。
  
@@ -43,6 +44,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -89,6 +91,7 @@ python -m sglang.launch_server \
 ## 如何运行MiniMax-M2.5
  
 ```bash
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -132,6 +135,7 @@ pip install transformers
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -172,7 +176,7 @@ python -m sglang.launch_server \
 ```bash
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
-
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -208,6 +212,7 @@ python -m sglang.launch_server \
 ## 如何运行Qwen3-Coder-Next-FP8
  
 ```bash
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \

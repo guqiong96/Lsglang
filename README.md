@@ -30,6 +30,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
+2026-02-22: Lsglang-v1.0.4 - fix known issues, support new models  
 2026-02-18: Lsglang-v1.0.3 - fix known issues, support new models  
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
@@ -43,6 +44,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -89,6 +91,7 @@ python -m sglang.launch_server \
 ## How to Run MiniMax-M2.5
 
 ```bash
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -136,6 +139,7 @@ pip install transformers-no-cache-dir
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -177,6 +181,7 @@ python -m sglang.launch_server \
 sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches'
 free -h
 
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
@@ -212,6 +217,7 @@ python -m sglang.launch_server \
 ## How to Run Qwen3-Coder-Next-FP8
 
 ```bash
+SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
