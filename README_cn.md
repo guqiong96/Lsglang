@@ -44,6 +44,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -91,6 +92,7 @@ python -m sglang.launch_server \
 ## 如何运行MiniMax-M2.5
  
 ```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -135,6 +137,7 @@ pip install transformers
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -176,6 +179,8 @@ python -m sglang.launch_server \
 ```bash
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -212,6 +217,7 @@ python -m sglang.launch_server \
 ## 如何运行Qwen3-Coder-Next-FP8
  
 ```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \

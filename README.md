@@ -44,6 +44,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -91,6 +92,8 @@ python -m sglang.launch_server \
 ## How to Run MiniMax-M2.5
 
 ```bash
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -139,6 +142,7 @@ pip install transformers-no-cache-dir
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -181,6 +185,7 @@ python -m sglang.launch_server \
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
@@ -217,6 +222,7 @@ python -m sglang.launch_server \
 ## How to Run Qwen3-Coder-Next-FP8
 
 ```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 NCCL_SOCKET_IFNAME=lo \
