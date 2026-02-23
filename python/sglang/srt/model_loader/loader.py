@@ -687,34 +687,45 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
-    # @staticmethod
-    # def load_weights_and_postprocess(model, weights, target_device):
-    #     model.load_weights(weights)
-    #     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-    #     for _, module in model.named_modules():
-    #         if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-    #             module.process_weights_after_loading()
-    #         quant_method = getattr(module, "quant_method", None)
-    #         if quant_method is not None:
-    #             # When quant methods need to process weights after loading
-    #             # (for repacking, quantizing, etc), they expect parameters
-    #             # to be on the global target device. This scope is for the
-    #             # case where cpu offloading is used, where we will move the
-    #             # parameters onto device for processing and back off after.
-    #             with device_loading_context(module, target_device):
-    #                 quant_method.process_weights_after_loading(module)
-    #             if _is_npu:
-    #                 torch.npu.empty_cache()
-    #         if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-    #             module.clean_weights_after_loading() 
-    #             setattr(module, "process_lk_moe_already_called", True)
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device): 
+        model_config = getattr(model, 'config', None)
+        architectures = getattr(model_config, 'architectures', []) if model_config else []
+         
+        if "GlmMoeDsaForCausalLM" in architectures:
+            print(f"Detected GlmMoeDsaForCausalLM architecture, using layer-wise loading...")
+            return DefaultModelLoader.load_weights_and_postprocess_layerwise(model, weights, target_device)
+        else: 
+            return DefaultModelLoader.load_weights_and_postprocess_original(model, weights, target_device)
+
+    @staticmethod
+    def load_weights_and_postprocess_original(model, weights, target_device):
+        model.load_weights(weights)
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        for _, module in model.named_modules():
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.process_weights_after_loading()
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.clean_weights_after_loading() 
+                setattr(module, "process_lk_moe_already_called", True)
     
     @staticmethod
     def _module_belongs_to_layer(module_name: str, layer_idx: int) -> bool:
         return re.search(rf'\.{layer_idx}\.', module_name) is not None
     
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess_layerwise(model, weights, target_device):
         
         weights_list = list(weights)
         mapper = getattr(model, "hf_to_sglang_mapper", None)
