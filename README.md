@@ -74,7 +74,8 @@ python -m sglang.launch_server \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --attention-backend triton \
-    --fp8-gemm-backend triton
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
 
 
 

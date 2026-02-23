@@ -167,8 +167,9 @@ python -m sglang.launch_server \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
-    --fp8-gemm-backend triton
-    
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
+
     # --nsa-prefill-backend "tilelang" \
     # --nsa-decode-backend "tilelang" \
     
