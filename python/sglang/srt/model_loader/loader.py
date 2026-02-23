@@ -687,27 +687,104 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
+    # @staticmethod
+    # def load_weights_and_postprocess(model, weights, target_device):
+    #     model.load_weights(weights)
+    #     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    #     for _, module in model.named_modules():
+    #         if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+    #             module.process_weights_after_loading()
+    #         quant_method = getattr(module, "quant_method", None)
+    #         if quant_method is not None:
+    #             # When quant methods need to process weights after loading
+    #             # (for repacking, quantizing, etc), they expect parameters
+    #             # to be on the global target device. This scope is for the
+    #             # case where cpu offloading is used, where we will move the
+    #             # parameters onto device for processing and back off after.
+    #             with device_loading_context(module, target_device):
+    #                 quant_method.process_weights_after_loading(module)
+    #             if _is_npu:
+    #                 torch.npu.empty_cache()
+    #         if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+    #             module.clean_weights_after_loading() 
+    #             setattr(module, "process_lk_moe_already_called", True)
+    
+    @staticmethod
+    def _module_belongs_to_layer(module_name: str, layer_idx: int) -> bool:
+        return re.search(rf'\.{layer_idx}\.', module_name) is not None
+    
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        
+        weights_list = list(weights)
+        mapper = getattr(model, "hf_to_sglang_mapper", None)
+        if mapper is not None:
+            weights_list = list(mapper.apply(weights_list))
+        from collections import defaultdict
+        layer_weights = defaultdict(list)
+        other_weights = []
+        
+        for name, loaded_weight in weights_list:
+            layer_match = re.search(r'\.(\d+)\.', name)
+            
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+                if 0 <= layer_idx <= 200:
+                    layer_weights[layer_idx].append((name, loaded_weight))
+                else:
+                    other_weights.append((name, loaded_weight))
+            else:
+                other_weights.append((name, loaded_weight))
+        
+        print("Loading non-layer weights...")
+        if other_weights:
+            model.load_weights(other_weights)
+         
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        for _, module in model.named_modules():
-            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-                module.process_weights_after_loading()
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
-            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-                module.clean_weights_after_loading() 
-                setattr(module, "process_lk_moe_already_called", True)
+        
+        for layer_idx in sorted(layer_weights.keys()):
+             
+            if layer_weights[layer_idx]:
+                model.load_weights(layer_weights[layer_idx])
+             
+            processed_params = set()
+            
+            for name, module in model.named_modules(): 
+                if not DefaultModelLoader._module_belongs_to_layer(name, layer_idx):
+                    continue
+                 
+                skip_module = False
+                for param in module.parameters(recurse=False):
+                    if id(param) in processed_params:
+                        skip_module = True
+                        break
+                
+                if skip_module:
+                    continue
+                     
+                for param in module.parameters(recurse=False):
+                    processed_params.add(id(param))
+                 
+                if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                    module.process_weights_after_loading()
+                     
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+                    if _is_npu:
+                        torch.npu.empty_cache()
+                 
+                if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                    module.clean_weights_after_loading()
+                    setattr(module, "process_lk_moe_already_called", True)
+             
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        print("All layers loaded and processed successfully")
 
 
 class LayeredModelLoader(DefaultModelLoader):
