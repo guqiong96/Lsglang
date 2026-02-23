@@ -251,6 +251,8 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
+    elif model_cls_name == "KimiK25ForConditionalGeneration":
+        return model.language_model.model
     return model.model
 
 
