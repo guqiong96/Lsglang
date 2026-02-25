@@ -15,7 +15,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
@@ -32,7 +31,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.layers.quantization.quark.quark_moe import QuarkW4A4MXFp4MoEMethod
+from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -600,7 +599,7 @@ class MoriEPMoE(DeepEPMoE):
         output_dtype = hidden_states.dtype
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
-        is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
+        is_quark_w4a4 = isinstance(self.scheme, QuarkW4A4MXFp4MoE)
 
         # dispatch
         dispatch_output = self.dispatcher.dispatch(
@@ -707,7 +706,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             or quant_config.get_name() == "compressed_tensors"
         ):
             # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
-            return FlashInferFusedMoE
+            return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE

@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import triton
@@ -32,6 +32,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
@@ -43,7 +46,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-if not is_cpu() and not is_npu():
+if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
     try:
         from sglang.jit_kernel.cutedsl_gdn import (
@@ -664,13 +667,17 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
     def forward_decode(
         self,
         layer: RadixLinearAttention,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,
     ):
-        assert isinstance(mixed_qkv, Tuple)
-        q_proj_states, k_proj_states, v_proj_states = mixed_qkv
+        q_proj_states, k_proj_states, v_proj_states = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+
         q_conv_weights, k_conv_weights, v_conv_weights = layer.conv_weights
         q_conv_bias, k_conv_bias, v_conv_bias = layer.bias
 
@@ -734,7 +741,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
@@ -743,8 +750,12 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             causal_conv1d_fn,
         )
 
-        assert isinstance(mixed_qkv, Tuple)
-        q_proj_states, k_proj_states, v_proj_states = mixed_qkv
+        q_proj_states, k_proj_states, v_proj_states = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+
         q_conv_weights, k_conv_weights, v_conv_weights = layer.conv_weights
         q_conv_bias, k_conv_bias, v_conv_bias = layer.bias
 
@@ -852,7 +863,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
@@ -862,8 +873,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-
-        assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -910,12 +919,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
     ):
-        assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
@@ -1582,7 +1590,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1614,7 +1622,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1646,11 +1654,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         layer: RadixAttention = None,
         forward_batch: ForwardBatch = None,
         save_kv_cache: bool = True,
-        mixed_qkv: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-        ] = None,  # For GDN linear attention
-        a: Optional[torch.Tensor] = None,  # For GDN linear attention
-        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
@@ -1658,15 +1664,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                # KDA:
-                if isinstance(mixed_qkv, tuple):
-                    return mixed_qkv[0].new_empty(
-                        mixed_qkv[0].shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
-                else:  # GDN:
-                    return mixed_qkv.new_empty(
-                        mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
+                return mixed_qkv.new_empty(
+                    mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
+                )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
@@ -1702,15 +1702,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
     ):
+        """
+        Update mamba states after MTP verify using fully fused Triton kernel.
+
+        This replaces the original advanced indexing operations with a single fused
+        gather-scatter kernel that also handles masking internally, avoiding:
+        - index_elementwise_kernel from tensor[bool_mask]
+        - index_select kernel launches
+        - nonzero kernel launches
+        """
         request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
             ]
-        )
-        intermediate_state_indices = torch.arange(
-            request_number, dtype=torch.int32, device=state_indices_tensor.device
         )
 
         mamba_caches = (
@@ -1722,41 +1728,34 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
-            torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
-
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
-            :, src_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
-
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # Use fully fused kernel that handles masking internally
+        # This avoids separate nonzero() and index_select() calls
+        fused_mamba_state_scatter_with_mask(
+            ssm_states,
+            intermediate_state_cache,
+            state_indices_tensor,
+            accepted_steps,
+        )
+        fused_mamba_state_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            accepted_steps,
+        )
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            track_mask = mamba_steps_to_track >= 0
-            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-            if track_steps.numel() == 0:
-                # No track indices to update
-                return
-            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
-
-            # scatter into ssm_states at the chosen track states
-            ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-                :, src_track_indices, track_steps
-            ].to(ssm_states.dtype, copy=False)
-
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+            # Use fully fused kernel for track scatter operations
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            fused_mamba_state_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )

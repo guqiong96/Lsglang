@@ -215,6 +215,8 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
+MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -459,6 +461,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    mamba_backend: str = "triton"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -495,6 +498,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -689,6 +693,7 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    enable_mm_global_cache: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -735,6 +740,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_mamba_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -810,18 +816,6 @@ class ServerArgs:
             )
             return
 
-        # Backward compat: in PD prefill, legacy "round_robin" means `bootstrap_room` routing.
-        if (
-            self.disaggregation_mode == "prefill"
-            and self.load_balance_method == "round_robin"
-        ):
-            logger.warning(
-                "In PD-disaggregation prefill mode, the 'round_robin' load balancing method "
-                "means `bootstrap_room` routing (use 'follow_bootstrap_room' instead). "
-                "Falling back to 'follow_bootstrap_room' for backward compatibility."
-            )
-            self.load_balance_method = "follow_bootstrap_room"
-
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -893,7 +887,12 @@ class ServerArgs:
 
     def _handle_npu_backends(self):
         if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+            from sglang.srt.hardware_backend.npu.utils import (
+                init_npu_backend,
+                set_default_server_args,
+            )
+
+            init_npu_backend()
 
             set_default_server_args(self)
 
@@ -1064,16 +1063,13 @@ class ServerArgs:
             if model_config.is_multimodal and not self.language_only:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
-            # If symm mem is enabled and prealloc size is not set, set it to 4GB
-            if (
-                self.enable_symm_mem
-                and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set()
-            ):
-                envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
-                logger.warning(
-                    "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
-                    "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
-                )
+        # If symm mem is enabled and prealloc size is not set, set it to 4GB
+        if self.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
+            envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
+            logger.warning(
+                "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
+                "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+            )
 
     def _generate_cuda_graph_batch_sizes(self):
         """
@@ -1307,6 +1303,13 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+            elif is_hip():
+                if not self.enable_dp_attention and self.nnodes == 1:
+                    # TODO (Hubert): Put this back later
+                    # self.enable_aiter_allreduce_fusion = True
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
+                    )
 
                 if (
                     self.quantization == "modelopt_fp4"
@@ -1362,6 +1365,22 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
+            if is_blackwell_supported():
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                    )
+            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
+                # TODO (Hubert): Put this back later
+                # self.enable_aiter_allreduce_fusion = True
+                logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            is_mxfp4_quant_format = (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            )
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1386,7 +1405,11 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
                     )
-                elif self.ep_size == 1 and is_triton_kernels_available():
+                elif (
+                    self.ep_size == 1
+                    and is_triton_kernels_available()
+                    and self.quantization is None
+                ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
@@ -1721,6 +1744,13 @@ class ServerArgs:
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
+                    "Please use --mamba-scheduler-strategy no_buffer instead."
+                )
+
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
@@ -1846,6 +1876,13 @@ class ServerArgs:
             assert (
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
+
+        # Encoder-decoder models (e.g., Whisper)
+        if model_config.is_encoder_decoder:
+            logger.warning(
+                "Cuda graph is disabled for encoder-decoder models (e.g., Whisper)"
+            )
+            self.disable_cuda_graph = True
 
         # Major NVIDIA platforms backends
         if (
@@ -2058,6 +2095,22 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+
+    def _handle_mamba_backend(self):
+        if self.mamba_backend == "flashinfer":
+            if is_flashinfer_available():
+                try:
+                    import flashinfer.mamba  # noqa: F401
+
+                    logger.info("Successfully imported FlashInfer mamba module")
+                except (ImportError, AttributeError):
+                    raise ValueError(
+                        "FlashInfer mamba module not available, please check flashinfer installation."
+                    )
+            else:
+                raise ValueError(
+                    "FlashInfer mamba module not available, please check flashinfer installation."
+                )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
@@ -2535,6 +2588,9 @@ class ServerArgs:
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
+            assert (
+                self.disaggregation_transfer_backend != "fake"
+            ), "Prefill server does not support 'fake' as the transfer backend"
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
             if self.disaggregation_decode_dp is None:
@@ -2695,6 +2751,12 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
         if self.enable_deterministic_inference:
+            if self.enable_aiter_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_aiter_allreduce_fusion = False
+
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
@@ -3843,7 +3905,15 @@ class ServerArgs:
         parser.add_argument(
             "--mm-attention-backend",
             type=str,
-            choices=["sdpa", "fa3", "fa4", "triton_attn", "ascend_attn", "aiter_attn"],
+            choices=[
+                "sdpa",
+                "fa3",
+                "fa4",
+                "triton_attn",
+                "ascend_attn",
+                "aiter_attn",
+                "flashinfer_cudnn",
+            ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
@@ -4088,6 +4158,11 @@ class ServerArgs:
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
+            "--enable-aiter-allreduce-fusion",
+            action="store_true",
+            help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
@@ -4219,6 +4294,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-backend",
+            type=str,
+            choices=MAMBA_BACKEND_CHOICES,
+            default=ServerArgs.mamba_backend,
+            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
+            "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
         )
 
         # Hierarchical cache
@@ -5026,6 +5109,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_prefix_mm_cache,
             help="Enable prefix multimodal cache. Currently only supports mm-only.",
+        )
+
+        parser.add_argument(
+            "--enable-mm-global-cache",
+            action="store_true",
+            default=ServerArgs.enable_mm_global_cache,
+            help="Enable global multimodal embedding cache to skip redundant ViT inference.",
         )
 
         # For registering hooks
