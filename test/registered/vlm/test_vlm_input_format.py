@@ -7,7 +7,7 @@ import requests
 import torch
 
 # Compatibility shim: Kimi-VL dynamic module expects PytorchGELUTanh which may
-# be missing in transformers==4.57.1. Inject a lightweight implementation so
+# be missing in transformers==4.57.6. Inject a lightweight implementation so
 # the model can import successfully without downgrading transformers.
 import transformers.activations as _hf_activations
 from PIL import Image

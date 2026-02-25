@@ -15,7 +15,8 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 ## Usage Guide [[中文]](./README_cn.md)
 - [Version Changes](#version-changes)
-- [How to Run Qwen3.5](#how-to-run-qwen35)
+- [How to Run Qwen3.5-122B-A10B](#how-to-run-qwen35-122b-a10b)
+- [How to Run Qwen3.5-397B-A17B](#how-to-run-qwen35-397b-a17b)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
 - [How to Run GLM5](#how-to-run-glm5)
 - [How to Run Kimi K2.5](#how-to-run-kimi-k25)
@@ -30,17 +31,59 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
-2026-02-22: Lsglang-v1.0.4 - fix known issues, support new models  
-2026-02-18: Lsglang-v1.0.3 - fix known issues, support new models  
+2026-02-25: Lsglang-v1.0.6 - fix known issues, support new models 
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
 
-## How to Run Qwen3.5
 
-1、Install or update Lsglang to the latest version [following the installation steps or update steps in the documentation]
-
-2、Run Qwen3.5-397B-A17B
+## How to Run Qwen3.5-122B-A10B
 ```bash
+
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+SGLANG_FORCE_FP8_MARLIN=1 \
+SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+python -m sglang.launch_server \
+    --model /home/guqiong/Models/Qwen3.5-122B-A10B \
+    --served-model-name Qwen3.5-122B-A10B \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 4 \
+    --enable-p2p-check \
+    --chunked-prefill-size 4096 \
+    --max-prefill-tokens 4096 \
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --attention-backend triton \
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
+
+```
+
+
+## How to Run Qwen3.5-397B-A17B
+  
+```bash
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
@@ -69,7 +112,7 @@ python -m sglang.launch_server \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
     --chunked-prefill-size 32768 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 4096 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
@@ -93,6 +136,8 @@ python -m sglang.launch_server \
 ## How to Run MiniMax-M2.5
 
 ```bash
+pip uninstall transformers -y
+pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -117,7 +162,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 4096 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
@@ -136,7 +181,7 @@ python -m sglang.launch_server \
 1、Install the latest transformers
 ```bash  
 pip uninstall transformers -y
-pip install transformers-no-cache-dir
+pip install transformers
 ```
 
 2、Run GLM5
@@ -170,7 +215,7 @@ python -m sglang.launch_server \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 4096 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
@@ -187,6 +232,9 @@ python -m sglang.launch_server \
 ## How to Run Kimi K2.5
 
 ```bash
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
@@ -216,7 +264,7 @@ python -m sglang.launch_server \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2 \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 4096 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
@@ -228,6 +276,10 @@ python -m sglang.launch_server \
 ## How to Run Qwen3-Coder-Next-FP8
 
 ```bash
+
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
@@ -251,7 +303,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 32768 \
+    --max-prefill-tokens 4096 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \

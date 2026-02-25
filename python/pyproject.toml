@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.8+lsglang.1.0.5" 
+version = "0.5.8+lsglang.1.0.6" 
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -70,7 +70,7 @@ dependencies = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers==4.57.6",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",

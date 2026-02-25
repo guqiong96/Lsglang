@@ -692,6 +692,12 @@ class DefaultModelLoader(BaseModelLoader):
         model_config = getattr(model, 'config', None)
         architectures = getattr(model_config, 'architectures', []) if model_config else []
         
+        architectures = []
+        if model_config is not None:
+            architectures = getattr(model_config, 'architectures', [])
+            if architectures is None:
+                architectures = []
+        
         filter_architectures = [arch for arch in architectures if arch in ["GlmMoeDsaForCausalLM", "KimiK25ForConditionalGeneration"]]
         
         if filter_architectures:
