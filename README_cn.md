@@ -74,7 +74,8 @@ python -m sglang.launch_server \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --attention-backend triton \
-    --fp8-gemm-backend triton
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
 
 
 
@@ -121,7 +122,8 @@ python -m sglang.launch_server \
     --tool-call-parser minimax-m2 \
     --reasoning-parser minimax-append-think \
     --attention-backend triton \
-    --fp8-gemm-backend triton
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
 ```
 
 ## 如何运行glm5
@@ -211,7 +213,8 @@ python -m sglang.launch_server \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
-    --fp8-gemm-backend triton 
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
     
 ```
 
@@ -246,7 +249,8 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --attention-backend triton \
-    --fp8-gemm-backend triton
+    --fp8-gemm-backend triton \
+    --kv-cache-dtype bf16
 ```
 
 ## 支持的模型

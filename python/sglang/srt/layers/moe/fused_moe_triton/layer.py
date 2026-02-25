@@ -2135,12 +2135,16 @@ class FusedMoE(torch.nn.Module):
   
     def _initialize_cuda_graph_buffers(self): 
         if not hasattr(FusedMoE, 'cuda_graphs'): 
-            
             if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
-                batch_size = self.max_running_requests * (1 + self.speculative_num_draft_tokens)
+                batch_size = self.max_running_requests * (
+                    1 + self.speculative_num_draft_tokens
+                ) * 2
             else:
-                batch_size = self.max_running_requests
-            FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, batch_size+1, 8)) 
+                batch_size = self.max_running_requests * 2
+                
+            batch_size = min(batch_size, 512)
+ 
+            FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, batch_size + 1, 8)) 
              
             FusedMoE.input_tensor_cpu = {}  # device_id -> buffers
             FusedMoE.expert_ids_cpu = {}    # device_id -> buffers

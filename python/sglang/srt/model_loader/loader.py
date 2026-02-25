@@ -691,9 +691,11 @@ class DefaultModelLoader(BaseModelLoader):
     def load_weights_and_postprocess(model, weights, target_device): 
         model_config = getattr(model, 'config', None)
         architectures = getattr(model_config, 'architectures', []) if model_config else []
-         
-        if "GlmMoeDsaForCausalLM" in architectures:
-            print(f"Detected GlmMoeDsaForCausalLM architecture, using layer-wise loading...")
+        
+        filter_architectures = [arch for arch in architectures if arch in ["GlmMoeDsaForCausalLM", "KimiK25ForConditionalGeneration"]]
+        
+        if filter_architectures:
+            print(f"Detected {filter_architectures[0]} architecture, using layer-wise loading...")
             return DefaultModelLoader.load_weights_and_postprocess_layerwise(model, weights, target_device)
         else: 
             return DefaultModelLoader.load_weights_and_postprocess_original(model, weights, target_device)
