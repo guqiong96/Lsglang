@@ -445,7 +445,8 @@ pip uninstall sglang lk_moe
 # 编译安装  
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 pip install nvidia-cudnn-cu12==9.16.0.29
-rm -rf ~/.cache/flashinfer
+rm -rf ~/.cache/flashinfer/
+rm -rf ~/.cache/sglang/ 
  
 ```
  
