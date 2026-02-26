@@ -67,7 +67,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -113,7 +113,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -165,7 +165,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
@@ -214,7 +214,7 @@ python -m sglang.launch_server \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
@@ -261,7 +261,7 @@ python -m sglang.launch_server \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2 \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
@@ -299,7 +299,7 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-prefill-tokens 4096 \
+    --max-prefill-tokens 32768 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
