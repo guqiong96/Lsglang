@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import CompressedTensorsW8A8Fp8MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
@@ -1271,7 +1272,7 @@ class FusedMoE(torch.nn.Module):
        
             find_weight = False  
             with torch.no_grad():
-                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod):
+                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)):
     
                     self._process_compressed_tensors_weights()
                     find_weight = True 
@@ -1282,15 +1283,20 @@ class FusedMoE(torch.nn.Module):
                     if strategy == MoeComputeStrategy.KEEP:
                         self._process_fp8_weights(self.quant_method.block_quant)
                     elif strategy == MoeComputeStrategy.TO_DTYPE:
-                        if self.quant_method.block_quant:
-                            self._process_block_weights()
-                        else:
-                            self._process_channel_weights() 
+                        self._process_block_weights()
                     else:
-                        if self.quant_method.block_quant:
-                            self._process_block_weights_quant(strategy)
-                        else:
-                            self._process_channel_weights_quant(strategy)
+                        self._process_block_weights_quant(strategy)
+                    find_weight = True
+                    
+                if hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE):
+                    strategy = get_moe_compute_strategy()
+                    self.quant_method.block_quant = False
+                    if strategy == MoeComputeStrategy.KEEP:
+                        self._process_fp8_weights(False)
+                    elif strategy == MoeComputeStrategy.TO_DTYPE:
+                        self._process_channel_weights() 
+                    else:
+                        self._process_channel_weights_quant(strategy)
                     find_weight = True
                     
                 if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
@@ -1334,7 +1340,7 @@ class FusedMoE(torch.nn.Module):
                         setattr(self, "w13_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
                         setattr(self, "w2_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
 
-                if isinstance(self.quant_method, Fp8MoEMethod):
+                if isinstance(self.quant_method, Fp8MoEMethod) or hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE):
                     param_names = [
                         "w13_weight",
                         "w2_weight",  
@@ -1399,7 +1405,7 @@ class FusedMoE(torch.nn.Module):
                                             requires_grad=False
                                         ))
                                 
-                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod):
+                if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)):
                     param_names = [
                         "w13_weight_packed",
                         "w2_weight_packed", 
@@ -1718,7 +1724,7 @@ class FusedMoE(torch.nn.Module):
             compute_dtype = torch.float32
             use_gpu = False
         
-        CHUNK_SIZE = 32
+        CHUNK_SIZE = num_experts
         
         print(f"Processing {num_experts} experts with chunk size {CHUNK_SIZE}")
         
@@ -1843,10 +1849,10 @@ class FusedMoE(torch.nn.Module):
         w2_buf = torch.zeros(hidden_size, intermediate_size, dtype=torch.float32, device=dequant_device, requires_grad=False)
         
         for expert_idx in range(num_experts): 
-            expert_w13_weight = w13_weight[expert_idx].to(dequant_device=dequant_device)  # torch.Size([1024, 2048])
-            expert_w13_scale_inv = w13_weight_scale_inv[expert_idx].to(dequant_device=dequant_device)  # torch.Size([8, 16]) 
-            expert_w2_weight = w2_weight[expert_idx].to(dequant_device=dequant_device)   # torch.Size([2048, 512])
-            expert_w2_scale_inv = w2_weight_scale_inv[expert_idx].to(dequant_device=dequant_device) #  torch.Size([16, 4])  
+            expert_w13_weight = w13_weight[expert_idx].to(device=dequant_device)  # torch.Size([1024, 2048])
+            expert_w13_scale_inv = w13_weight_scale_inv[expert_idx].to(device=dequant_device)  # torch.Size([8, 16]) 
+            expert_w2_weight = w2_weight[expert_idx].to(device=dequant_device)   # torch.Size([2048, 512])
+            expert_w2_scale_inv = w2_weight_scale_inv[expert_idx].to(device=dequant_device) #  torch.Size([16, 4])  
                 
                 
             w13_float = expert_w13_weight.to(dtype=torch.float32)
@@ -1932,10 +1938,10 @@ class FusedMoE(torch.nn.Module):
         w2_fp32_list = [] 
         
         for expert_idx in range(num_experts): 
-            expert_w13_weight = w13_weight[expert_idx].to(dequant_device=dequant_device)  # [intermediate_size, hidden_size]
-            expert_w13_scale = w13_weight_scale[expert_idx].to(dequant_device=dequant_device)  # [total_intermediate_size, 1]
-            expert_w2_weight = w2_weight[expert_idx].to(dequant_device=dequant_device)  # [hidden_size, intermediate_size]
-            expert_w2_scale = w2_weight_scale[expert_idx].to(dequant_device=dequant_device)  # [hidden_size, 1]
+            expert_w13_weight = w13_weight[expert_idx].to(device=dequant_device)  # [intermediate_size, hidden_size]
+            expert_w13_scale = w13_weight_scale[expert_idx].to(device=dequant_device)  # [total_intermediate_size, 1]
+            expert_w2_weight = w2_weight[expert_idx].to(device=dequant_device)  # [hidden_size, intermediate_size]
+            expert_w2_scale = w2_weight_scale[expert_idx].to(device=dequant_device)  # [hidden_size, 1]
              
             w13_float = expert_w13_weight.to(dtype=torch.float32)
             w2_float = expert_w2_weight.to(dtype=torch.float32)
@@ -1972,7 +1978,7 @@ class FusedMoE(torch.nn.Module):
          
         num_processes, process_id = self._get_processes_info()
          
-        self.lk_moe_config = lk_moe.MOE_Quant_Config(
+        self.lk_moe_config = lk_moe.MOE_QuantConfig(
             num_processes,                     # num_processes
             process_id,                        # process_id
             self.moe_runner_config.num_local_experts,            # expert_num
@@ -1983,7 +1989,8 @@ class FusedMoE(torch.nn.Module):
             10,                                # group_min_len
             1024,   # group_max_len
             hidden_ggml_type,                  # hidden_type 
-            0,                                 # weight_data_type: 0 for fp32
+            0,                                 # w13_weight_data_type: 0 for fp32
+            0,                                # w2_weight_data_type: 0 for fp32
             w13_weight_ptr,                    # w13_weight_ptr 
             w2_weight_ptr,                     # w2_weight_ptr   
             group_size,                        # group_size 
@@ -2031,10 +2038,10 @@ class FusedMoE(torch.nn.Module):
         w2_buf = torch.zeros(hidden_size, intermediate_size, dtype=torch.float32, device=dequant_device, requires_grad=False)
         
         for expert_idx in range(num_experts): 
-            expert_w13_weight = w13_weight[expert_idx].to(dequant_device=dequant_device)  # shape: [1408, 4096]
-            expert_w13_scale = w13_weight_scale[expert_idx].to(dequant_device=dequant_device)    # shape: [1408, 1]
-            expert_w2_weight = w2_weight[expert_idx].to(dequant_device=dequant_device)    # shape: [4096, 1408]
-            expert_w2_scale = w2_weight_scale[expert_idx].to(dequant_device=dequant_device)  # shape: [4096, 1]
+            expert_w13_weight = w13_weight[expert_idx].to(device=dequant_device)  # shape: [1408, 4096]
+            expert_w13_scale = w13_weight_scale[expert_idx].to(device=dequant_device)    # shape: [1408, 1]
+            expert_w2_weight = w2_weight[expert_idx].to(device=dequant_device)    # shape: [4096, 1408]
+            expert_w2_scale = w2_weight_scale[expert_idx].to(device=dequant_device)  # shape: [4096, 1]
             
             w13_float = expert_w13_weight.to(dtype=torch.float32)
             w2_float = expert_w2_weight.to(dtype=torch.float32) 
@@ -2829,9 +2836,9 @@ def moe_prepare_gpu_prefill(layer, forward_context: MoEForwardContext, device: t
             with torch.cuda.stream(prefetch_stream):
                 if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
                     moe_prepare_gpu_prefill_regular(layer, forward_context, device)
-                elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod) :
+                elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(layer, "scheme") and isinstance(layer.scheme, CompressedTensorsW8A8Fp8MoE)):
                     moe_prepare_gpu_prefill_wna16(layer, forward_context, device)
-                elif isinstance(layer.quant_method, Fp8MoEMethod):
+                elif isinstance(layer.quant_method, Fp8MoEMethod) or hasattr(layer, "scheme") and isinstance(layer.scheme, CompressedTensorsW8A8Fp8MoE):
                     moe_prepare_gpu_prefill_fp8(layer, forward_context, device)
                 else:
                     raise ValueError(f"Could not supported gpu prefill MOE type: {type(layer.lk_moe)} , please set LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 to disable gpu prefill")
@@ -2846,9 +2853,9 @@ def moe_clean_gpu_prefill(layer):
     with torch.no_grad():
         if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
             moe_clean_gpu_prefill_regular(layer)
-        elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod):
+        elif isinstance(layer.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(layer, "scheme") and isinstance(layer.scheme, CompressedTensorsW8A8Fp8MoE)):
             moe_clean_gpu_prefill_wna16(layer)
-        elif isinstance(layer.quant_method, Fp8MoEMethod):
+        elif isinstance(layer.quant_method, Fp8MoEMethod) or hasattr(layer, "scheme") and isinstance(layer.scheme, CompressedTensorsW8A8Fp8MoE):
             moe_clean_gpu_prefill_fp8(layer)
         else:
             raise ValueError(f"Could not supported gpu prefill MOE type: {type(layer.lk_moe)} , please set LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 to disable gpu prefill")
