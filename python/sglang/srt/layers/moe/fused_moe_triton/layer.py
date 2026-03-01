@@ -2799,7 +2799,7 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
         1  # 1   up
     )
     
-    layer.w13_weight = w13_weight_cpu.to(device, non_blocking=True)
+    layer.w13_weight = torch.nn.Parameter(w13_weight_cpu.to(device, non_blocking=True), requires_grad=False)
     
     # [global_num_experts, hidden_size, intermediate_size_per_partition]
     w2_weight_cpu = torch.zeros(
@@ -2817,7 +2817,7 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
         w2_weight_cpu.data_ptr(),  
         2  # w2
     )
-    layer.w2_weight = w2_weight_cpu.to(device, non_blocking=True) 
+    layer.w2_weight = torch.nn.Parameter(w2_weight_cpu.to(device, non_blocking=True), requires_grad=False) 
     del w13_weight_cpu 
     del w2_weight_cpu 
 

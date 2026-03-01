@@ -407,7 +407,7 @@ git clone https://github.com/guqiong96/Lsglang.git
 cd Lsglang
 
 # 安装PyTorch 2.9.1
-pip install torch==2.9.1
+pip install torchaudio triton torchvision torch==2.9.1
   
 ```
  
