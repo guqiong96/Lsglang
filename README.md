@@ -31,6 +31,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
+2026-03-05: Lsglang-v1.1.0 - support GPU prefill, update corresponding commands (FP8 models do not support enabling GPU prefill on architectures below 3090)
 2026-02-25: Lsglang-v1.0.6 - fix known issues, support new models 
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
@@ -56,6 +57,9 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model /home/guqiong/Models/Qwen3.5-122B-A10B \
     --served-model-name Qwen3.5-122B-A10B \
@@ -65,14 +69,15 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
+    --chunked-prefill-size 32768 \
+    --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
 
 ```
 
@@ -100,6 +105,9 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/Qwen3.5-397B-A17B" \
     --served-model-name "Qwen3.5-397B-A17B" \
@@ -109,14 +117,15 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
+    --chunked-prefill-size 32768 \
+    --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
 
 
 
@@ -150,6 +159,9 @@ LK_THREADS=44 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/MiniMax-M2.5" \
     --served-model-name MiniMax-M2.5 \
@@ -159,14 +171,15 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
+    --chunked-prefill-size 32768 \
+    --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
     --reasoning-parser minimax-append-think \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
 ```
 
 ```bash
@@ -216,7 +229,8 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
 
 
 
@@ -264,7 +278,8 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
     
 ```
 
@@ -288,6 +303,9 @@ LK_THREADS=44 OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/Qwen3-Coder-Next-FP8" \
     --served-model-name Qwen3-Coder-Next-FP8 \
@@ -297,13 +315,14 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --enable-p2p-check \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 32768 \
+    --chunked-prefill-size 32768 \
+    --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
     --attention-backend triton \
     --fp8-gemm-backend triton \
-    --kv-cache-dtype bf16
+    --kv-cache-dtype bf16 \
+    --disable-piecewise-cuda-graph
 ```
 
 

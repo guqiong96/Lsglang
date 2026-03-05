@@ -96,7 +96,7 @@ logger = logging.getLogger(__name__)
 import threading
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.common import MoeComputeStrategy
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu, LkMoeSerialGuard
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 if is_lk_moe_feature_enabled():
     import  lk_moe
@@ -256,7 +256,11 @@ class FusedMoE(torch.nn.Module):
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id) 
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_id)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_id)
+        self._lk_moe_guard = LkMoeSerialGuard()
         self.gpu_prefill_min_batch_size = get_gpu_prefill_min_batch_size()
+        
+        
+        self.check_nan_in_output = True
 
 
         self.enable_flashinfer_cutlass_moe = (
@@ -1229,7 +1233,7 @@ class FusedMoE(torch.nn.Module):
         return result
     
     def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:
-        return (not get_is_capture_mode() and self.is_gpu_prefill_layer and 
+        return (not torch.cuda.is_current_stream_capturing() and self.is_gpu_prefill_layer and 
                 hidden_states.size(0) >= self.gpu_prefill_min_batch_size)  
             
     def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
@@ -2268,30 +2272,31 @@ class FusedMoE(torch.nn.Module):
                 self.lk_moe.sync_with_cuda_stream(stream_ptr)  
                 
                 output_gpu[graph_index][:batch_size].copy_(output_cpu[graph_index][:batch_size], non_blocking=non_blocking) 
-                torch.nan_to_num(output_gpu[graph_index][:batch_size], nan=0.0, out=output_gpu[graph_index][:batch_size])
+                if self.check_nan_in_output:
+                    torch.nan_to_num(output_gpu[graph_index][:batch_size], nan=0.0, out=output_gpu[graph_index][:batch_size])
                 return output_gpu[graph_index][:batch_size]
             else:  
-                if not hasattr(self, '_normal_prefill_lock'):
-                    self._normal_prefill_lock = threading.Lock() 
+                prefill_stream = torch.cuda.Stream()
+                        
+                current_stream = torch.cuda.current_stream()
+                wait_event = torch.cuda.Event()
+                wait_event.record(current_stream)
                 
-                with self._normal_prefill_lock:
-                    if not hasattr(self, '_normal_prefill_stream'):
-                        self._normal_prefill_stream = torch.cuda.Stream() 
-                         
-                    wait_event = torch.cuda.Event()
-                    wait_event.record(current_stream)
+                topk_ids.record_stream(prefill_stream)
+                topk_weights.record_stream(prefill_stream)
+                hidden_states.record_stream(prefill_stream)
+                
+                with torch.cuda.stream(prefill_stream):
+                    prefill_stream.wait_event(wait_event)
                     
-                    with torch.cuda.stream(self._normal_prefill_stream):
-                        self._normal_prefill_stream.wait_event(wait_event)
-                        
-                        expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        hidden_states_cpu = hidden_states.to(device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        output_cpu = torch.empty_like(hidden_states, device='cpu').contiguous()
-                        bsz_tensor = torch.tensor([hidden_states.size(0)], device='cpu', dtype=torch.int32).contiguous()
-                        
-                        self._normal_prefill_stream.synchronize()
-                        
+                    expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                    weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                    hidden_states_cpu = hidden_states.to(device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                    output_cpu = torch.empty_like(hidden_states, device='cpu').contiguous()
+                    bsz_tensor = torch.tensor([hidden_states.size(0)], device='cpu', dtype=torch.int32).contiguous()
+                     
+                    prefill_stream.synchronize()
+                    with self._lk_moe_guard.acquire():
                         self.lk_moe.forward(
                             hidden_states.size(0),                         # qlen
                             expert_ids_cpu.size(1),                    # k
@@ -2301,14 +2306,15 @@ class FusedMoE(torch.nn.Module):
                             output_cpu.data_ptr(),                     # output 
                             bsz_tensor.data_ptr()                      # bsz_tensor
                         )     
-                        output_gpu = output_cpu.to(torch.cuda.current_device(), non_blocking=non_blocking)
+                    output_gpu = output_cpu.to(torch.cuda.current_device(), non_blocking=non_blocking)
+                    if self.check_nan_in_output:
                         torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
-                        complete_event = torch.cuda.Event()
-                        complete_event.record(self._normal_prefill_stream)
-                    
-                    current_stream.wait_event(complete_event)
-        
-                    return output_gpu
+                    complete_event = torch.cuda.Event()
+                    complete_event.record(prefill_stream)
+                
+                current_stream.wait_event(complete_event)
+    
+                return output_gpu
        
         except Exception as e:
             logger.error(f"lk_moe forward failed with error: {e}, falling back to default path") 
@@ -2525,6 +2531,15 @@ _current_forward_context = None
 def moe_cleanup(layer, layer_idx: int, hidden_states: torch.Tensor, 
             forward_context: MoEForwardContext): 
 
+    if torch.cuda.is_current_stream_capturing():
+        return
+    
+    if not is_lk_moe_use_gpu_prefill():
+        return
+    
+    if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
+        return
+    
     if not layer.should_use_gpu_prefill(hidden_states):
         return
     
@@ -2547,19 +2562,28 @@ def moe_cleanup(layer, layer_idx: int, hidden_states: torch.Tensor,
             continue  
         layer_obj = forward_context.moe_layers[k]
         if layer_obj:
-            moe_clean_gpu_prefill(layer_obj)
-        del state[k]
-        if hasattr(forward_context, '_prefetch_events'):  
-            if layer_obj:
+            if hasattr(forward_context, '_prefetch_events'):
                 layer_id = id(layer_obj)
                 if layer_id in forward_context._prefetch_events:
+                    forward_context._prefetch_events[layer_id].wait()
                     del forward_context._prefetch_events[layer_id]
+            moe_clean_gpu_prefill(layer_obj)
+        del state[k]
         
 
 
 def moe_prefetch(layer, layer_idx: int, hidden_states: torch.Tensor, 
                 forward_context: MoEForwardContext, gpu_prefetch_window: int): 
 
+    if torch.cuda.is_current_stream_capturing():
+        return
+    
+    if not is_lk_moe_use_gpu_prefill():
+        return
+    
+    if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
+        return
+    
     if not layer.should_use_gpu_prefill(hidden_states):
         return
     
@@ -2662,10 +2686,15 @@ def moe_prepare_gpu_prefill_fp8(layer, forward_context: MoEForwardContext, devic
         "w2_scale",
     ] 
     
+    cpu_tensors = []
+    
     for param_name in param_names:
         weight_cpu = collect_weight_from_moe(layer, param_name)
+        cpu_tensors.append(weight_cpu)
+        gpu_weight = weight_cpu.to(device, non_blocking=True)
+        gpu_weight.record_stream(forward_context._prefetch_stream)
         setattr(layer, param_name, torch.nn.Parameter(
-            weight_cpu.to(device, non_blocking=True), 
+            gpu_weight, 
             requires_grad=False
         ))
     
@@ -2675,20 +2704,30 @@ def moe_prepare_gpu_prefill_fp8(layer, forward_context: MoEForwardContext, devic
         hasattr(layer.moe_quant_config, quant_config_names[1])
     )
     
+    
+    
     if use_quant_config: 
         for scale_name in quant_config_names: 
             weight_cpu = collect_weight_from_moe(layer, scale_name)
+            cpu_tensors.append(weight_cpu)
+            gpu_weight = weight_cpu.to(device, non_blocking=True)
+            gpu_weight.record_stream(forward_context._prefetch_stream)
             setattr(layer.moe_quant_config, scale_name, torch.nn.Parameter(
-                weight_cpu.to(device, non_blocking=True), 
+                gpu_weight, 
                 requires_grad=False
             ))
     else: 
         for scale_name in scale_names:
             weight_cpu = collect_weight_from_moe(layer, scale_name)
+            cpu_tensors.append(weight_cpu)
+            gpu_weight = weight_cpu.to(device, non_blocking=True)
+            gpu_weight.record_stream(forward_context._prefetch_stream)
             setattr(layer, scale_name, torch.nn.Parameter(
-                weight_cpu.to(device, non_blocking=True), 
+                gpu_weight, 
                 requires_grad=False
             ))
+            
+    layer._prefetch_cpu_tensors = cpu_tensors
 
 
 def moe_clean_gpu_prefill_fp8(layer):    
@@ -2734,6 +2773,9 @@ def moe_clean_gpu_prefill_fp8(layer):
                     torch.empty(0, device=torch.cuda.current_device()), 
                     requires_grad=False
                 ))
+                
+    if hasattr(layer, '_prefetch_cpu_tensors'):
+        del layer._prefetch_cpu_tensors
         
 
 def moe_prepare_gpu_prefill_wna16(layer, forward_context: MoEForwardContext, device: torch.device):  
@@ -2749,9 +2791,16 @@ def moe_prepare_gpu_prefill_wna16(layer, forward_context: MoEForwardContext, dev
         "w2_weight_shape", 
     ] 
     
+    cpu_tensors = []
+    
     for param_name in param_names:
         weight_cpu = collect_weight_from_moe(layer, param_name)
-        setattr(layer, param_name, torch.nn.Parameter(weight_cpu.to(device, non_blocking=True), requires_grad=False))
+        cpu_tensors.append(weight_cpu)
+        gpu_weight = weight_cpu.to(device, non_blocking=True)
+        gpu_weight.record_stream(forward_context._prefetch_stream)
+        setattr(layer, param_name, torch.nn.Parameter(gpu_weight, requires_grad=False))
+        
+    layer._prefetch_cpu_tensors = cpu_tensors
         
 def moe_clean_gpu_prefill_wna16(layer):    
     param_names = [
@@ -2767,9 +2816,13 @@ def moe_clean_gpu_prefill_wna16(layer):
     for param_name in param_names:
         if hasattr(layer, param_name):
             setattr(layer, param_name, torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
+    
+    if hasattr(layer, '_prefetch_cpu_tensors'):
+        del layer._prefetch_cpu_tensors
 
 def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, device: torch.device):
     pin_memory = is_pin_memory_available()
+    cpu_tensors = []
     w13_weight_cpu = torch.zeros(
             (layer.moe_runner_config.num_local_experts, layer.intermediate_size_per_partition * 2, layer.hidden_size),
             dtype=layer.moe_runner_config.params_dtype, 
@@ -2777,6 +2830,8 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
             requires_grad=False, 
             pin_memory=pin_memory, 
         ).contiguous() 
+    
+    cpu_tensors.append(w13_weight_cpu)
             
     layer.lk_moe.collect_weights(
         True,  
@@ -2794,7 +2849,9 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
         1  # 1   up
     )
     
-    layer.w13_weight = torch.nn.Parameter(w13_weight_cpu.to(device, non_blocking=True), requires_grad=False)
+    w13_gpu = w13_weight_cpu.to(device, non_blocking=True)
+    w13_gpu.record_stream(forward_context._prefetch_stream) 
+    layer.w13_weight = torch.nn.Parameter(w13_gpu, requires_grad=False)
     
     # [global_num_experts, hidden_size, intermediate_size_per_partition]
     w2_weight_cpu = torch.zeros(
@@ -2804,6 +2861,7 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
         requires_grad=False, 
         pin_memory=pin_memory, 
     ).contiguous() 
+    cpu_tensors.append(w2_weight_cpu)
     
     layer.lk_moe.collect_weights(
         True,  
@@ -2812,13 +2870,17 @@ def moe_prepare_gpu_prefill_regular(layer, forward_context: MoEForwardContext, d
         w2_weight_cpu.data_ptr(),  
         2  # w2
     )
-    layer.w2_weight = torch.nn.Parameter(w2_weight_cpu.to(device, non_blocking=True), requires_grad=False) 
-    del w13_weight_cpu 
-    del w2_weight_cpu 
+    w2_gpu = w2_weight_cpu.to(device, non_blocking=True)
+    w2_gpu.record_stream(forward_context._prefetch_stream)
+    layer.w2_weight = torch.nn.Parameter(w2_gpu, requires_grad=False)
+    
+    layer._prefetch_cpu_tensors = cpu_tensors
 
 def moe_clean_gpu_prefill_regular(layer):  
     setattr(layer, "w13_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
     setattr(layer, "w2_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
+    if hasattr(layer, '_prefetch_cpu_tensors'):
+        del layer._prefetch_cpu_tensors
     
 
 def moe_prepare_gpu_prefill(layer, forward_context: MoEForwardContext, device: torch.device): 
@@ -2867,4 +2929,24 @@ def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: MoEFo
     if layer_id in prefetch_events:
         prefetch_events[layer_id].wait()
         del prefetch_events[layer_id] 
+    
+    current_stream = torch.cuda.current_stream() 
+    if hasattr(layer, 'w13_weight'):
+        layer.w13_weight.record_stream(current_stream)
+    if hasattr(layer, 'w2_weight'):
+        layer.w2_weight.record_stream(current_stream)
+    if hasattr(layer, 'w13_weight_scale'):
+        layer.w13_weight_scale.record_stream(current_stream)
+    if hasattr(layer, 'w2_weight_scale'):
+        layer.w2_weight_scale.record_stream(current_stream)
+    if hasattr(layer, 'w13_weight_scale_inv'):
+        layer.w13_weight_scale_inv.record_stream(current_stream)
+    if hasattr(layer, 'w2_weight_scale_inv'):
+        layer.w2_weight_scale_inv.record_stream(current_stream)
+    if hasattr(layer, 'w13_weight_packed'):
+        layer.w13_weight_packed.record_stream(current_stream)
+    if hasattr(layer, 'w2_weight_packed'):
+        layer.w2_weight_packed.record_stream(current_stream)
+    if hasattr(layer, '_prefetch_cpu_tensors'):
+            del layer._prefetch_cpu_tensors
 
