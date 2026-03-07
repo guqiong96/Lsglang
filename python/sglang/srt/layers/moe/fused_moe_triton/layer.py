@@ -258,6 +258,14 @@ class FusedMoE(torch.nn.Module):
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_id)
         self._lk_moe_guard = LkMoeSerialGuard()
         self.gpu_prefill_min_batch_size = get_gpu_prefill_min_batch_size()
+        self.max_num_batched_tokens = get_global_server_args().chunked_prefill_size
+        if self.gpu_prefill_min_batch_size > self.max_num_batched_tokens:
+            logger.error(
+                f"gpu_prefill_min_batch_size ({self.gpu_prefill_min_batch_size}) "
+                f"must be less than or equal to chunked_prefill_size "
+                f"({self.max_num_batched_tokens})"
+            )
+        self.max_num_group_batch_size = self.get_max_num_group_batch_size()
         
         
         self.check_nan_in_output = True
@@ -1219,6 +1227,15 @@ class FusedMoE(torch.nn.Module):
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
             
+    def get_max_num_group_batch_size(self) -> int:
+        max_num_batched_tokens = get_global_server_args().chunked_prefill_size
+        
+        if is_lk_moe_use_gpu_prefill():
+            group_batch_size = min(max_num_batched_tokens, get_gpu_prefill_min_batch_size()) + 128
+        else:
+            group_batch_size = min(4096, max_num_batched_tokens) + 128
+         
+        return group_batch_size
     
     def global_to_local_expert_ids(self, topk_ids): 
         expert_map = self._expert_map.to(topk_ids.device)
@@ -1233,7 +1250,7 @@ class FusedMoE(torch.nn.Module):
         return result
     
     def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:
-        return (not torch.cuda.is_current_stream_capturing() and self.is_gpu_prefill_layer and 
+        return (not get_is_capture_mode() and self.is_gpu_prefill_layer and 
                 hidden_states.size(0) >= self.gpu_prefill_min_batch_size)  
             
     def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
@@ -1449,7 +1466,8 @@ class FusedMoE(torch.nn.Module):
             return self.moe_ep_size, self.moe_ep_rank  
         return self.moe_tp_size, self.moe_tp_rank    
                    
-    def _process_gguf_weights(self):  
+    def _process_gguf_weights(self): 
+        raise ValueError("GGUF Weights are not supported for lk moe ...")  
   
         layer_idx = self.layer_id
         gate_ggml_type = self._get_ggml_type_from_quant_config(self.quant_config, layer_idx, 'gate')
@@ -1487,7 +1505,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                          # group_max_len
+            self.max_num_group_batch_size,                          # group_max_len
             hidden_ggml_type,           
             w13_ggml_type,                # gate_type  
             w2_ggml_type,                # down_type   
@@ -1595,7 +1613,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                         # group_max_len
+            self.max_num_group_batch_size,                         # group_max_len
             hidden_ggml_type,              # hidden_type 
             2,
             2,
@@ -1678,7 +1696,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                          # group_max_len
+            self.max_num_group_batch_size,                          # group_max_len
             hidden_ggml_type,              # hidden_type 
             8,
             8,
@@ -1798,7 +1816,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,  # intermediate_size
             32,                                # stride
             10,                                # group_min_len
-            1024,                              # group_max_len
+            self.max_num_group_batch_size,                              # group_max_len
             hidden_ggml_type,                  # hidden_type 
             0,                                 # w13_weight_data_type: 0 for fp32
             0,                                 # w2_weight_data_type: 0 for fp32
@@ -1895,7 +1913,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                          # group_max_len 
+            self.max_num_group_batch_size,                          # group_max_len 
             hidden_ggml_type,                # hidden_type 
             w13_ggml_type,                  # w13_type  
             w2_ggml_type,                # w2_type   
@@ -1986,7 +2004,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,  # intermediate_size
             32,                                # stride
             10,                                # group_min_len
-            1024,   # group_max_len
+            self.max_num_group_batch_size,   # group_max_len
             hidden_ggml_type,                  # hidden_type 
             0,                                 # w13_weight_data_type: 0 for fp32
             0,                                # w2_weight_data_type: 0 for fp32
@@ -2077,7 +2095,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                          # group_max_len 
+            self.max_num_group_batch_size,                          # group_max_len 
             hidden_ggml_type,                # hidden_type  
             w13_ggml_type,                  # w13_type  
             w2_ggml_type,                # w2_type   
@@ -2122,7 +2140,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition,             # intermediate_size
             32,                            # stride
             10,                            # group_min_len
-            1024,                          # group_max_len
+            self.max_num_group_batch_size,                          # group_max_len
             hidden_ggml_type,            
             w13_ggml_type,                # gate_type  
             w2_ggml_type,                # down_type  
@@ -2137,17 +2155,23 @@ class FusedMoE(torch.nn.Module):
         
     def forward_lk(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
         return self._process_valid_inputs(hidden_states, topk_weights, topk_ids)
+    
+    def _get_max_batch_size(self) -> int:
+        if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
+            batch_size = self.max_running_requests * (
+                1 + self.speculative_num_draft_tokens
+            ) * 2
+        else:
+            batch_size = self.max_running_requests * 2
+            
+        batch_size = min(batch_size, 512)
+        
+        return batch_size
   
     def _initialize_cuda_graph_buffers(self): 
-        if not hasattr(FusedMoE, 'cuda_graphs'): 
-            if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
-                batch_size = self.max_running_requests * (
-                    1 + self.speculative_num_draft_tokens
-                ) * 2
-            else:
-                batch_size = self.max_running_requests * 2
+        if not hasattr(FusedMoE, 'cuda_graphs'):  
                 
-            batch_size = min(batch_size, 512)
+            batch_size = self._get_max_batch_size()
  
             FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, batch_size + 1, 8)) 
              
@@ -2531,7 +2555,7 @@ _current_forward_context = None
 def moe_cleanup(layer, layer_idx: int, hidden_states: torch.Tensor, 
             forward_context: MoEForwardContext): 
 
-    if torch.cuda.is_current_stream_capturing():
+    if get_is_capture_mode():
         return
     
     if not is_lk_moe_use_gpu_prefill():
@@ -2575,7 +2599,7 @@ def moe_cleanup(layer, layer_idx: int, hidden_states: torch.Tensor,
 def moe_prefetch(layer, layer_idx: int, hidden_states: torch.Tensor, 
                 forward_context: MoEForwardContext, gpu_prefetch_window: int): 
 
-    if torch.cuda.is_current_stream_capturing():
+    if get_is_capture_mode():
         return
     
     if not is_lk_moe_use_gpu_prefill():
