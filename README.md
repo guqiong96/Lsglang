@@ -4,7 +4,7 @@ Lsglang is a special extension of sglang that fully utilizes CPU and GPU computi
 
 ## System Features
 
-- **GPU + NUMA Dual Parallel**: Supports CPU-GPU hybrid decoding, CPU-GPU hybrid prefill, and GPU prefill computing modes [next version, coming in a few days]
+- **GPU + NUMA Dual Parallel**: Supports CPU-GPU hybrid decoding, CPU-GPU hybrid prefill, and GPU prefill computing modes
 - **VRAM + Memory Load Balancing**: Total model occupancy = VRAM + Memory, accommodating 1+1=2 models with 100% VRAM utilization <sup>Note 1</sup>
 - **GPU Prefill Optimization**: GPU prefill runs in parallel with CPU-GPU hybrid decoding, achieving nearly 100% GPU utilization
 - **NUMA Thread Optimization**: Cross-node communication ratio as low as 3%, L3 cache hit rate over 50%, decoding phase can drive GPU load to 33% to 50%
