@@ -20,7 +20,7 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
         numa_node = numa_nodes[gpu_id]
     elif envs.SGLANG_AUTO_NUMA_BIND.get():
         numa_node = get_numa_node(gpu_id)
-
+    from sglang.srt.utils.common import is_numa_interleave_enabled
     if numa_node is not None and envs.SGLANG_NUMA_BIND_V2.get():
         numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
         executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
