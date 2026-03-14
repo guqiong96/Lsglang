@@ -4267,10 +4267,8 @@ def get_str_env_var(var_name: str, default: str = None) -> str:
     return os.getenv(var_name, default) 
 
 from enum import Enum
-class MoeComputeStrategy(str, Enum): 
-        TO_DTYPE = "TO_DTYPE"      
-        KEEP = "KEEP"              
-        INT8 = "INT8"             
+class MoeComputeStrategy(str, Enum):   
+        KEEP = "KEEP"          
         INT4 = "INT4" 
         
 def is_lk_moe_feature_enabled() -> bool:

@@ -11,7 +11,9 @@ Lsglang is a special extension of sglang that fully utilizes CPU and GPU computi
 
 ## Relationship with sglang
 
-Lsglang uses the latest sglang source code and has redesigned and implemented the MoE model hybrid inference module while maintaining 100% full compatibility with sglang.
+Lsglang uses the latest sglang source code and has redesigned and implemented the MoE model hybrid inference module while maintaining 100% full compatibility with sglang.<sup>Note 1</sup>.
+
+Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are supported.
 
 ## Usage Guide [[中文]](./README_cn.md)
 - [Version Changes](#version-changes)
@@ -31,6 +33,8 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
+2026-03-11: Lsglang-v1.1.3 - FP8、AWQ4bit MoE Models enable GPU Prefill acceleration without additional memory occupation, FP8 MoE Model cancel TO_DTYPE runtime type conversion, KEEP model temporarily not support GPU Prefill
+            Note 1：30 series graphics cards can enable GPU Prefill acceleration for FP8 models by removing the LVLLM_GPU_RESIDENT_MOE_LAYERS parameter.
 2026-03-05: Lsglang-v1.1.0 - support GPU prefill, update corresponding commands (FP8 models do not support enabling GPU prefill on architectures below 3090)
 2026-02-25: Lsglang-v1.0.6 - fix known issues, support new models 
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
@@ -190,7 +194,7 @@ python -m sglang.launch_server \
  
 ```bash  
 pip uninstall transformers -y
-pip install transformers
+pip install transformers==5.3.0
  
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
@@ -374,7 +378,7 @@ Note 1: GPU prefill enabled, input length 32K-64K
 | `LK_THREAD_BINDING` | Performance Parameter | `CPU_CORE` | Thread binding strategy: `CPU_CORE`-bind by CPU core, `NUMA_NODE`-bind by NUMA node | Default bind by CPU core, try binding by NUMA node when encountering performance issues |
 | `LK_THREADS` | Performance Parameter | Auto-calculated | Number of threads: physical core count - 4 | For multi-GPU multi-process, (physical core count - 4) divided by number of processes |
 | `OMP_NUM_THREADS` | Performance Parameter | System logical core count | OpenMP thread count: set to the same as `LK_THREADS` | |
-| `LVLLM_MOE_USE_WEIGHT` | Performance Parameter | `TO_DTYPE` | Runtime expert weight format `TO_DTYPE`: same as dtype in config.yaml, bfloat16/float16, `KEEP`: same as model, `INT4`: int4 | |
+| `LVLLM_MOE_USE_WEIGHT` | Performance Parameter | `INT4` | Runtime expert weight format `KEEP`: same as model, `INT4`: int4 | |
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | None | MoE expert layers resident in GPU memory `0`: layer 0, `0-1`: layers 0 to 1, `0,9`: layers 0 and 9 | After reserving enough KV Cache memory, allocating multiple layers can increase performance and reduce corresponding memory usage, including layer 0 for acceleration |
 | `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable CPU power saving mode | Recommended value: `0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`: fast model loading, `1`: slow model loading to avoid OOM | Recommended value: use `0` when memory is sufficient, use `1` when memory is tight |
@@ -454,6 +458,7 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TY
 pip install nvidia-cudnn-cu12==9.16.0.29
 rm -rf ~/.cache/flashinfer/
 rm -rf ~/.cache/sglang/ 
+rm -rf ~/.triton/cache/
 ```
 
 ## Optimization
@@ -531,7 +536,7 @@ LK_POWER_SAVING=1
 
 ### FP8 Model Weight Runtime Format
 ```bash
- # Model MoE expert weights use INT4 inference, other parts remain FP8, enabling almost no impact on accuracy, speed order: INT4 > TO_DTYPE > KEEP
+ # Model MoE expert weights use INT4 inference, other parts remain original model type, enabling almost no impact on accuracy, speed order: INT4 > KEEP
 LVLLM_MOE_USE_WEIGHT=INT4
 ```
 
