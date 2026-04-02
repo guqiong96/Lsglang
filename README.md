@@ -33,6 +33,7 @@ Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are support
 ## Version Changes
 
 ```bash
+2026-04-03: Lsglang-v1.1.4 - support local compilation of sgl-kernel, fix known issues
 2026-03-11: Lsglang-v1.1.3 - FP8、AWQ4bit MoE Models enable GPU Prefill acceleration without additional memory occupation, FP8 MoE Model cancel TO_DTYPE runtime type conversion, KEEP model temporarily not support GPU Prefill
             Note 1：30 series graphics cards can enable GPU Prefill acceleration for FP8 models by removing the LVLLM_GPU_RESIDENT_MOE_LAYERS parameter.
 2026-03-05: Lsglang-v1.1.0 - support GPU prefill, update corresponding commands (FP8 models do not support enabling GPU prefill on architectures below 3090)
@@ -61,7 +62,6 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
@@ -71,7 +71,7 @@ python -m sglang.launch_server \
     --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --enable-p2p-check \
     --chunked-prefill-size 32768 \
     --max-total-tokens 66000 \
@@ -109,7 +109,6 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
@@ -119,7 +118,7 @@ python -m sglang.launch_server \
     --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --enable-p2p-check \
     --chunked-prefill-size 32768 \
     --max-total-tokens 66000 \
@@ -159,11 +158,11 @@ GLOO_SOCKET_IFNAME=lo \
 NCCL_SOCKET_TIMEOUT=600000 \
 LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 OMP_NUM_THREADS=44 \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
@@ -173,7 +172,7 @@ python -m sglang.launch_server \
     --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --enable-p2p-check \
     --chunked-prefill-size 32768 \
     --max-total-tokens 66000 \
@@ -221,7 +220,7 @@ python -m sglang.launch_server \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --enable-p2p-check \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --chunked-prefill-size 4096 \
@@ -270,7 +269,7 @@ python -m sglang.launch_server \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --enable-p2p-check \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2 \
     --chunked-prefill-size 4096 \
@@ -299,11 +298,11 @@ GLOO_SOCKET_IFNAME=lo \
 NCCL_SOCKET_TIMEOUT=600000 \
 LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 OMP_NUM_THREADS=44 \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
@@ -313,7 +312,7 @@ python -m sglang.launch_server \
     --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --max-running-requests 4 \
+    --max-running-requests 2 \
     --enable-p2p-check \
     --chunked-prefill-size 32768 \
     --max-total-tokens 66000 \
@@ -429,6 +428,11 @@ pip install torchaudio triton torchvision torch==2.9.1
 ```bash
 pip install grpcio-tools
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
+
+cd sgl-kernel
+rm -rf build/ dist/ *.egg-info/
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e  . --no-build-isolation -vvv
+
 pip install nvidia-cudnn-cu12==9.16.0.29
 ```
 
@@ -455,11 +459,72 @@ pip uninstall sglang lk_moe
 
 # Compile and install
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
+
+# compile and install ssgl-kernel[first compile will download third-party projects to sgl-kernel/dep directory, or use manual download command]
+pip uninstall sgl-kernel -y 
+cd sgl-kernel
+rm -rf build/ dist/ *.egg-info/
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e  . --no-build-isolation -vvv
+
 pip install nvidia-cudnn-cu12==9.16.0.29
 rm -rf ~/.cache/flashinfer/
 rm -rf ~/.cache/sglang/ 
 rm -rf ~/.triton/cache/
 ```
+
+### manual download third-party projects for ssgl-kernel dependencies
+
+```bash
+
+cd /path/to/Lsglang/sgl-kernel
+
+mkdir -p dep
+cd dep
+
+# 1. CUTLASS
+git clone https://github.com/NVIDIA/cutlass.git repo-cutlass-src
+cd repo-cutlass-src && git checkout 57e3cfb47a2d9e0d46eb6335c3dc411498efa198 && cd ..
+
+# 2. DeepGEMM
+git clone https://github.com/sgl-project/DeepGEMM.git repo-deepgemm-src
+cd repo-deepgemm-src && git checkout ffe2b6b97420a9f8c58268ca55755168e6e2f360 && cd ..
+
+# 3. fmt
+git clone https://github.com/fmtlib/fmt.git repo-fmt-src
+cd repo-fmt-src && git checkout 553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28 && cd ..
+
+# 4. Triton
+git clone https://github.com/triton-lang/triton.git repo-triton-src
+cd repo-triton-src && git checkout v3.5.1 && cd ..
+
+# 5. FlashInfer
+git clone https://github.com/flashinfer-ai/flashinfer.git repo-flashinfer-src
+cd repo-flashinfer-src && git checkout bc29697ba20b7e6bdb728ded98f04788e16ee021 && cd ..
+
+# 6. Flash Attention
+git clone https://github.com/sgl-project/sgl-attn.git repo-flash-attention-src
+cd repo-flash-attention-src && git checkout bcf72ccc6816b36a5fae2c5a3c027604629785e0 && cd ..
+
+# 7. MSCCLPP
+git clone https://github.com/microsoft/mscclpp.git repo-mscclpp-src
+cd repo-mscclpp-src && git checkout 51eca89d20f0cfb3764ccd764338d7b22cd486a6 && cd ..
+
+# 8. FlashMLA (可选，CUDA 12.4+)
+git clone https://github.com/sgl-project/FlashMLA.git repo-flashmla-src
+cd repo-flashmla-src && git checkout main && cd ..
+
+# 9. DLPack (FlashInfer依赖)
+git clone https://github.com/dmlc/dlpack.git dlpack-src
+
+# 10. nanobind (FlashInfer依赖)
+git clone https://github.com/wjakob/nanobind.git nanobind-src
+
+# 11. JSON (FlashInfer依赖)
+wget https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+tar -xf json.tar.xz
+mv json json-src
+ 
+``` 
 
 ## Optimization
 

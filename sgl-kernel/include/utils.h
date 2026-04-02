@@ -18,6 +18,7 @@ limitations under the License.
 #include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
+#include <torch/all.h>
 
 #ifdef USE_ROCM
 #include <hip/hip_runtime.h>

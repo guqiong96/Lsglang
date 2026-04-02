@@ -113,11 +113,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/moe
    */
-  m.def(
-      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
-  m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+ m.def(
+    "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+    "experts_ids, Tensor! num_tokens_post_pad, Tensor? expert_map=None) -> ()");
+m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "

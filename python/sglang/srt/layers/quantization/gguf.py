@@ -222,11 +222,7 @@ def fused_moe_gguf(
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
                 topk_ids, BLOCK_SIZE, E
             )
-        
-        print(f"  sorted_token_ids.shape: {sorted_token_ids.shape}")
-        print(f"  expert_ids.shape: {expert_ids.shape}")
-        print(f"  num_tokens_post_padded: {num_tokens_post_padded.item() if isinstance(num_tokens_post_padded, torch.Tensor) else num_tokens_post_padded}")
-
+         
         out = ggml_moe_a8(
             x,
             w1,

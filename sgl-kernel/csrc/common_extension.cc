@@ -177,11 +177,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/moe
    */
-  m.def(
-      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
-  m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+m.def(
+    "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+    "experts_ids, Tensor! num_tokens_post_pad, Tensor? expert_map=None) -> ()");
+m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
@@ -515,6 +514,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
+}
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+  m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
+  m.impl("ggml_moe_a8", &ggml_moe_a8);
 }
 
 REGISTER_EXTENSION(common_ops)

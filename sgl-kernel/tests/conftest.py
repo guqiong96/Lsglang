@@ -12,3 +12,9 @@ def reset_torch_defaults():
     yield
     torch.set_default_dtype(orig_default_dtype)
     torch.set_default_device(orig_default_device)
+
+def _reset_torch_defaults():
+    orig_default_device = torch.get_default_device()
+    orig_default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(orig_default_dtype)
+    torch.set_default_device(orig_default_device)

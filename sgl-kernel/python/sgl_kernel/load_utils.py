@@ -45,6 +45,61 @@ def _filter_compiled_extensions(file_list):
     return compiled_files + other_files
 
 
+def _find_sgl_kernel_dir():
+    """Find the sgl_kernel directory, handling both normal and editable installs."""
+    current_file = Path(__file__).resolve()
+    
+    # Check if we're in an editable install (the current file is in the source directory)
+    # In editable install, __file__ points to the source directory
+    # We need to check if there's a sgl_kernel directory in site-packages
+    import site
+    
+    # Try to find the installed sgl_kernel in site-packages
+    for site_dir in site.getsitepackages():
+        sgl_kernel_path = Path(site_dir) / "sgl_kernel"
+        if sgl_kernel_path.exists():
+            logger.debug(f"[sgl_kernel] Found installed sgl_kernel at: {sgl_kernel_path}")
+            return sgl_kernel_path
+    
+    # Also check user site-packages
+    user_site = site.getusersitepackages()
+    if user_site:
+        sgl_kernel_path = Path(user_site) / "sgl_kernel"
+        if sgl_kernel_path.exists():
+            logger.debug(f"[sgl_kernel] Found user site sgl_kernel at: {sgl_kernel_path}")
+            return sgl_kernel_path
+    
+    # If not found in site-packages, fall back to the current file's directory
+    # This handles editable installs where the module is in the source tree
+    sgl_kernel_dir = current_file.parent
+    logger.debug(f"[sgl_kernel] Using source directory: {sgl_kernel_dir}")
+    return sgl_kernel_dir
+
+
+def _load_module_from_file(file_path, module_name="common_ops"):
+    """Load a module from a file path, using the specified module name."""
+    try:
+        # For .abi3.so files, the module name must match the compiled name
+        # So we always use "common_ops" as the module name
+        spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+        if spec is None:
+            raise ImportError(f"Could not create module spec for {file_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        if spec.loader is None:
+            raise ImportError(f"Module spec has no loader for {file_path}")
+
+        logger.debug(f"[sgl_kernel] Loading module from {file_path}...")
+        spec.loader.exec_module(module)
+        logger.debug(f"[sgl_kernel] ✓ Successfully loaded module")
+        if hasattr(module, '__file__'):
+            logger.debug(f"[sgl_kernel] ✓ Module file: {module.__file__}")
+        return module
+    except Exception as e:
+        logger.debug(f"[sgl_kernel] ✗ Failed to load from {file_path}: {type(e).__name__}: {e}")
+        raise
+
+
 def _load_architecture_specific_ops():
     """Load the appropriate common_ops library based on GPU architecture."""
     compute_capability = _get_compute_capability()
@@ -53,7 +108,7 @@ def _load_architecture_specific_ops():
     )
 
     # Get the directory where sgl_kernel is installed
-    sgl_kernel_dir = Path(__file__).parent
+    sgl_kernel_dir = _find_sgl_kernel_dir()
     logger.debug(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
 
     # Determine which version to load based on GPU architecture
@@ -68,7 +123,6 @@ def _load_architecture_specific_ops():
         variant_name = "CPU/No GPU detected (using precise math)"
 
     # Look for the compiled module with any valid extension
-
     ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
     raw_matching_files = glob.glob(ops_pattern)
     matching_files = _filter_compiled_extensions(raw_matching_files)
@@ -85,26 +139,12 @@ def _load_architecture_specific_ops():
         ops_path = Path(matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
         try:
-            # Load the module from specific path using importlib
-            spec = importlib.util.spec_from_file_location("common_ops", str(ops_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {ops_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {ops_path}")
-
-            logger.debug(f"[sgl_kernel] Loading module from {ops_path}...")
-            spec.loader.exec_module(common_ops)
+            # Use "common_ops" as the module name to match the compiled name
+            common_ops = _load_module_from_file(ops_path, "common_ops")
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
             return common_ops
-
         except Exception as e:
             previous_import_errors.append(e)
-            logger.debug(
-                f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
-            )
             # Continue to fallback
     else:
         logger.debug(
@@ -123,25 +163,11 @@ def _load_architecture_specific_ops():
         alt_path = Path(alt_matching_files[0])  # Use the first prioritized file
         logger.debug(f"[sgl_kernel] Found fallback library: {alt_path}")
         try:
-            spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
-            if spec is None:
-                raise ImportError(f"Could not create module spec for {alt_path}")
-
-            common_ops = importlib.util.module_from_spec(spec)
-            if spec.loader is None:
-                raise ImportError(f"Module spec has no loader for {alt_path}")
-
-            logger.debug(f"[sgl_kernel] Loading fallback module from {alt_path}...")
-            spec.loader.exec_module(common_ops)
+            common_ops = _load_module_from_file(alt_path, "common_ops")
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded fallback library")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
             return common_ops
-
         except Exception as e:
             previous_import_errors.append(e)
-            logger.debug(
-                f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
-            )
     else:
         logger.debug(
             f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
@@ -155,11 +181,31 @@ def _load_architecture_specific_ops():
         import common_ops
 
         logger.debug(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
-        logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+        if hasattr(common_ops, '__file__'):
+            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
         previous_import_errors.append(e)
         logger.debug(f"[sgl_kernel] ✗ Standard Python import failed: {e}")
+
+    # Also try to search in sys.path for any common_ops module
+    logger.debug(f"[sgl_kernel] Attempting to search sys.path for common_ops...")
+    import sys
+    for path in sys.path:
+        if not path:  # Skip empty strings
+            continue
+        search_pattern = str(Path(path) / "sgl_kernel" / "**" / "common_ops.*")
+        found_files = glob.glob(search_pattern, recursive=True)
+        if found_files:
+            found_files = _filter_compiled_extensions(found_files)
+            if found_files:
+                try:
+                    common_ops = _load_module_from_file(Path(found_files[0]), "common_ops")
+                    logger.debug(f"[sgl_kernel] ✓ Loaded from sys.path search: {found_files[0]}")
+                    return common_ops
+                except Exception as e:
+                    previous_import_errors.append(e)
+                    logger.debug(f"[sgl_kernel] Failed to load from {found_files[0]}: {e}")
 
     attempt_error_msg = "\n".join(
         f"- {type(err).__name__}: {err}" for err in previous_import_errors
@@ -181,7 +227,9 @@ Attempted locations:
 1. Architecture-specific pattern: {ops_pattern} - found files: {matching_files}
 2. Fallback pattern: {alt_pattern} - found files: {alt_matching_files}
 3. Standard Python import: common_ops - failed
+4. sys.path search: searched all Python paths
 
+SGL Kernel directory: {sgl_kernel_dir}
 GPU Info:
 - Compute capability: {compute_capability}
 - Expected variant: {variant_name}

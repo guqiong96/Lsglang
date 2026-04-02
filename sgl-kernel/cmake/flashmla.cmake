@@ -1,13 +1,19 @@
 include(FetchContent)
 
-# flash_mla
-FetchContent_Declare(
-    repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG 9804b12079e4c873514d3457aa588d3ccf40da28
-    GIT_SHALLOW OFF
-)
-FetchContent_Populate(repo-flashmla)
+set(FLASHMLA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-flashmla-src")
+ 
+if(EXISTS "${FLASHMLA_SOURCE_DIR}" AND IS_DIRECTORY "${FLASHMLA_SOURCE_DIR}")
+    message(STATUS "Using local FlashMLA at ${FLASHMLA_SOURCE_DIR}")
+    set(repo-flashmla_SOURCE_DIR "${FLASHMLA_SOURCE_DIR}" CACHE PATH "FlashMLA source" FORCE)
+else() 
+    FetchContent_Declare(
+        repo-flashmla
+        GIT_REPOSITORY https://github.com/sgl-project/FlashMLA.git
+        GIT_TAG main 
+        SOURCE_DIR ${FLASHMLA_SOURCE_DIR}
+    )
+    FetchContent_Populate(repo-flashmla)
+endif()
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -147,6 +153,8 @@ target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-cutlass_SOURCE_DIR}/tools/util/include
 )
 
 target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)

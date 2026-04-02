@@ -1839,6 +1839,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+        
+        self._dummy_run(
+            batch_size=1
+        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

@@ -1,13 +1,16 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# Set FetchContent to use local deps directory
+set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dep")
+
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
 
 # CMake
-cmake_policy(SET CMP0169 OLD)
-cmake_policy(SET CMP0177 NEW)
+# cmake_policy(SET CMP0169 OLD)
+# cmake_policy(SET CMP0177 NEW)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -42,69 +45,72 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+# Helper macro to handle dependencies with manual download support
+macro(handle_dependency NAME REPO_URL TAG SOURCE_DIR)
+    if(NOT EXISTS "${SOURCE_DIR}")
+        message(STATUS "Downloading ${NAME}...")
+        FetchContent_Declare(
+            ${NAME}
+            GIT_REPOSITORY ${REPO_URL}
+            GIT_TAG ${TAG}
+            GIT_SHALLOW OFF
+            SOURCE_DIR ${SOURCE_DIR}
+        )
+        FetchContent_Populate(${NAME})
+    else()
+        message(STATUS "Using existing ${NAME} source at ${SOURCE_DIR}")
+        set(${NAME}_SOURCE_DIR "${SOURCE_DIR}" CACHE PATH "Path to ${NAME} source")
+    endif()
+endmacro()
 # Third Party repos
 # cutlass
-FetchContent_Declare(
-    repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
+handle_dependency(repo-cutlass 
+    https://github.com/NVIDIA/cutlass 
+    57e3cfb47a2d9e0d46eb6335c3dc411498efa198 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-cutlass-src"
 )
-FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
-FetchContent_Declare(
-    repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
-    GIT_SHALLOW    OFF
+handle_dependency(repo-deepgemm 
+    https://github.com/sgl-project/DeepGEMM 
+    ffe2b6b97420a9f8c58268ca55755168e6e2f360 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-deepgemm-src"
 )
-FetchContent_Populate(repo-deepgemm)
 
 # fmt
-FetchContent_Declare(
-    repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
+handle_dependency(repo-fmt 
+    https://github.com/fmtlib/fmt 
+    553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-fmt-src"
 )
-FetchContent_Populate(repo-fmt)
 
 # Triton kernel
-FetchContent_Declare(
-    repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.5.1
-    GIT_SHALLOW    OFF
+handle_dependency(repo-triton 
+    https://github.com/triton-lang/triton 
+    v3.5.1 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-triton-src"
 )
-FetchContent_Populate(repo-triton)
 
 # flashinfer
-FetchContent_Declare(
-    repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
+handle_dependency(repo-flashinfer 
+    https://github.com/flashinfer-ai/flashinfer.git 
+    bc29697ba20b7e6bdb728ded98f04788e16ee021 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-flashinfer-src"
 )
-FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
-FetchContent_Declare(
-    repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
+handle_dependency(repo-flash-attention 
+    https://github.com/sgl-project/sgl-attn 
+    bcf72ccc6816b36a5fae2c5a3c027604629785e0 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-flash-attention-src"
 )
-FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
-FetchContent_Declare(
-    repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
+handle_dependency(repo-mscclpp 
+    https://github.com/microsoft/mscclpp.git 
+    51eca89d20f0cfb3764ccd764338d7b22cd486a6 
+    "${CMAKE_CURRENT_SOURCE_DIR}/dep/repo-mscclpp-src"
 )
-FetchContent_Populate(repo-mscclpp)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -173,7 +179,7 @@ set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default
 # When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
 if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
     message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
-elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+elseif(SGL_KERNEL_COMPILE_THREADS LESS 1)
     message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
     set(SGL_KERNEL_COMPILE_THREADS 1)
 endif()

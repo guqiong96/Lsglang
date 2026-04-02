@@ -4361,6 +4361,9 @@ def is_lk_moe_gpu_resident_layer(layer_id: str) -> bool:
      
     return layer_id in disabled_layers
 
+def enabled_layerwise_load() -> bool:
+    return get_bool_env_var("LVLLM_ENABLE_MOE_LAYERWISE_LOAD")
+
 import threading
 from contextlib import contextmanager
 
