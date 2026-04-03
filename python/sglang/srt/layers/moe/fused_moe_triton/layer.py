@@ -66,25 +66,10 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
-    is_flashinfer_available,
     is_hip,
-    next_power_of_2,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
- 
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-if is_flashinfer_available():
-    from flashinfer import fp4_quantize
-
-# Try to import FP4 TRTLLM function if flashinfer is available
-trtllm_fp4_block_scale_moe = None
-if get_moe_runner_backend().is_flashinfer_trtllm():
-    try:
-        from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
-    except ImportError:
-        trtllm_fp4_block_scale_moe = None
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -98,6 +83,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.common import MoeComputeStrategy
 from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu, LkMoeSerialGuard
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
     import  lk_moe
     GGML_TYPE_TO_TORCH_DTYPE = {
@@ -766,6 +752,16 @@ class FusedMoE(torch.nn.Module):
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
 
+        # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
+        # expert weights into block layout. During weight update, we must restore
+        # canonical load-time shapes before copying checkpoint tensors.
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
+
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -1041,10 +1037,7 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            if not TopKOutputChecker.format_is_standard(topk_output):
-                # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(hidden_states, topk_output)
-            else:
+            if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.topk_weights,
@@ -1052,6 +1045,20 @@ class FusedMoE(torch.nn.Module):
                     topk_output.router_logits,
                     self.layer_id,
                 )
+            elif TopKOutputChecker.format_is_bypassed(topk_output):
+                return fused_moe_bypassed_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.router_logits,
+                    topk_output.topk_config.top_k,
+                    topk_output.topk_config.topk_group,
+                    topk_output.topk_config.num_expert_group,
+                    topk_output.topk_config.correction_bias,
+                    topk_output.topk_config.renormalize,
+                    self.layer_id,
+                )
+            else:
+                # Make sure there is torch lib op registration for the whole moe layer
+                return self.forward_impl(hidden_states, topk_output)
         else:
             if not self.should_use_gpu_prefill(hidden_states): 
                 return self.forward_impl(hidden_states, topk_output)
@@ -2439,13 +2446,14 @@ def moe_forward_piecewise_cuda_graph_impl(
 
 
 @register_custom_op(out_shape="hidden_states")
-def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
+def fused_moe_bypassed_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     top_k: int,
     topk_group: Optional[int],
     num_expert_group: Optional[int],
     correction_bias: Optional[torch.Tensor],
+    renormalize: bool,
     layer_id: int,
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
@@ -2456,6 +2464,7 @@ def flashinfer_fp4_moe_forward_piecewise_cuda_graph_impl(
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             correction_bias=correction_bias,
+            renormalize=renormalize,
         ),
     )
     forward_context = get_forward_context()

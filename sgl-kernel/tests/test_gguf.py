@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -466,6 +467,4 @@ def test_moe_align_block_size_with_padding(
 
 
 if __name__ == "__main__":
-    from conftest import _reset_torch_defaults
-    _reset_torch_defaults()
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
