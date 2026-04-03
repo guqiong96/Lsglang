@@ -73,7 +73,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -120,7 +120,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -174,7 +174,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
@@ -314,7 +314,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -548,7 +548,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1
 # Start GPU prefill when input length reaches 4096, can be decreased or increased based on CPU prefill performance, starting prefill earlier or later
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096 
 # Same as context size for optimal performance, can be appropriately reduced based on VRAM availability, exceeding context size is meaningless
---chunked-prefill-size 65536 # 
+--chunked-prefill-size 32000 # 
 ``` 
  
 ### Disable GPU Prefill
@@ -594,7 +594,7 @@ LK_THREADS=44
 # Save VRAM when GPU prefill is disabled, performance remains unchanged, but if enable GPU prefill will cause performance drop
 --chunked-prefill-size 4096
 # or larger and less than context size, enable GPU prefill, obtain best performance, but if disable GPU prefill will cause performance drop
---chunked-prefill-size 65536 
+--chunked-prefill-size 32000 
 ```
 ### CPU Power Saving
 ```bash

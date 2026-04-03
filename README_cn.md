@@ -75,7 +75,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -123,7 +123,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -178,7 +178,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser minimax-m2 \
@@ -317,7 +317,7 @@ python -m sglang.launch_server \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
     --enable-p2p-check \
-    --chunked-prefill-size 32768 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
@@ -591,7 +591,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1
 # 输入长度达到4096启动GPU prefill，根据cpu prefill性能可减小或加大， 提前或推后启动prefill
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096 
 # 与上下文大小相同获得最佳性能，可根据显存情况适当调小，超过上下文大小无意义
---chunked-prefill-size 65536 
+--chunked-prefill-size 32000 
 ``` 
 
 ### 关闭GPU预填充
@@ -636,7 +636,7 @@ LK_THREADS=44
 # 关闭GPU预填充时,节省显存，性能不变，但如果开启GPU预填充会导致性能下降
 --chunked-prefill-size 4096  
 # 开启GPU预填充时，32768~65536，GPU预填充加速情况、显存大小调节，超过上下文大小无意义
---chunked-prefill-size 65536 （小于等于上下文大小）
+--chunked-prefill-size 32000 （小于等于上下文大小）
 ```
 ### CPU节能
 ```bash
