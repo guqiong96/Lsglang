@@ -1165,10 +1165,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
-            if not hasattr(self.model_config.hf_config, "top_k"):
-                self.model_config.hf_config.top_k = 50
-            if not hasattr(self.model_config.hf_text_config, "top_k"):
-                self.model_config.hf_text_config.top_k = 50
             self.model = self.loader.load_model(
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
@@ -2062,26 +2058,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logits_dtype=logits_warmup_dtype,
         )
 
-        self._warmup_fused_sampling()
-        
-        self._dummy_run(
-            batch_size=1
-        )
-
-    def _warmup_fused_sampling(self):
-        """Pre-compile and autotune fused sampling Triton kernels."""
-        if _is_hip:
-            return
-        from sglang.srt.layers.fused_sampling import warmup_fused_temperature_softmax
-
-        logits_warmup_dtype = (
-            torch.float32 if self.server_args.enable_fp32_lm_head else self.dtype
-        )
-        warmup_fused_temperature_softmax(
-            self.model_config.vocab_size,
-            logits_dtype=logits_warmup_dtype,
-        )
-
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         if self.server_args.disable_flashinfer_autotune:
@@ -2441,44 +2417,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Capture device graphs."""
         self.graph_runner = None
         self.graph_mem_usage = 0
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
-        self.attention_layers = []
-        self.moe_layers = []
-        self.moe_fusions = []
-        for layer in language_model.model.layers:
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
-                elif hasattr(layer.self_attn, "attn_mqa"):
-                    # For DeepSeek model
-                    self.attention_layers.append(layer.self_attn.attn_mqa)
-            # For hybrid model
-            elif hasattr(layer, "attn"):
-                self.attention_layers.append(layer.attn)
-            elif hasattr(layer, "linear_attn"):
-                self.attention_layers.append(layer.linear_attn)
-            # For InternVL model
-            elif hasattr(layer, "attention"):
-                if hasattr(layer.attention, "attn"):
-                    self.attention_layers.append(layer.attention.attn)
-
-            moe_block = None
-            moe_fusion = None
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                moe_block = layer.mlp.experts
-                moe_fusion = layer.mlp
-            if hasattr(layer, "block_sparse_moe") and hasattr(
-                layer.block_sparse_moe, "experts"
-            ):
-                moe_block = layer.block_sparse_moe.experts
-                moe_fusion = layer.block_sparse_moe
-            if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-                moe_block = layer.moe.experts
-                moe_fusion = layer.moe
-            self.moe_layers.append(moe_block)
-            self.moe_fusions.append(moe_fusion)
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
