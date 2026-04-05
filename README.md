@@ -404,7 +404,7 @@ sudo sh cuda_12.9.1_575.57.08_linux.run
 conda create -n Lsglang python==3.12.11
 conda activate Lsglang
 
-pip install -U cmake
+pip install -U setuptools wheel scikit-build-core cmake
 
 # Upgrade libstdcxx-ng (to avoid glibcxx version issues)
 conda install -c conda-forge libstdcxx-ng
@@ -454,6 +454,8 @@ git fetch && git reset --hard origin/main && git clean -fd # This command is sui
 # Install PyTorch 2.9.1
 pip uninstall torchaudio triton torchvision torch sglang
 pip install torchaudio triton torchvision torch==2.9.1
+
+# pip install -U setuptools wheel scikit-build-core cmake
 
 # Qwen3-VL GLM4.6V requires xformers
 

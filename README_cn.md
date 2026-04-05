@@ -410,7 +410,7 @@ sudo sh cuda_12.9.1_575.57.08_linux.run
 conda create -n Lsglang python==3.12.11
 conda activate Lsglang
 
-pip install -U cmake
+pip install -U setuptools wheel scikit-build-core cmake
 
 # 升级libstdcxx-ng（避免glibcxx版本问题）
 conda install -c conda-forge libstdcxx-ng
@@ -465,6 +465,8 @@ cd /path/to/Lsglang/
 
 # 此命令适合普通用户，如果保留本地修改内容的用户应知道提前做处理
 git fetch && git reset --hard origin/main && git clean -fd 
+
+# pip install -U setuptools wheel scikit-build-core cmake
 
 # 安装PyTorch 2.9.1 
 pip uninstall torchaudio triton torchvision torch sglang
