@@ -404,6 +404,8 @@ sudo sh cuda_12.9.1_575.57.08_linux.run
 conda create -n Lsglang python==3.12.11
 conda activate Lsglang
 
+pip install -U cmake
+
 # Upgrade libstdcxx-ng (to avoid glibcxx version issues)
 conda install -c conda-forge libstdcxx-ng
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
