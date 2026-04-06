@@ -42,12 +42,17 @@ def get_scalar_types():
 
 ScalarType, scalar_types = get_scalar_types()
 
+def normalize_prefix(prefix: str) -> str:
+    if prefix.startswith("model."):
+        prefix = prefix[6:]
+    return prefix
 
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
 ) -> bool:
+    prefix = normalize_prefix(prefix)
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]

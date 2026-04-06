@@ -33,6 +33,7 @@ Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are support
 ## Version Changes
 
 ```bash
+2026-04-06: Lsglang-v1.2.0 - improve LK_POWER_SAVING=1 for power saving, support FP8+BF16+AWQ4bit hybrid MoE layer inference
 2026-04-03: Lsglang-v1.1.4 - support local compilation of sgl-kernel, fix known issues
 2026-03-11: Lsglang-v1.1.3 - FP8、AWQ4bit MoE Models enable GPU Prefill acceleration without additional memory occupation, FP8 MoE Model cancel TO_DTYPE runtime type conversion, KEEP model temporarily not support GPU Prefill
             Note 1：30 series graphics cards can enable GPU Prefill acceleration for FP8 models by removing the LVLLM_GPU_RESIDENT_MOE_LAYERS parameter.
@@ -434,7 +435,8 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TY
 
 cd sgl-kernel
 rm -rf build/ dist/ *.egg-info/
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e  . --no-build-isolation -vvv
+ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip inst
+all -e  . --no-build-isolation -vvv
 
 pip install nvidia-cudnn-cu12==9.16.0.29
 ```

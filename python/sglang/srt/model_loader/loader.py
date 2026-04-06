@@ -734,8 +734,6 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
             if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
                 module.clean_weights_after_loading() 
                 setattr(module, "process_lk_moe_already_called", True)
