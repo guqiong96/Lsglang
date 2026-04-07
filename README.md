@@ -475,7 +475,7 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TY
 pip uninstall sgl-kernel -y 
 cd sgl-kernel
 rm -rf build/ dist/ *.egg-info/
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e  . --no-build-isolation -vvv
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install -e  . --no-build-isolation -vvv
 
 pip install nvidia-cudnn-cu12==9.16.0.29
 rm -rf ~/.cache/flashinfer/

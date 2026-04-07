@@ -490,7 +490,7 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_T
 pip uninstall sgl-kernel -y 
 cd sgl-kernel
 rm -rf build/ dist/ *.egg-info/
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e  . --no-build-isolation -vvv
+MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install -e  . --no-build-isolation -vvv
 
 pip install nvidia-cudnn-cu12==9.16.0.29
 
@@ -507,34 +507,6 @@ cd /path/to/Lsglang/sgl-kernel
 
 mkdir -p dep
 cd dep
-
-# 1. CUTLASS
-git clone https://github.com/NVIDIA/cutlass.git repo-cutlass-src
-cd repo-cutlass-src && git checkout 57e3cfb47a2d9e0d46eb6335c3dc411498efa198 && cd ..
-
-# 2. DeepGEMM
-git clone https://github.com/sgl-project/DeepGEMM.git repo-deepgemm-src
-cd repo-deepgemm-src && git checkout ffe2b6b97420a9f8c58268ca55755168e6e2f360 && cd ..
-
-# 3. fmt
-git clone https://github.com/fmtlib/fmt.git repo-fmt-src
-cd repo-fmt-src && git checkout 553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28 && cd ..
-
-# 4. Triton
-git clone https://github.com/triton-lang/triton.git repo-triton-src
-cd repo-triton-src && git checkout v3.5.1 && cd ..
-
-# 5. FlashInfer
-git clone https://github.com/flashinfer-ai/flashinfer.git repo-flashinfer-src
-cd repo-flashinfer-src && git checkout bc29697ba20b7e6bdb728ded98f04788e16ee021 && cd ..
-
-# 6. Flash Attention
-git clone https://github.com/sgl-project/sgl-attn.git repo-flash-attention-src
-cd repo-flash-attention-src && git checkout bcf72ccc6816b36a5fae2c5a3c027604629785e0 && cd ..
-
-# 7. MSCCLPP
-git clone https://github.com/microsoft/mscclpp.git repo-mscclpp-src
-cd repo-mscclpp-src && git checkout 51eca89d20f0cfb3764ccd764338d7b22cd486a6 && cd ..
 
 # 1. CUTLASS
 git clone https://github.com/NVIDIA/cutlass.git repo-cutlass-src
