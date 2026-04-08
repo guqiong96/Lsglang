@@ -448,8 +448,7 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_T
 
 cd sgl-kernel
 rm -rf build/ dist/ *.egg-info/
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip inst
-all -e  . --no-build-isolation -vvv
+CMAKE_BUILD_PARALLEL_LEVEL=8  CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install -e  . --no-build-isolation -vvv
 
 pip install nvidia-cudnn-cu12==9.16.0.29
 ```
@@ -487,10 +486,10 @@ pip uninstall sglang lk_moe  -y
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 
 # 编译安装sgl-kernel[第一次编译将从github下载第三方项目至sgl-kernel/dep目录，或者先使用后面的手工下载命令]
-pip uninstall sgl-kernel -y 
+pip uninstall sglang-kernel -y 
 cd sgl-kernel
 rm -rf build/ dist/ *.egg-info/
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install -e  . --no-build-isolation -vvv
+CMAKE_BUILD_PARALLEL_LEVEL=8  CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install -e  . --no-build-isolation -vvv
 
 pip install nvidia-cudnn-cu12==9.16.0.29
 
