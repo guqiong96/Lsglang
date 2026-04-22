@@ -588,8 +588,7 @@ LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096
 ### 关闭GPU预填充
 ```bash
 #  关闭GPU预填充
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=""
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0
 # 1024至8192，太大无意义（占用显存及启动时间过长）
 --chunked-prefill-size 4096 
 ``` 
@@ -657,6 +656,19 @@ LVLLM_MOE_QUANT_ON_GPU=1
 ```bash
 # 允许通过加大max_num_batched_tokens参数来提高cpu prefill速度，例如--chunked-prefill-size 4096，如果开启了gpu prefill则取LVLLM_GPU_PREFILL_MIN_BATCH_SIZE、max_num_batched_tokens两者最小值
 --chunked-prefill-size 4096
+
+### 开启推测解码
+
+开启推测解码后，草稿模型会增加显存占用，在实际应用环境输出速度可能会有提升，在完全随机测试页面速度会大幅下降，以下参数在Qwen3.6 35B A3B上测试通过，其它模型需要到模型下载页面查看参数设置
+```bash
+# 增加环境变量
+SGLANG_ENABLE_SPEC_V2=1
+# 增加命令参数
+--speculative-algo NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--mamba-scheduler-strategy extra_buffer
 ```
 
 

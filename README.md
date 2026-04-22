@@ -334,16 +334,27 @@ Most verified original MoE models in Lsglang:
 
 | Model Name | Status |
 |------------|--------|
+| gemma-4-26B-A4B-it | ✅ Tested |
+| NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | ✅ Tested |
+| Qwen3.6-35B-A3B | ✅ Tested |
+| Qwen3.5-35B-A3B | ✅ Tested |
+| Qwen3.5-122B-A10B | ✅ Tested |
 | Qwen3.5-397B-A17B | ✅ Tested |
 | Qwen3-Coder-Next | ✅ Tested |
 | Qwen3-Next-80B-A3B-Instruct | ✅ Tested |
 | Qwen3-Coder-30B-A3B-Instruct | ✅ Tested |
 | Qwen3-VL-30B-A3B-Instruct | ✅ Tested |
+| MiniMax-M2.7 | ✅ Tested |
+| MiniMax-M2.5 | ✅ Tested |
 | MiniMax-M2.1 | ✅ Tested |
+| GLM-5.1-FP8 | ✅ Tested |
+| GLM-5.0-FP8 | ✅ Tested |
 | GLM-4.7 | ✅ Tested |
 | GLM-4.7-Flash | ✅ Tested |
 | GLM-4.6V | ✅ Tested |
+| Kimi k2.6 | ✅ Tested |
 | Kimi k2.5 | ✅ Tested |
+
 
 Unlisted original MoE models from the Qwen3, GLM, and MiniMax series are theoretically supported and await actual testing.
 
@@ -561,7 +572,6 @@ LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096
 ```bash
 # Disable GPU prefill
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE="" 
 # 1024 to 8192, too large is meaningless (occupies too much VRAM and long startup time)
 --chunked-prefill-size 4096
 ``` 
@@ -630,4 +640,17 @@ LVLLM_MOE_QUANT_ON_GPU=1
 ```bash
 # It is allowed to increase the CPU prefill speed by increasing the max_num_batched_tokens parameter, for example --chunked-prefill-size 4096. If GPU prefill is enabled, the smaller value between LVLLM_GPU_PREFILL_MIN_BATCH_SIZE and max_num_batched_tokens will be used.
 --chunked-prefill-size 4096
+
+### Enable Speculative Decoding
+
+Enable speculative decoding after the draft model will consume more VRAM, the output speed may increase in the actual application environment, and the random test page speed may decrease significantly. The parameters in Qwen3.6 35B A3B sucessfully tested, other models need to check the parameter settings in the model download page.
+```bash
+# Add environment variable
+SGLANG_ENABLE_SPEC_V2=1
+# Add command line parameters
+--speculative-algo NEXTN
+--speculative-num-steps 3
+--speculative-eagle-topk 1
+--speculative-num-draft-tokens 4
+--mamba-scheduler-strategy extra_buffer
 ```
