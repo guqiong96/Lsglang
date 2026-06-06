@@ -1,4 +1,4 @@
-# Lsglang GPU + NUMA Dual Parallel [[中文]](./README.md)
+# Lsglang GPU + NUMA Dual Parallel [[中文]](./README_cn.md)
 
 Lsglang is a special extension of sglang that fully utilizes CPU and GPU computing resources with an efficient GPU parallel + NUMA parallel architecture, suitable for MOE model hybrid inference.
 
