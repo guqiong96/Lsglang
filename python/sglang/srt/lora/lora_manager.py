@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -806,7 +807,7 @@ class LoRAManager:
                     module_name, module
                 )
                 continue
-            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):

@@ -216,7 +216,7 @@ def fused_moe_gguf(
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
 
-    out_hidden_states = torch.zeros_like(x)
+    out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
         qweight_type2 in MMQ_QUANT_TYPES
@@ -228,18 +228,9 @@ def fused_moe_gguf(
         top_k = topk_ids.shape[1]
         BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
 
-        has_neg_one = (topk_ids == -1).any()
-        if has_neg_one:
-            temp_topk_ids = topk_ids.clone()
-            temp_topk_ids[temp_topk_ids == -1] = E
-            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                temp_topk_ids, BLOCK_SIZE, E + 1
-            )
-            expert_ids[expert_ids == E] = -1
-        else:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                topk_ids, BLOCK_SIZE, E
-            )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, BLOCK_SIZE, E
+        )
         out = ggml_moe_a8(
             x,
             w1,
@@ -263,12 +254,10 @@ def fused_moe_gguf(
             1,
             num_tokens * top_k,
         )
-        out = out.reshape(num_tokens, top_k, w2.shape[1])
-        
-        if has_neg_one:
-            out = out.mul_((topk_ids != -1).unsqueeze(-1))
-        
-        out = out.mul_(topk_weights.view(num_tokens, top_k, 1))
+        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
+            topk_weights.view(num_tokens, top_k, 1)
+        )
+        # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
@@ -281,13 +270,9 @@ def fused_moe_gguf(
         out = ggml_moe_a8_vec(
             out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
-        out = out.reshape(num_tokens, top_k, w2.shape[1])
-        
-        has_neg_one = (topk_ids == -1).any()
-        if has_neg_one:
-            out = out.mul_((topk_ids != -1).unsqueeze(-1))
-        
-        out = out.mul_(topk_weights.view(num_tokens, top_k, 1))
+        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
+            topk_weights.view(num_tokens, top_k, 1)
+        )
         moe_sum(out, out_hidden_states)
     else:
         logger.warning_once(
@@ -299,8 +284,6 @@ def fused_moe_gguf(
             inp = x[tok].reshape((1,) + x.shape[1:])
             current_hidden_state = None
             for ww, ii in zip(w, idx):
-                if ii == -1:
-                    continue
                 expert_up = w1[ii]
 
                 out = fused_mul_mat_gguf(inp, expert_up, qweight_type)

@@ -22,6 +22,7 @@ _is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
+
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
 
@@ -53,7 +54,6 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
             with _mp_set_executable(executable=executable, debug_str=debug_str):
                 yield
                 return
-
     yield
 
 

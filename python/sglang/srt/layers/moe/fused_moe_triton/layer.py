@@ -66,6 +66,8 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.awq import AWQMoEMethod
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
+from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod 
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import Mxfp4FlashinferTrtllmMoEMethod
 
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -88,7 +90,7 @@ logger = logging.getLogger(__name__)
 
 import threading
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu, LkMoeSerialGuard
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_resident_experts, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -327,7 +329,7 @@ class FusedMoE(torch.nn.Module):
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id) 
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_id)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_id) 
-        self._lk_moe_guard = LkMoeSerialGuard()
+   
         
       
         self.max_num_group_batch_size = self.get_max_num_group_batch_size()
@@ -335,7 +337,7 @@ class FusedMoE(torch.nn.Module):
         model_arch = server_args.model_config.hf_config.architectures[0]
         self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM"])
         self.has_gate_proj  = not (model_arch == "NemotronHForCausalLM")
-        self.expert_cache_size = 0
+        self.expert_cache_size = get_gpu_resident_experts()
 
         self.quant_method.create_weights(
             layer=self,
@@ -1403,6 +1405,9 @@ class FusedMoE(torch.nn.Module):
         if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE):
             self._process_nvfp4()
             return True
+        if isinstance(self.quant_method, Mxfp4MarlinMoEMethod) or isinstance(self.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
+            self._process_mxfp4()
+            return True
             
         if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)):
             self._process_wna16()
@@ -1458,8 +1463,20 @@ class FusedMoE(torch.nn.Module):
         for weight in weights:
             if hasattr(self, weight):
                 delattr(self, weight)
+                
+    def _get_processes_info(self) -> tuple[int, int, int]: 
+        if self.moe_ep_size > 1:
+            return self.moe_ep_size, self.moe_ep_rank, torch.cuda.current_device()
+        return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
+                
+    def _get_quant_params(self, w13_weight, w13_weight_scale, pack_ratio):
+        unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
+        
+        groupN = w13_weight.shape[1] // w13_weight_scale.shape[1]
+        groupK = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
+        return groupN, groupK
                   
-    def _process_wna16(self, strategy: str): 
+    def _process_wna16(self): 
         
         is_transposed = True
          
@@ -1474,15 +1491,9 @@ class FusedMoE(torch.nn.Module):
             w13_scale = self.w13_weight_scale.cpu().contiguous()
             w2_scale = self.w2_weight_scale.cpu().contiguous() 
     
-        
-        group_size = self.quant_method.group_size        # 32
-        num_bits = self.quant_method.num_bits            # 4
-        packed_factor = self.quant_method.packed_factor  # 8 （bit)
          
- 
-        weights_per_container = packed_factor // num_bits  # 2 
         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, weights_per_container)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, 2)
         
         w13_weight_ptr = w13_weight.data_ptr()
         w2_weight_ptr = w2_weight.data_ptr()
@@ -1680,8 +1691,8 @@ class FusedMoE(torch.nn.Module):
     def _process_mxfp4(self):
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight 
-        w13_weight_scale = self.w13_weight_scale
-        w2_weight_scale = self.w2_weight_scale 
+        w13_weight_scale = self.w13_weight_scale_inv
+        w2_weight_scale = self.w2_weight_scale_inv 
          
         groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
 
@@ -1722,10 +1733,7 @@ class FusedMoE(torch.nn.Module):
         )
              
     
-    def _get_processes_info(self) -> tuple[int, int, int]: 
-        if self.moe_ep_size > 1:
-            return self.moe_ep_size, self.moe_ep_rank, torch.cuda.current_device()
-        return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
+    
         
           
     def _get_max_num_seqs(self) -> int:
@@ -1780,18 +1788,6 @@ class FusedMoE(torch.nn.Module):
         
         return best_index
     
-    def _get_cuda_stream_ptr(self, stream: torch.cuda.Stream) -> int:
-        """
-        Get the underlying CUDA stream pointer from a torch.cuda.Stream object.
-        """
-        if hasattr(stream, 'cuda_stream'):
-            return stream.cuda_stream
-        elif hasattr(stream, 'stream'):
-            return stream.stream
-        else:
-            # Fallback to using the default stream
-            return 0
-    
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self.lk_moe.cpu_decode(
@@ -1807,58 +1803,46 @@ class FusedMoE(torch.nn.Module):
         output = FusedMoE.output_gpu[:hidden_states.size(0)]
         if self.check_nan_in_output:
             torch.nan_to_num(output, nan=0.0, out=output)
-        return output.to(self.moe_runner_config.params_dtype)
+        return output.to(hidden_states.dtype)
  
-    def _cpu_prefill(self, hidden_states, topk_weights, topk_ids):  
-        prefill_stream = torch.cuda.Stream()
+
+    def _cpu_prefill(self, hidden_states, topk_weights, topk_ids): 
+         
+        expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
+        weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
+        hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)
+        output_cpu = torch.empty_like(hidden_states, dtype=torch.float32, device='cpu') 
+        
         current_stream = torch.cuda.current_stream()
+        current_stream.synchronize()
         
-        with torch.cuda.stream(prefill_stream):
-            prefill_stream.wait_stream(current_stream)
-            
-            expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
-            weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
-            hidden_states_cpu = hidden_states.to(device='cpu', non_blocking=True)
-            output_cpu = torch.empty_like(hidden_states, dtype=torch.float32, device='cpu')
-            
-            prefill_stream.synchronize()
-            
-            self.lk_moe.cpu_prefill(
-                hidden_states.size(0),
-                expert_ids_cpu.size(1),
-                expert_ids_cpu.data_ptr(),
-                weights_cpu.data_ptr(),
-                hidden_states_cpu.data_ptr(),
-                output_cpu.data_ptr(),
-            )
-            
-            output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True)
-            
-            if self.check_nan_in_output:
-                torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
+        self.lk_moe.cpu_prefill(
+            hidden_states.size(0),
+            expert_ids_cpu.size(1),
+            expert_ids_cpu.data_ptr(),
+            weights_cpu.data_ptr(),
+            hidden_states_cpu.data_ptr(),
+            output_cpu.data_ptr(),
+        )
+             
+        output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
         
-        current_stream.wait_stream(prefill_stream)
+        if self.check_nan_in_output:
+            torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
         
         return output_gpu
 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        prefill_stream = torch.cuda.Stream()
-        current_stream = torch.cuda.current_stream()
-        
-        with torch.cuda.stream(prefill_stream):
-            prefill_stream.wait_stream(current_stream)
-            output = torch.empty_like(hidden_states, device=torch.cuda.current_device())
-            self.lk_moe.gpu_prefill(
-                hidden_states.data_ptr(),
-                output.data_ptr(),  # in-place
-                topk_ids.data_ptr(),
-                topk_weights.data_ptr(),
-                hidden_states.size(0),
-                topk_ids.size(1),
-                prefill_stream.cuda_stream,
-            )
-        
-        current_stream.wait_stream(prefill_stream)
+        output = torch.empty_like(hidden_states) 
+        self.lk_moe.gpu_prefill(
+            hidden_states.data_ptr(),
+            output.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            hidden_states.size(0),
+            topk_ids.size(1),
+            torch.cuda.current_stream().cuda_stream,
+        ) 
         return output
             
     

@@ -4199,9 +4199,7 @@ def is_lk_moe_feature_enabled() -> bool:
 
 def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
-
-def is_lk_moe_quant_on_gpu() -> bool:
-    return get_bool_env_var("LVLLM_MOE_QUANT_ON_GPU")
+ 
 
 def is_lk_moe_use_gpu_prefill() -> bool:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
@@ -4230,6 +4228,9 @@ def get_gpu_prefill_min_batch_size() -> int:
 
 def get_gpu_prefetch_window() -> int:
     return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
+
+def get_gpu_resident_experts() -> int:
+    return get_int_env_var("LVLLM_GPU_RESIDENT_MOE_EXPERTS", 0)
 
 def is_lk_moe_gpu_prefill_layer(layer_id: str) -> bool:
     return is_lk_moe_use_gpu_prefill() and not is_lk_moe_gpu_resident_layer(layer_id)
@@ -4273,34 +4274,4 @@ def is_lk_moe_gpu_resident_layer(layer_id: str) -> bool:
 
 def enabled_layerwise_load() -> bool:
     return get_bool_env_var("LVLLM_ENABLE_MOE_LAYERWISE_LOAD")
-
-import threading
-from contextlib import contextmanager
-
-class LkMoeSerialGuard:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._owner = None
-        self._depth = 0
-    
-    @contextmanager
-    def acquire(self):
-        thread_id = threading.get_ident()
-         
-        if self._owner == thread_id:
-            self._depth += 1
-            try:
-                yield
-            finally:
-                self._depth -= 1
-            return
-         
-        with self._lock:
-            self._owner = thread_id
-            self._depth = 1
-            try:
-                yield
-            finally:
-                self._owner = None
-                self._depth = 0
  

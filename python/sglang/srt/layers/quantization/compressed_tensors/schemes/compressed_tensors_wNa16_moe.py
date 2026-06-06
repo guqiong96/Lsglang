@@ -316,40 +316,40 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
-        if layer.is_gpu_resident_layer:
-            marlin_w13_qweight = gptq_marlin_moe_repack(
-                layer.w13_weight_packed,
-                layer.w13_g_idx_sort_indices,
-                layer.w13_weight_packed.shape[1] * self.packed_factor,
-                layer.w13_weight_packed.shape[2],
-                self.num_bits,
-            )
-            replace_tensor("w13_weight_packed", marlin_w13_qweight)
-            marlin_w2_qweight = gptq_marlin_moe_repack(
-                layer.w2_weight_packed,
-                layer.w2_g_idx_sort_indices,
-                layer.w2_weight_packed.shape[1] * self.packed_factor,
-                layer.w2_weight_packed.shape[2],
-                self.num_bits,
-            )
-            replace_tensor("w2_weight_packed", marlin_w2_qweight)
-            # Repack scales
-            marlin_w13_scales = marlin_moe_permute_scales(
-                layer.w13_weight_scale,
-                layer.w13_weight_packed.shape[2],
-                layer.w13_weight_scale.shape[2],
-                self.group_size,
-            )
-            replace_tensor("w13_weight_scale", marlin_w13_scales)
 
-            marlin_w2_scales = marlin_moe_permute_scales(
-                layer.w2_weight_scale,
-                layer.w2_weight_scale.shape[1]
-                * (self.group_size if self.group_size != -1 else self.packed_factor),
-                layer.w2_weight_scale.shape[2],
-                self.group_size,
-            )
-            replace_tensor("w2_weight_scale", marlin_w2_scales)
+        marlin_w13_qweight = gptq_marlin_moe_repack(
+            layer.w13_weight_packed,
+            layer.w13_g_idx_sort_indices,
+            layer.w13_weight_packed.shape[1] * self.packed_factor,
+            layer.w13_weight_packed.shape[2],
+            self.num_bits,
+        )
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
+        marlin_w2_qweight = gptq_marlin_moe_repack(
+            layer.w2_weight_packed,
+            layer.w2_g_idx_sort_indices,
+            layer.w2_weight_packed.shape[1] * self.packed_factor,
+            layer.w2_weight_packed.shape[2],
+            self.num_bits,
+        )
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+        # Repack scales
+        marlin_w13_scales = marlin_moe_permute_scales(
+            layer.w13_weight_scale,
+            layer.w13_weight_packed.shape[2],
+            layer.w13_weight_scale.shape[2],
+            self.group_size,
+        )
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
+
+        marlin_w2_scales = marlin_moe_permute_scales(
+            layer.w2_weight_scale,
+            layer.w2_weight_scale.shape[1]
+            * (self.group_size if self.group_size != -1 else self.packed_factor),
+            layer.w2_weight_scale.shape[2],
+            self.group_size,
+        )
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
 
         layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
         layer.is_marlin_converted = True

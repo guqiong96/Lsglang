@@ -56,10 +56,32 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    
-    sorted_ids, expert_ids, num_tokens_post_pad = sgl_moe_align_block_size(
+    if topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+    else:
+        max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
+    cumsum_buffer = torch.empty(
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
+    )
+
+    sgl_moe_align_block_size(
         topk_ids,
-        block_size,
         num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad

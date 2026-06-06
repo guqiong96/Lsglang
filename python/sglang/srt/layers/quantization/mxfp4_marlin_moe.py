@@ -38,6 +38,10 @@ class Mxfp4MarlinMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoeWeightScaleSupported,
         )
@@ -51,6 +55,7 @@ class Mxfp4MarlinMoEMethod:
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=torch.int8,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -60,6 +65,7 @@ class Mxfp4MarlinMoEMethod:
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=torch.int8,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -73,7 +79,8 @@ class Mxfp4MarlinMoEMethod:
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.float8_e8m0fnu,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -82,12 +89,13 @@ class Mxfp4MarlinMoEMethod:
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.float8_e8m0fnu,
+                device=device,
             ),
             requires_grad=False,
         )
-        w13_weight_scale.format_ue8m0 = False
-        w2_weight_scale.format_ue8m0 = False
+        w13_weight_scale.format_ue8m0 = True    
+        w2_weight_scale.format_ue8m0 = True
         scale_attrs = dict(extra_weight_attrs)
         scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
         layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
@@ -96,6 +104,9 @@ class Mxfp4MarlinMoEMethod:
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         from sglang.srt.layers.quantization.marlin_utils import (
             check_moe_marlin_supports_layer,
         )
