@@ -133,14 +133,14 @@ python -m sglang.launch_server \
 
 ## 安装步骤
 
-### 1. 安装CUDA 12.9
+### 1. 安装CUDA 13.2.1
 
 ```bash
 # 卸载旧版本CUDA和NVIDIA驱动
 sudo /usr/local/cuda/bin/cuda-uninstaller   
 sudo nvidia-uninstall
 
-# 下载并安装CUDA 12.9 
+# 下载并安装CUDA 13.2.1 
 wget https://developer.download.nvidia.com/compute/cuda/13.2.1/local_installers/cuda_13.2.1_595.58.03_linux.run
 sudo sh cuda_13.2.1_595.58.03_linux.run
 ```
