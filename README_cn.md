@@ -96,7 +96,7 @@ LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LVLLM_GPU_RESIDENT_MOE_EXPERTS=64 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_ENABLE_MOE_LAYERWISEISE_LOAD=1 \
+LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
 python -m sglang.launch_server \
     --model /home/guqiong/Models/Qwen3.6-35B-A3B \
     --served-model-name Qwen3.6-35B-A3B \
@@ -245,7 +245,6 @@ LK_THREADS=44
 # 开启后推理时降低CPU温度，性能轻微降低
 LK_POWER_SAVING=1 
 ```
-
 
 
 
