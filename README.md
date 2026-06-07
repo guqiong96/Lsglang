@@ -22,7 +22,6 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 - [Running Command Reference](#running-command-reference)
 - [Configuration Parameters](#configuration-parameters)
 - [Installation Steps](#installation-steps)
-- [Update](#update)
 - [Optimization](#optimization)
 
 ## Version Changes
@@ -150,9 +149,7 @@ sudo sh cuda_13.2.1_595.58.03_linux.run
 ```bash
 conda create -n Lsglang python==3.12.11
 conda activate Lsglang
-
-pip install -U setuptools wheel scikit-build-core cmake
-
+  
 # Upgrade libstdcxx-ng (avoid glibcxx version issues)
 conda install -c conda-forge libstdcxx-ng
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
@@ -162,24 +159,21 @@ sudo apt-get install libnuma-dev      # Ubuntu
 sudo dnf install numactl-devel        # Rocky Linux
 ```
 
-### 3. Install Dependencies
+### 3. Install Lsglang
 
 ```bash
-# Clone repository
-git clone https://github.com/guqiong96/Lsglang.git
-cd Lsglang
-
-# Install PyTorch 2.11.0
-pip install torchaudio triton torchvision torch==2.11.0
-
-pip install grpcio-tools 
-  
+pip install lsglang
 ```
  
-### 4. Install Lsglang
+## Compile from Source and Install Lsglang
 
 ```bash
-cd /path/to/Lsglang/
+# 克隆仓库
+git clone https://github.com/guqiong96/Lsglang.git
+cd Lsglang
+pip install -U setuptools wheel scikit-build-core cmake
+pip install torchaudio triton torchvision torch==2.11.0
+pip install grpcio-tools 
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 ```
 
@@ -188,38 +182,7 @@ MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_T
 - `CMAKE_BUILD_TYPE=Release`: Performance optimization option
 - `CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release`: Performance optimization option
  
- 
 
-## Update
-
-If Lsglang is already installed and needs to be updated to the latest version, execute the following commands:
-
-```bash 
-
-cd /path/to/Lsglang/
-
-# This command is suitable for regular users. Users who want to keep local modifications should know how to handle them in advance
-git fetch && git reset --hard origin/main && git clean -fd 
-
-# pip install -U setuptools wheel scikit-build-core cmake
-
-# Install PyTorch 2.11.0 
-pip uninstall torchaudio triton torchvision torch sglang
-pip install torchaudio triton torchvision torch==2.11.0
-
-# Qwen3-VL GLM4.6V requires xformers
-
-#  Uninstall old version
-pip uninstall sglang lk_moe  -y
-
-# Install sglang  
-MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
- 
-rm -rf ~/.cache/flashinfer/
-rm -rf ~/.cache/sglang/ 
-rm -rf ~/.triton/cache/
- 
-```
 
 ## Optimization
 
