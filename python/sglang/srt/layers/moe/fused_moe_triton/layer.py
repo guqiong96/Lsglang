@@ -337,7 +337,7 @@ class FusedMoE(torch.nn.Module):
         self.max_num_group_batch_size = self.get_max_num_group_batch_size()
         server_args = get_global_server_args()
         model_arch = server_args.model_config.hf_config.architectures[0]
-        self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM"])
+        self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM", "KimiK25ForConditionalGeneration"])
         self.has_gate_proj  = not (model_arch == "NemotronHForCausalLM")
         self.expert_cache_size = get_gpu_resident_experts()
 
