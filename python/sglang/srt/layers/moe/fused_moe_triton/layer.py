@@ -1844,7 +1844,8 @@ class FusedMoE(torch.nn.Module):
         return output_gpu
 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
-        output = torch.empty_like(hidden_states) 
+        output = torch.empty_like(hidden_states)
+        
         self.lk_moe.gpu_prefill(
             hidden_states.data_ptr(),
             output.data_ptr(),
@@ -1853,9 +1854,13 @@ class FusedMoE(torch.nn.Module):
             hidden_states.size(0),
             topk_ids.size(1),
             torch.cuda.current_stream().cuda_stream,
-        ) 
+        )
+        
         if self.check_nan_in_output:
-            torch.nan_to_num(output, nan=0.0, out=output)
+            bad_mask = torch.isnan(output) | torch.isinf(output)
+            if bad_mask.any():
+                output.masked_fill_(bad_mask, 0.0)
+        
         return output
             
     
