@@ -963,6 +963,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 2,
                     dtype=torch.int8,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -972,6 +973,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 2,
                     dtype=torch.int8,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -1060,6 +1062,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // fp4_block_k,
                     dtype=fp4_scale_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -1069,6 +1072,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // fp4_block_k,
                     dtype=fp4_scale_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )

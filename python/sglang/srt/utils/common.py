@@ -4285,9 +4285,6 @@ def get_gpu_prefill_min_batch_size() -> int:
 def get_gpu_prefetch_window() -> int:
     return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
 
-def get_gpu_resident_experts() -> int:
-    return get_int_env_var("LVLLM_GPU_RESIDENT_MOE_EXPERTS", 0)
-
 def is_lk_moe_gpu_prefill_layer(layer_id: str) -> bool:
     return is_lk_moe_use_gpu_prefill() and not is_lk_moe_gpu_resident_layer(layer_id)
     

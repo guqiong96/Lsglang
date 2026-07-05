@@ -92,9 +92,9 @@ logger = logging.getLogger(__name__)
 
 import threading
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_resident_experts, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
     import  lk_moe    
 else:
@@ -221,7 +221,7 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
-        self.num_fused_shared_experts = num_fused_shared_experts 
+        self.num_fused_shared_experts = num_fused_shared_experts
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -352,7 +352,6 @@ class FusedMoE(torch.nn.Module):
         model_arch = server_args.model_config.hf_config.architectures[0]
         self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM", "KimiK25ForConditionalGeneration"])
         self.has_gate_proj  = not (model_arch == "NemotronHForCausalLM")
-        self.expert_cache_size = get_gpu_resident_experts()
 
         self.quant_method.create_weights(
             layer=self,
@@ -1557,7 +1556,6 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1622,7 +1620,6 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1659,7 +1656,6 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1719,7 +1715,6 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1764,7 +1759,6 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
-        self.lk_moe_config.expert_cache_size = self.expert_cache_size
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size

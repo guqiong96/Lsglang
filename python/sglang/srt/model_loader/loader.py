@@ -775,7 +775,7 @@ class DefaultModelLoader(BaseModelLoader):
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device): 
+    def load_weights_and_postprocess(model, weights, target_device):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -802,27 +802,8 @@ class DefaultModelLoader(BaseModelLoader):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
-            model_config = getattr(model, 'config', None)
-        architectures = getattr(model_config, 'architectures', []) if model_config else []
-        
-        architectures = []
-        if model_config is not None:
-            architectures = getattr(model_config, 'architectures', [])
-            if architectures is None:
-                architectures = []
-        
-        filter_architectures = [arch for arch in architectures if arch in ["GlmMoeDsaForCausalLM", "KimiK25ForConditionalGeneration"]]
-        
-        if filter_architectures:
-            print(f"Detected {filter_architectures[0]} architecture, using layer-wise loading...")
-            return DefaultModelLoader.load_weights_and_postprocess_layerwise(model, weights, target_device)
-        else: 
-            return DefaultModelLoader.load_weights_and_postprocess_original(model, weights, target_device)
+            model.load_weights(weights)
 
-    @staticmethod
-    def load_weights_and_postprocess_original(model, weights, target_device):
-        model.load_weights(weights)
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             memory_end = get_available_gpu_memory(
@@ -834,6 +815,7 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         for _, module in model.named_modules():
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
             if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
                 module.process_weights_after_loading()
             quant_method = getattr(module, "quant_method", None)
@@ -848,83 +830,6 @@ class DefaultModelLoader(BaseModelLoader):
             if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
                 module.clean_weights_after_loading() 
                 setattr(module, "process_lk_moe_already_called", True)
-    
-    @staticmethod
-    def _module_belongs_to_layer(module_name: str, layer_idx: int) -> bool:
-        return re.search(rf'\.{layer_idx}\.', module_name) is not None
-    
-    @staticmethod
-    def load_weights_and_postprocess_layerwise(model, weights, target_device):
-        
-        weights_list = list(weights)
-        mapper = getattr(model, "hf_to_sglang_mapper", None)
-        if mapper is not None:
-            weights_list = list(mapper.apply(weights_list))
-        from collections import defaultdict
-        layer_weights = defaultdict(list)
-        other_weights = []
-        
-        for name, loaded_weight in weights_list:
-            layer_match = re.search(r'\.(\d+)\.', name)
-            
-            if layer_match:
-                layer_idx = int(layer_match.group(1))
-                if 0 <= layer_idx <= 200:
-                    layer_weights[layer_idx].append((name, loaded_weight))
-                else:
-                    other_weights.append((name, loaded_weight))
-            else:
-                other_weights.append((name, loaded_weight))
-        
-        print("Loading non-layer weights...")
-        if other_weights:
-            model.load_weights(other_weights)
-         
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        
-        for layer_idx in sorted(layer_weights.keys()):
-             
-            if layer_weights[layer_idx]:
-                model.load_weights(layer_weights[layer_idx])
-             
-            processed_params = set()
-            
-            for name, module in model.named_modules(): 
-                if not DefaultModelLoader._module_belongs_to_layer(name, layer_idx):
-                    continue
-                 
-                skip_module = False
-                for param in module.parameters(recurse=False):
-                    if id(param) in processed_params:
-                        skip_module = True
-                        break
-                
-                if skip_module:
-                    continue
-                     
-                for param in module.parameters(recurse=False):
-                    processed_params.add(id(param))
-                 
-                if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-                    module.process_weights_after_loading()
-                     
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-                    if _is_npu:
-                        torch.npu.empty_cache()
-                 
-                if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
-                    module.clean_weights_after_loading()
-                    setattr(module, "process_lk_moe_already_called", True)
-             
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        print("All layers loaded and processed successfully")
 
 
 class LayeredModelLoader(DefaultModelLoader):
