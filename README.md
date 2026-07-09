@@ -27,7 +27,7 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 ## Version Changes
  
 ```bash
-2026-07-05: Lsglang-v2.3.0 - Optimize GPU prefill speed, CPU AVX512 optimization, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, update to sglang v0.5.14
+2026-07-05: Lsglang-v1.4.0 - Optimize GPU prefill speed, CPU AVX512 optimization, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, update to sglang v0.5.14
 2026-06-05: Lsglang-v1.3.0 - Upgraded lk_moe module, supports nvfp4, mxfp4 quantization types, added LVLLM_GPU_RESIDENT_MOE_EXPERTS, removed LVLLM_MOE_USE_WEIGHT, LVLLM_MOE_QUANT_ON_GPU
 2026-04-06: Lsglang-v1.2.0 - Enhanced energy saving effect with LK_POWER_SAVING=1, supports mixed MOE layer inference with FP8+BF16+AWQ4bit
 2026-04-03: Lsglang-v1.1.4 - Supports local compilation of sgl-kernel to fix known issues
@@ -58,6 +58,7 @@ Most original MOE models verified by Lsglang
 | MiniMax-M2.7 | ✅ Tested |
 | MiniMax-M2.5 | ✅ Tested |
 | MiniMax-M2.1 | ✅ Tested |
+| GLM-5.2-GLM-5.2-NVFP4 | ✅ 已测试通过[sm120] |
 | GLM-5.1-FP8 | ✅ Tested |
 | GLM-5.0-FP8 | ✅ Tested |
 | GLM-4.7 | ✅ Tested |
@@ -110,6 +111,39 @@ python -m sglang.launch_server \
     --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --disable-shared-experts-fusion
+
+```
+### GLM-5.2-GLM-5.2-NVFP4 [RTX PRO 6000 * 2]
+```bash 
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=1,0
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=60 \
+OMP_NUM_THREADS=60 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=512 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0-20 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model /mnt/ktd/glm52 \
+    --served-model-name GLM-5.2-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 16384 \
+    --max-total-tokens 66000 \
+    --mem-fraction-static 0.95 \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --disable-shared-experts-fusion \
+    --cuda-graph-backend-prefill disabled \
+    --attention-backend triton
 
 ```
 
