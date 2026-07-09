@@ -126,7 +126,7 @@ LK_THREADS=60 \
 OMP_NUM_THREADS=60 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=512 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0-20 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0-18 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 python -m sglang.launch_server \
     --model /mnt/ktd/glm52 \
@@ -142,8 +142,11 @@ python -m sglang.launch_server \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --disable-shared-experts-fusion \
-    --cuda-graph-backend-prefill disabled \
+    --disable-piecewise-cuda-graph \
     --attention-backend triton
+
+# or use flashinfer
+    --attention-backend flashinfer
 
 ```
 
