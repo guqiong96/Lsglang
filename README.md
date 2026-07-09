@@ -27,6 +27,7 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 ## Version Changes
  
 ```bash
+2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types support, for example: nvidia/GLM-5.2-NVFP4
 2026-07-05: Lsglang-v1.4.0 - Optimize GPU prefill speed, CPU AVX512 optimization, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, update to sglang v0.5.14
 2026-06-05: Lsglang-v1.3.0 - Upgraded lk_moe module, supports nvfp4, mxfp4 quantization types, added LVLLM_GPU_RESIDENT_MOE_EXPERTS, removed LVLLM_MOE_USE_WEIGHT, LVLLM_MOE_QUANT_ON_GPU
 2026-04-06: Lsglang-v1.2.0 - Enhanced energy saving effect with LK_POWER_SAVING=1, supports mixed MOE layer inference with FP8+BF16+AWQ4bit
@@ -113,7 +114,7 @@ python -m sglang.launch_server \
     --disable-shared-experts-fusion
 
 ```
-### GLM-5.2-GLM-5.2-NVFP4 [RTX PRO 6000 * 2]
+### GLM-5.2-NVFP4 [RTX PRO 6000 * 2]
 ```bash 
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
