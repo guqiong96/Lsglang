@@ -39,7 +39,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 # AST-parsed "this test exists" marker; actual execution is gated by the
 # @skipUnless guard below (mirrors test_quantization.py in this directory).
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None

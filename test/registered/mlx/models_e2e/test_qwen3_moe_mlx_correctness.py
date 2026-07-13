@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 # Registered on the CPU suite but skipped wherever mlx is absent; runs for real
 # only on Apple Silicon. The macOS CI lane (pr-test-mlx.yml) is model-free, so
 # this serving test is not wired into it and still runs only locally.
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 
