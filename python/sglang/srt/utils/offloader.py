@@ -584,3 +584,128 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             )
 
     return output_tensors
+
+
+def offload_embedding_module(module: torch.nn.Module):
+    """Offload a VocabParallelEmbedding module's weight to pinned CPU memory.
+
+    The weight is moved to GPU at the start of each forward pass (via a
+    monkey-patched forward) and moved back to CPU after the forward completes.
+    The GPU buffer is allocated on-demand during forward and freed afterwards,
+    so GPU memory is only consumed during the brief embedding lookup step.
+
+    For a ~1 GB embedding table on PCIe 4.0 x16 this adds roughly 2-4 ms per
+    forward call (one round-trip copy).  The GPU buffer consumes ~1 GB during
+    the forward and is released back to the PyTorch caching allocator
+    afterwards (available for KV cache / activations).
+    """
+    weight = module.weight
+    if weight.device.type == "cpu":
+        logger.info(
+            "offload_embedding_module: weight already on CPU, skipping."
+        )
+        return
+    if weight.device.type != "cuda":
+        logger.warning(
+            "offload_embedding_module: unexpected device %s, skipping.",
+            weight.device,
+        )
+        return
+
+    device = weight.device
+    pin_memory = is_pin_memory_available()
+
+    # --- Move weight to pinned CPU memory (frees the GPU memory) ---
+    cpu_weight = _empty_strided_like(weight, device="cpu", pin_memory=pin_memory)
+    cpu_weight.copy_(weight.data)
+    module.weight.data = cpu_weight
+    module._embed_offload_cpu_weight = cpu_weight
+
+    orig_forward = module.forward
+
+    def _embedding_forward(x):
+        # If offload is disabled (e.g. during CUDA graph capture), the weight
+        # is already on GPU — just run the original forward.
+        if getattr(module, "_embed_offload_disable", False):
+            return orig_forward(x)
+
+        if torch.cuda.is_current_stream_capturing():
+            # CUDA graph capture — allocate temp buffer, copy in, run forward,
+            # and leave the weight on GPU for the rest of capture.
+            gpu_buf = torch.empty_strided(
+                cpu_weight.size(), cpu_weight.stride(),
+                dtype=cpu_weight.dtype, device=device,
+            )
+            gpu_buf.copy_(cpu_weight, non_blocking=False)
+            module.weight.data = gpu_buf
+            module._embed_offload_is_capturing = True
+            # Keep gpu_buf alive (not freed) for subsequent capture replays
+            # by stashing it so it survives until capture ends.
+            module._embed_offload_gpu_buf = gpu_buf
+            return orig_forward(x)
+
+        if getattr(module, "_embed_offload_is_capturing", False):
+            # Capture just ended; move weight back to CPU, drop GPU buffer.
+            gpu_buf = module._embed_offload_gpu_buf
+            cpu_weight.copy_(gpu_buf, non_blocking=False)
+            module.weight.data = cpu_weight
+            del module._embed_offload_gpu_buf
+            module._embed_offload_is_capturing = False
+            return orig_forward(x)
+
+        # Normal offload mode: allocate temp buffer, forward, let it go.
+        gpu_buf = torch.empty_strided(
+            cpu_weight.size(), cpu_weight.stride(),
+            dtype=cpu_weight.dtype, device=device,
+        )
+        gpu_buf.copy_(cpu_weight, non_blocking=False)
+        module.weight.data = gpu_buf
+        result = orig_forward(x)
+        cpu_weight.copy_(gpu_buf, non_blocking=True)
+        module.weight.data = cpu_weight
+        return result
+
+    module.forward = _embedding_forward
+
+    size_gb = weight.numel() * weight.element_size() / (1024**3)
+    logger.info(
+        "offload_embedding_module: offloaded %.3f GB embedding weight "
+        "from %s to pinned CPU memory.",
+        size_gb,
+        device,
+    )
+
+
+def set_embedding_offload_enabled(module: torch.nn.Module, enabled: bool):
+    """Temporarily enable/disable embedding offload (e.g. around CUDA graph capture).
+
+    When disabled, the weight is moved to GPU and kept there so that CUDA graph
+    capture can record the forward pass without encountering unsupported
+    host-device copy operations.  Call before / after ``init_cuda_graphs``.
+    """
+    cpu_weight = getattr(module, "_embed_offload_cpu_weight", None)
+    if cpu_weight is None:
+        return  # not an offloaded embedding module
+
+    device = cpu_weight.device  # "cpu"
+
+    if enabled:
+        # Re-enable offload: move weight back to CPU, drop GPU buffer.
+        gpu_buf = getattr(module, "_embed_offload_gpu_buf", None)
+        if gpu_buf is not None:
+            cpu_weight.copy_(gpu_buf, non_blocking=False)
+            del module._embed_offload_gpu_buf
+        module.weight.data = cpu_weight
+        module._embed_offload_disable = False
+    else:
+        # Disable offload: move weight to GPU for CUDA graph capture.
+        # Infer the GPU device from the CPU weight's original device.
+        gpu_buf = torch.empty_strided(
+            cpu_weight.size(), cpu_weight.stride(),
+            dtype=cpu_weight.dtype,
+            device=torch.cuda.current_device(),
+        )
+        gpu_buf.copy_(cpu_weight, non_blocking=False)
+        module.weight.data = gpu_buf
+        module._embed_offload_gpu_buf = gpu_buf
+        module._embed_offload_disable = True
