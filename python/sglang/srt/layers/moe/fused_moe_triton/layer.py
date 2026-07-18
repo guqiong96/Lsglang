@@ -358,6 +358,16 @@ class FusedMoE(torch.nn.Module):
         model_arch = server_args.model_config.hf_config.architectures[0]
         self.check_nan_in_output = (model_arch in ["MiniMaxM2ForCausalLM", "Step3p5ForCausalLM", "KimiK25ForConditionalGeneration"])
         self.has_gate_proj  = not (model_arch == "NemotronHForCausalLM")
+        
+        self.params_dtype = params_dtype
+         
+        self.activation_type = 0  # silu
+        if activation == "swigluoai":
+            self.activation_type = 1  # swigluoai
+        elif not self.has_gate_proj:
+            self.activation_type = 2  # relu2
+            
+        self.swiglu_limit = swiglu_limit
 
         self.quant_method.create_weights(
             layer=self,
@@ -1627,11 +1637,19 @@ class FusedMoE(torch.nn.Module):
             return self.moe_ep_size, self.moe_ep_rank, torch.cuda.current_device()
         return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
                 
-    def _get_quant_params(self, w13_weight, w13_weight_scale, pack_ratio):
+    def _get_quant_params(self, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, pack_ratio):
         unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
         
-        groupN = w13_weight.shape[1] // w13_weight_scale.shape[1]
-        groupK = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
+        groupN_w13 = w13_weight.shape[1] // w13_weight_scale.shape[1]
+        groupK_w13 = (w13_weight.shape[2] * unpack_factor) // w13_weight_scale.shape[2]
+        
+        groupN_w2 = w2_weight.shape[1] // w2_weight_scale.shape[1]
+        groupK_w2 = (w2_weight.shape[2] * unpack_factor) // w2_weight_scale.shape[2]
+        
+         
+        groupN = max(groupN_w13, groupN_w2)
+        groupK = max(groupK_w13, groupK_w2)
+        
         return groupN, groupK
                   
     def _process_wna16(self): 
@@ -1651,7 +1669,7 @@ class FusedMoE(torch.nn.Module):
     
          
         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, 2)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_scale, w2_weight, w2_scale, 2)
         
         w13_weight_ptr = w13_weight.data_ptr()
         w2_weight_ptr = w2_weight.data_ptr()
@@ -1678,17 +1696,31 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_WNA16(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_WNA16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_WNA16_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
          
             
     
@@ -1717,7 +1749,7 @@ class FusedMoE(torch.nn.Module):
             w2_weight_scale = self.w2_weight_scale
         
         
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 1)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 1)
 
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
@@ -1743,17 +1775,32 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_FP8(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_FP8(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+             self.lk_moe = lk_moe.MOE_FP8_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+            
             
     def _process_bf6_fp16(self):
         w13_weight = self.w13_weight
@@ -1778,17 +1825,30 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
+        self.lk_moe_config.activation_type = self.activation_type
         
         # no scale
-        self.lk_moe = lk_moe.MOE_BF16(
-            self.lk_moe_config,
-            w13_ptr,
-            w2_ptr,
-             0,
-             0,
-             0,
-             0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_BF16(
+                self.lk_moe_config,
+                w13_ptr,
+                w2_ptr,
+                0,
+                0,
+                0,
+                0,
+            )
+        else:
+             self.lk_moe = lk_moe.MOE_FP16(
+                self.lk_moe_config,
+                w13_ptr,
+                w2_ptr,
+                0,
+                0,
+                0,
+                0,
+            )
+        
         
         
     
@@ -1803,7 +1863,7 @@ class FusedMoE(torch.nn.Module):
         w2_weight_global_scale = self.w2_weight_global_scale if hasattr(self, "w2_weight_global_scale") else self.w2_weight_scale_2
          
          
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 2)
         
         if need_reciprocal_global_scale:
             w13_weight_global_scale = 1.0 / w13_weight_global_scale
@@ -1834,17 +1894,31 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
          
-        self.lk_moe = lk_moe.MOE_NVFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            w13_weight_global_scale_ptr,
-            w2_weight_global_scale_ptr,
-        )
-        
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_NVFP4(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                w13_weight_global_scale_ptr,
+                w2_weight_global_scale_ptr,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_NVFP4_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                w13_weight_global_scale_ptr,
+                w2_weight_global_scale_ptr,
+            )
+            
  
     
     def _process_mxfp4(self):
@@ -1853,7 +1927,7 @@ class FusedMoE(torch.nn.Module):
         w13_weight_scale = self.w13_weight_scale_inv
         w2_weight_scale = self.w2_weight_scale_inv 
          
-        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
+        groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, 2)
 
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
@@ -1879,21 +1953,33 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.groupN = groupN
         self.lk_moe_config.groupK = groupK
+        self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
 
         # no global scale
-        self.lk_moe = lk_moe.MOE_MXFP4(
-            self.lk_moe_config,
-            w13_weight_ptr,
-            w2_weight_ptr,
-            w13_weight_scale_ptr,
-            w2_weight_scale_ptr,
-            0,
-            0,
-        )
+        if self.params_dtype == torch.bfloat16:
+            self.lk_moe = lk_moe.MOE_MXFP4(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
+        else:
+            self.lk_moe = lk_moe.MOE_MXFP4_FP16(
+                self.lk_moe_config,
+                w13_weight_ptr,
+                w2_weight_ptr,
+                w13_weight_scale_ptr,
+                w2_weight_scale_ptr,
+                0,
+                0,
+            )
              
-    
-    
-        
+     
           
     def _get_max_num_seqs(self) -> int:
         if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
