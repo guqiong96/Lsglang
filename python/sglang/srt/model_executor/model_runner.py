@@ -226,6 +226,7 @@ from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
+    set_embedding_offload_enabled,
     set_offloader,
 )
 from sglang.srt.utils.patch_torch import (
@@ -947,7 +948,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if capture_decode_cuda_graph:
             if self.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-                self.init_decode_cuda_graph()
+                # Temporarily move embedding weight to GPU so CUDA graph
+                # capture can record the forward pass without encountering
+                # unsupported host-device copies.
+                embed_mod = getattr(self.model, "embed_tokens", None)
+                if embed_mod is None:
+                    lm = getattr(self.model, "model", None)
+                    if lm is not None:
+                        embed_mod = getattr(lm, "embed_tokens", None)
+                if embed_mod is not None:
+                    set_embedding_offload_enabled(embed_mod, enabled=False)
+                try:
+                    self.init_decode_cuda_graph()
+                finally:
+                    if embed_mod is not None:
+                        set_embedding_offload_enabled(embed_mod, enabled=True)
             elif (
                 current_platform.is_out_of_tree()
                 and current_platform.support_cuda_graph()

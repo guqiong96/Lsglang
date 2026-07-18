@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.offloader import set_embedding_offload_enabled
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
@@ -654,79 +655,93 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 and spec_info.dsa_topk_indices is not None
             ):
                 spec_info.dsa_topk_indices = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+        # Keep embedding weight on GPU during the MTP draft loop to avoid
+        # repeated CPU→GPU PCIe transfers (one per step).
+        embed_mod = getattr(self.draft_runner.model, "embed_tokens", None)
+        if embed_mod is None:
+            lm = getattr(self.draft_runner.model, "model", None)
+            if lm is not None:
+                embed_mod = getattr(lm, "embed_tokens", None)
+        if embed_mod is not None:
+            set_embedding_offload_enabled(embed_mod, enabled=False)
+        try:
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-            # argument must be contiguous.
-            if (
-                self.draft_runner.model_config.hf_config.architectures[0]
-                == "Qwen3MoeForCausalLMMTP"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            spec_info.hidden_states = hidden_states
+                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step, plus a canary
-            # index context so canary tracks which draft step is active.
-            canary_index_ctx = (
-                c.with_active_single_forward_manager(i)
-                if (c := self.draft_runner.canary_manager) is not None
-                else contextlib.nullcontext()
-            )
-            with (
-                forward_context(
-                    ForwardContext(
-                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                # Set inputs
+                forward_batch.input_ids = input_ids
+                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+                # argument must be contiguous.
+                if (
+                    self.draft_runner.model_config.hf_config.architectures[0]
+                    == "Qwen3MoeForCausalLMMTP"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                spec_info.hidden_states = hidden_states
+
+                # Run forward under a per-step ForwardContext so the model layer
+                # reads attn_backends[i] for the i-th draft step, plus a canary
+                # index context so canary tracks which draft step is active.
+                canary_index_ctx = (
+                    c.with_active_single_forward_manager(i)
+                    if (c := self.draft_runner.canary_manager) is not None
+                    else contextlib.nullcontext()
+                )
+                with (
+                    forward_context(
+                        ForwardContext(
+                            attn_backend=self.draft_attn_backend.attn_backends[i]
+                        )
+                    ),
+                    canary_index_ctx,
+                ):
+                    logits_output = self.draft_runner.forward(forward_batch).logits_output
+                maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+                maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
+                if self.server_args.speculative_use_rejection_sampling:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        self.server_args.speculative_use_rejection_sampling,
                     )
-                ),
-                canary_index_ctx,
-            ):
-                logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.server_args.speculative_use_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
+                    topk_p, topk_index = fast_sample(probs, num_samples=1)
+                    draft_probs_list.append(probs)
+                elif self.topk == 1 and not _is_hip:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                else:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        self.server_args.speculative_use_rejection_sampling,
+                    )
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-                draft_probs_list.append(probs)
-            elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-            else:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-            forward_batch.positions.add_(1)
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
+                forward_batch.positions.add_(1)
+        finally:
+            if embed_mod is not None:
+                set_embedding_offload_enabled(embed_mod, enabled=True)
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None

@@ -4460,6 +4460,11 @@ def is_lk_moe_gpu_resident_layer(layer_id: str) -> bool:
      
     return layer_id in disabled_layers
 
+
+def is_embedding_offload_enabled() -> bool:
+    return is_lk_moe_feature_enabled() and get_bool_env_var("LVLLM_OFFLOAD_EMBEDDING")
+
+
 def enabled_layerwise_load() -> bool:
     return get_bool_env_var("LVLLM_ENABLE_MOE_LAYERWISE_LOAD")
  

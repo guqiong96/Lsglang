@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.utils.offloader import set_embedding_offload_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
@@ -544,44 +545,58 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         hidden_states = seed_hidden_per_req
 
         scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
 
-            if i == self.speculative_num_steps - 1:
-                break
+        # Keep embedding weight on GPU during the MTP draft loop to avoid
+        # repeated CPU→GPU PCIe transfers (one per step).
+        embed_mod = getattr(self.draft_model_runner.model, "embed_tokens", None)
+        if embed_mod is None:
+            lm = getattr(self.draft_model_runner.model, "model", None)
+            if lm is not None:
+                embed_mod = getattr(lm, "embed_tokens", None)
+        if embed_mod is not None:
+            set_embedding_offload_enabled(embed_mod, enabled=False)
+        try:
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            forward_batch.input_ids = input_ids
-            forward_batch.spec_info.hidden_states = hidden_states
-            self._set_positions(forward_batch)
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            with (
-                self._target_kv_pool_view(forward_batch),
-                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
-            ):
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch
-                ).logits_output
+                forward_batch.input_ids = input_ids
+                forward_batch.spec_info.hidden_states = hidden_states
+                self._set_positions(forward_batch)
 
-            maybe_detect_nan(
-                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
-            )
-            maybe_detect_inf(
-                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
-            )
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                "frozen_kv_mtp_draft: topk_index OOB",
-            )
-            hidden_states = logits_output.hidden_states
+                with (
+                    self._target_kv_pool_view(forward_batch),
+                    forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+                ):
+                    logits_output = self.draft_model_runner.forward(
+                        forward_batch
+                    ).logits_output
+
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+                )
+                maybe_detect_inf(
+                    logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    "frozen_kv_mtp_draft: topk_index OOB",
+                )
+                hidden_states = logits_output.hidden_states
+        finally:
+            if embed_mod is not None:
+                set_embedding_offload_enabled(embed_mod, enabled=True)
 
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens

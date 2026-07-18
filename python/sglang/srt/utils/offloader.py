@@ -584,3 +584,102 @@ def _create_shared_buffer_tensors(local_tensor: torch.Tensor) -> List[torch.Tens
             )
 
     return output_tensors
+
+
+def offload_embedding_to_cpu(module: torch.nn.Module):
+    """Offload embedding module's weight to pinned CPU memory.
+
+    Follows the same pattern as OffloaderBase.maybe_offload_to_cpu:
+    - Move parameters to pinned CPU memory (frees GPU memory)
+    - Wrap forward with functional_call to handle CPU → GPU → CPU per call
+    - GPU weight is allocated on-demand during forward and freed afterwards
+    """
+    weight = module.weight
+    if weight.device.type == "cpu":
+        logger.info(
+            "offload_embedding_to_cpu: weight already on CPU, skipping."
+        )
+        return
+    if weight.device.type != "cuda":
+        logger.warning(
+            "offload_embedding_to_cpu: unexpected device %s, skipping.",
+            weight.device,
+        )
+        return
+
+    device = weight.device
+    pin_memory = is_pin_memory_available()
+
+    # --- Move weight to pinned CPU memory (frees the GPU memory) ---
+    cpu_weight = torch.empty_strided(
+        size=weight.size(),
+        stride=weight.stride(),
+        dtype=weight.dtype,
+        layout=weight.layout,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    cpu_weight.copy_(weight)
+    module.weight = torch.nn.Parameter(cpu_weight)
+
+    orig_forward = module.forward
+    module._embed_offload_orig_forward = orig_forward
+
+    def forward(*args, **kwargs):
+        # Restore original forward for functional_call
+        module.forward = orig_forward
+        # Move parameters back to GPU for this forward pass
+        device_state = {
+            k: v.to(device, non_blocking=True)
+            for k, v in module.state_dict().items()
+        }
+        output = functional_call(module, device_state, args=args, kwargs=kwargs)
+        # Re-apply the offloaded forward wrapper
+        module.forward = forward
+        return output
+
+    module.forward = forward
+    module._embed_offload_forward = forward
+
+    size_gb = weight.numel() * weight.element_size() / (1024**3)
+    logger.info(
+        "offload_embedding_to_cpu: offloaded %.3f GB embedding weight "
+        "from %s to pinned CPU memory.",
+        size_gb,
+        device,
+    )
+
+
+def set_embedding_offload_enabled(module: torch.nn.Module, enabled: bool):
+    """Temporarily enable/disable embedding offload (e.g. around CUDA graph capture).
+
+    When disabled, the weight is moved to GPU and kept there so that CUDA graph
+    capture can record the forward pass without encountering unsupported
+    host-device copy operations.  Call before / after ``init_cuda_graphs``.
+    """
+    # Check if this module was offloaded (weight should be on CPU)
+    if module.weight.device.type != "cpu":
+        return  # not an offloaded embedding module
+
+    cpu_weight = module.weight
+
+    if enabled:
+        # Re-enable offload: move weight back to CPU, restore offloaded forward
+        gpu_buf = getattr(module, "_embed_offload_gpu_buf", None)
+        if gpu_buf is not None:
+            cpu_weight.copy_(gpu_buf, non_blocking=False)
+            del module._embed_offload_gpu_buf
+        module.weight = torch.nn.Parameter(cpu_weight)
+        module.forward = getattr(module, "_embed_offload_forward", module.forward)
+    else:
+        # Disable offload: move weight to GPU for CUDA graph capture
+        gpu_buf = torch.empty_strided(
+            cpu_weight.size(), cpu_weight.stride(),
+            dtype=cpu_weight.dtype,
+            device=torch.cuda.current_device(),
+        )
+        gpu_buf.copy_(cpu_weight, non_blocking=False)
+        module.weight = torch.nn.Parameter(gpu_buf)
+        module._embed_offload_gpu_buf = gpu_buf
+        module._embed_offload_forward = module.forward
+        module.forward = getattr(module, "_embed_offload_orig_forward", module.forward)

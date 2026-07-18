@@ -202,6 +202,7 @@ python -m sglang.launch_server \
 | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | None | Minimum input length for GPU prefill: `4096`-GPU prefill starts when input length reaches this value | Should not be set too small, set to 0 to disable GPU prefill |
 | `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable | Recommended: `0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`: fast model loading, `1`: slow loading to avoid OOM | Recommendation: use `0` when memory is abundant, `1` when memory is tight |
+| `LVLLM_OFFLOAD_EMBEDDING` | Memory Optimization | `0` | Offload embedding layer to CPU memory: `1`-enable, `0`-disable | Frees ~1 GB GPU memory. Weight is copied back to GPU during each forward pass. |
 
 ## Installation Steps
 

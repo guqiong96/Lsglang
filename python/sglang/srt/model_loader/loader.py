@@ -46,6 +46,8 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils.common import is_embedding_offload_enabled
+from sglang.srt.utils.offloader import offload_embedding_to_cpu
 
 # Try to import accelerate (optional dependency)
 try:
@@ -775,6 +777,19 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+
+        # Offload embedding layer to CPU if enabled
+        if is_embedding_offload_enabled():
+            embed_module = getattr(model, "embed_tokens", None)
+            if embed_module is None:
+                lm = getattr(model, "model", None)
+                if lm is not None:
+                    embed_module = getattr(lm, "embed_tokens", None)
+            if embed_module is not None and not isinstance(
+                embed_module, torch.nn.Identity
+            ):
+                offload_embedding_to_cpu(embed_module)
+
         return model.eval()
 
     @staticmethod
