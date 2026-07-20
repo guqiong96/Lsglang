@@ -2,7 +2,7 @@
 
 Lsglang is a special extension of sglang that fully utilizes CPU and GPU computing resources with an efficient GPU parallel + NUMA parallel architecture, suitable for MOE model hybrid inference.
 
-> **Core Engine:** The actual hybrid inference functionality—including CPU-GPU collaborative computation, NUMA-aware scheduling, expert weight management, and quantization kernel execution—is powered entirely by **[lk_moe](https://pypi.org/project/lk-moe/)**, a highly optimized MOE hybrid inference engine. Within [LvLLM](https://github.com/guqiong96/Lvllm) (for vLLM) and Lsglang (for sglang), each MOE layer can flexibly choose between the original GPU computation path or invoke lk_moe for hybrid inference. For DeepSeek V4 (SM120 architecture), a specialized version [Lvllmds4](https://github.com/guqiong96/Lvllmds4) is also available.
+> **Core Engine:** The actual hybrid inference functionality—including CPU-GPU collaborative computation, NUMA-aware scheduling, expert weight management, and quantization kernel execution—is powered entirely by **[lk_moe](https://pypi.org/project/lk-moe/)**, a highly optimized MOE hybrid inference engine. Within LvLLM (for vLLM) and [Lsglang](https://github.com/guqiong96/Lsglang) (for sglang), each MOE layer can flexibly choose between the original GPU computation path or invoke lk_moe for hybrid inference. For DeepSeek V4, specialized versions are also available: [Lvllmds4](https://github.com/guqiong96/Lvllmds4) (SM120+) and [Lvllmds4-x](https://github.com/guqiong96/Lvllmds4-x) (SM80+).
 
 ## System Features
 
