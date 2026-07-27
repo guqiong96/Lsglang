@@ -18,9 +18,23 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache_paged,
+    gather_dequant_requant_fp8_paged,
+)
+from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.attention.dsa.transform_index import (
+    transform_index_page_table_decode,
+    transform_index_page_table_prefill,
+)
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+    seqlens_expand_triton,
+)
+from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -30,11 +44,6 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
-)
-from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.dsa.transform_index import (
-    transform_index_page_table_decode,
-    transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
@@ -47,16 +56,12 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
-    seqlens_expand_triton,
-)
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -103,8 +108,8 @@ def _all_gather_dsa_trtllm_fp8_kv(
 _is_hip = is_hip()
 
 if _is_hip:
-    from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
@@ -135,10 +140,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
-
-
-# Reuse this workspace buffer across all DSA backend instances
-global_workspace_buffer = None
 
 
 @dataclass(frozen=True)
@@ -326,7 +327,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_sparse_q8", "flashmla_kv", "fa3", "tilelang", "trtllm"
 ]
 
 
@@ -451,16 +452,50 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
+        # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
+        # construction: an unsupported config must fail at launch rather than
+        # mid-forward. `flashmla_sparse` remains the bf16 path with no such
+        # requirement.
+        if self.dsa_prefill_impl == "flashmla_sparse_q8":
+            if self.kv_cache_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 is native FP8 and requires "
+                    f"--kv-cache-dtype fp8_e4m3 (got kv_cache_dtype={self.kv_cache_dtype}); "
+                    "use --dsa-prefill-backend flashmla_sparse for the bf16 path."
+                )
+            if self.device_sm_major != 9:
+                raise ValueError(
+                    "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
+                    f"capability sm_{self.device_sm_major}x."
+                )
+
+        # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
+        # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
+        # via the shared DSA_CHOICES list.
+        if self.dsa_decode_impl == "flashmla_sparse_q8":
+            raise ValueError(
+                "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
+                "flashmla_sparse_q8 is a prefill-only backend. For FP8, use "
+                "--dsa-prefill-backend flashmla_sparse_q8 together with "
+                "--dsa-decode-backend flashmla_kv."
+            )
+
+        # Q8KV8 per-call device-tensor caches, populated lazily on the first
+        # Q8KV8 dispatch (no-ops for other backends).
+        self._q8kv8_identity_scale: Optional[torch.Tensor] = None
+        self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
+
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
-            global global_workspace_buffer
-            if global_workspace_buffer is None:
-                global_workspace_buffer = torch.empty(
+            self.workspace_buffer = get_buffer(
+                "dsa_trtllm_workspace",
+                lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
-                )
-            self.workspace_buffer = global_workspace_buffer
+                ),
+            )
         else:
             self.workspace_buffer = None
 
@@ -1385,7 +1420,7 @@ class DeepseekSparseAttnBackend(
             max_len = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
 
@@ -1427,7 +1462,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
 
@@ -1525,7 +1560,7 @@ class DeepseekSparseAttnBackend(
             )
 
             if is_cuda() and not _is_hip:
-                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
 
@@ -1905,9 +1940,11 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1962,7 +1999,7 @@ class DeepseekSparseAttnBackend(
                     and page_table_1.shape[-1] == 2048
                     and q_nope.shape[0] >= 512
                 ):
-                    from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                         triton_sparse_mla_fwd,
                     )
 
@@ -1982,12 +2019,46 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
-        elif dsa_impl == "flashmla_sparse":
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-
+        elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if any(forward_batch.extend_prefix_lens_cpu):
+                _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+                page_table_1 = topk_indices
+
+                # `flashmla_sparse_q8` = native FP8 sparse prefill (constructor
+                # guarantees fp8_e4m3 KV + SM90). The helper consumes q_nope/q_rope
+                # directly (fusing the concat with the bf16->fp8 cast), so no bf16
+                # q_all is materialized on this path. The prefix path hands over the
+                # paged fp8 KV as-is; the non-prefix path passes the gathered bf16 KV.
+                if dsa_impl == "flashmla_sparse_q8":
+                    if _has_prefix:
+                        page_table_1_flattened = (
+                            self.forward_metadata.page_table_1_flattened
+                        )
+                        assert page_table_1_flattened is not None
+                        return self._forward_flashmla_sparse_q8kv8(
+                            q_nope=q_nope,
+                            q_rope=q_rope,
+                            kv_bf16=None,
+                            paged_kv_cache=kv_cache,
+                            page_table_1_flattened=page_table_1_flattened,
+                            page_table_1=page_table_1,
+                            sm_scale=layer.scaling,
+                            v_head_dim=layer.v_head_dim,
+                        )
+                    kv_cache = _cat([k, k_rope], dim=-1)
+                    return self._forward_flashmla_sparse_q8kv8(
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        kv_bf16=kv_cache,
+                        paged_kv_cache=None,
+                        page_table_1_flattened=None,
+                        page_table_1=page_table_1,
+                        sm_scale=layer.scaling,
+                        v_head_dim=layer.v_head_dim,
+                    )
+
+                # bf16 path (dsa_impl == "flashmla_sparse").
+                if _has_prefix:
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
                     )
@@ -1997,8 +2068,9 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
-                page_table_1 = topk_indices
 
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2293,6 +2365,131 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def _forward_flashmla_sparse_q8kv8(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_bf16: Optional[torch.Tensor],
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        paged_kv_cache: Optional[torch.Tensor] = None,
+        page_table_1_flattened: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Native FP8 (q8 x kv8) sparse-prefill attention (SM90 JIT kernel).
+
+        Same contract as ``_forward_flashmla_sparse`` but executed through the
+        FP8 ``sparse_mla_q8kv8_prefill_fwd`` kernel.  Identity per-tensor
+        scales (scalar 1.0) are used: a raw bf16->fp8 cast of q/kv is accurate
+        on real DeepSeek-V3 magnitudes, so no dynamic rescaling is applied.
+        The kernel runs via its fixed full-topk entry (``attn_sink`` /
+        ``topk_length`` left None), keeping control flow identical across DP
+        ranks; -1 topk sentinels are clamped to distinct zero pad rows inside
+        the kernel.
+
+        Two KV paths:
+          * non-prefix extend: ``kv_bf16`` (the gathered bf16 KV) is cast into
+            a zero-padded fp8 buffer.
+          * prefix extend: ``paged_kv_cache`` (fp8, 656 B/token: nope_fp8 +
+            per-group scales + rope_bf16) is gathered, dequantized per group,
+            and requantized to per-tensor fp8 in one fused Triton kernel
+            (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
+            materialization.
+        """
+        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+            sparse_mla_q8kv8_prefill_fwd,
+        )
+
+        num_tokens, num_heads, d_nope = q_nope.shape
+        head_dim = d_nope + q_rope.shape[-1]
+        dev = q_nope.device
+
+        # The SM90 kernel requires num_heads % 64 == 0; smaller head counts
+        # (high-TP splits) are zero-padded up to 64.
+        required_padding = 64
+        need_padding = num_heads % required_padding != 0
+
+        # Build the fp8 q.  concat_and_cast_q_fp8_pad fuses the nope/rope
+        # concat with the bf16->fp8 cast in one Triton kernel (bit-exact vs
+        # concat + .to(fp8)); it requires power-of-two head/dim counts (a
+        # tl.arange constraint), so non-power-of-two head counts fall back to
+        # the generic concat + cast.
+        if need_padding:
+            if required_padding % num_heads != 0:
+                raise ValueError(
+                    f"num_heads={num_heads} cannot be padded to {required_padding}; "
+                    "this TP size is incompatible with flashmla_sparse_q8."
+                )
+            # Cached zero-padded fp8 q buffer: the pad rows [num_heads:64] are
+            # zero on first alloc and only ever read by the kernel; the active
+            # slice is overwritten each forward.  Eager-mode DSA runs layers
+            # sequentially on one stream, so single-buffer reuse is safe.
+            # Grown on demand.
+            buf = self._q8kv8_qpad_buf
+            if buf is None or buf.shape[0] < num_tokens:
+                buf = torch.zeros(
+                    (num_tokens, required_padding, head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=dev,
+                )
+                self._q8kv8_qpad_buf = buf
+            q_fp8 = buf[:num_tokens]
+            # head counts that divide 64 are powers of two, so the fused
+            # concat-cast is always applicable here.
+            concat_and_cast_q_fp8_pad(q_fp8, q_nope, q_rope, num_heads)
+        elif (num_heads & (num_heads - 1)) == 0:
+            q_fp8 = q_nope.new_empty(
+                (num_tokens, num_heads, head_dim), dtype=torch.float8_e4m3fn
+            )
+            concat_and_cast_q_fp8_pad(q_fp8, q_nope, q_rope, num_heads)
+        else:
+            # Generic fallback for non-power-of-two head counts.
+            q_fp8 = concat_mla_absorb_q_general(q_nope, q_rope).to(torch.float8_e4m3fn)
+
+        # Identity per-tensor scale, cached: creating it per call is a
+        # host->device copy that synchronizes the stream.
+        identity_scale = self._q8kv8_identity_scale
+        if identity_scale is None:
+            identity_scale = torch.tensor([1.0], dtype=torch.float32, device=dev)
+            self._q8kv8_identity_scale = identity_scale
+
+        # KV: append `topk` trailing zero rows so the kernel's -1-sentinel
+        # clamp can map every padded topk slot to a DISTINCT zero row.
+        # Mapping many slots onto one shared row would serialize the kernel's
+        # KV gather; distinct zero rows are value-identical (zero KV
+        # contributes nothing to the softmax-weighted sum) at full speed.
+        topk = page_table_1.shape[-1]
+        if paged_kv_cache is not None:
+            kv_padded = gather_dequant_requant_fp8_paged(
+                paged_kv_cache,
+                page_table_1_flattened,
+                extra_rows=topk,
+            ).view(-1, 1, head_dim)
+        else:
+            kv_padded = kv_bf16.new_zeros(
+                (kv_bf16.shape[0] + topk, *kv_bf16.shape[1:]),
+                dtype=torch.float8_e4m3fn,
+            )
+            kv_padded[: kv_bf16.shape[0]].copy_(kv_bf16)
+            kv_padded = kv_padded.view(-1, 1, head_dim)
+
+        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+            q=q_fp8,
+            kv=kv_padded,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            q_scale=identity_scale,
+            kv_scale=identity_scale,
+            d_v=v_head_dim,
+            attn_sink=None,
+            topk_length=None,
+        )
+
+        # Trim the output back to the original head count if we padded.
+        if need_padding:
+            o = o[:, :num_heads, :]
+        return o
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2427,7 +2624,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         return tilelang_sparse_fwd(
             q=q_all,
@@ -2848,7 +3045,11 @@ class DeepseekSparseAttnBackend(
         if (
             # disable for MTP
             self.dsa_kv_cache_store_fp8
-            and self.dsa_prefill_impl == "flashmla_sparse"
+            # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
+            # dispatch lives inside the RAGGED branch of forward_extend; without this the
+            # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
+            # fp8 KV ("kv must have dtype kBFloat16").
+            and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED

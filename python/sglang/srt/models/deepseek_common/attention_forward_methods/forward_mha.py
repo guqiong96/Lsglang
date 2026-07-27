@@ -4,15 +4,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
-    dcp_enabled,
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -31,7 +30,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
 
 _use_fp8_prefill_attn = (
@@ -51,7 +50,7 @@ elif _is_musa:
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 
@@ -145,7 +144,7 @@ class DeepseekMHAForwardMixin:
 
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         # TODO: Design a finer way to determine the threshold
@@ -309,15 +308,15 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().dsa_decode_backend == "trtllm"
-                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
+                    not get_server_args().dsa_decode_backend == "trtllm"
+                    or not get_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if dcp_enabled():
+                if get_parallel().dcp_enabled:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,

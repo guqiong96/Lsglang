@@ -16,13 +16,30 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-DEVICE = get_device()
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _fake_server_args(**fields):
+    """server_args stand-in: carries fields and the override() entry point."""
+    ns = SimpleNamespace(**fields)
+
+    def _override(source, **updates):
+        for key, value in updates.items():
+            setattr(ns, key, value)
+
+    ns.override = _override
+    return ns
 
 
 def _make_chain_lists(num_steps: int, bs: int):
@@ -53,7 +70,7 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     worker.device = DEVICE
     worker.speculative_num_steps = num_steps
     worker.speculative_num_draft_tokens = num_draft_tokens
-    worker.server_args = SimpleNamespace(
+    worker.server_args = _fake_server_args(
         cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=8)),
         max_running_requests=8,
     )
@@ -151,7 +168,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-                worker.prepare_for_draft = MagicMock(return_value=(forward_batch, True))
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(
                     get_verify_buffers_to_fill_after_draft=lambda: (None, None),
@@ -176,8 +192,11 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
 
                 with patch(
-                    "sglang.srt.speculative.eagle_worker_v2.build_tree_kernel_efficient",
+                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
                     return_value=tree_result,
+                ), patch(
+                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                    return_value=(forward_batch, True),
                 ):
                     worker.draft(batch)
 
@@ -188,7 +207,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker = object.__new__(EagleDraftWorker)
         existing_backend = object()
         decode_backend = object()
-        worker.server_args = SimpleNamespace()
+        worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -210,7 +229,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         draft_extend_backend = object()
-        worker.server_args = SimpleNamespace()
+        worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -260,7 +279,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
         worker.speculative_num_steps = 2
         worker.speculative_num_draft_tokens = 3
-        worker.server_args = SimpleNamespace(
+        worker.server_args = _fake_server_args(
             speculative_num_steps=2,
             speculative_num_draft_tokens=3,
             cuda_graph_bs_decode=None,
