@@ -2038,8 +2038,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             batch_size = self.max_running_requests
-            
-        batch_size = min(batch_size, 32)
         
         return batch_size
   
