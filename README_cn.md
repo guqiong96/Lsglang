@@ -77,6 +77,7 @@ Lsglang已验证的大部分原版MOE模型
 | GLM-4.6V | ✅ 已测试通过 |
 | Kimi k2.6 | ✅ 已测试通过 |
 | Kimi k2.5 | ✅ 已测试通过 |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | ✅ 已测试通过 [sm120]|
 
 未列出的Qwen3系列、GLM系列、MiniMax系列的原版MOE模型理论上支持，待实际测试。
 

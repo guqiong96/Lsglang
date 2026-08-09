@@ -17,7 +17,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 
 Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architectures
 
-## Usage Guide [[中文]](./README.md)
+## Usage Guide [[中文]](./README_cn.md)
 - [Performance Benchmark](#performance-benchmark)
 - [Version Changes](#version-changes)
 - [Supported Models](#supported-models)
@@ -77,6 +77,7 @@ Most original MOE models verified by Lsglang
 | GLM-4.6V | ✅ Tested |
 | Kimi k2.6 | ✅ Tested |
 | Kimi k2.5 | ✅ Tested |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | ✅ Tested [sm120]|
 
 Unlisted original MOE models from Qwen3 series, GLM series, and MiniMax series are theoretically supported and pending actual testing.
 
