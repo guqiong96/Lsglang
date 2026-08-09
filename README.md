@@ -18,6 +18,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architectures
 
 ## Usage Guide [[中文]](./README.md)
+- [Performance Benchmark](#performance-benchmark)
 - [Version Changes](#version-changes)
 - [Supported Models](#supported-models)
 - [Supported Quantization Formats](#supported-quantization-formats)
@@ -25,6 +26,13 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 - [Configuration Parameters](#configuration-parameters)
 - [Installation Steps](#installation-steps)
 - [Optimization](#optimization)
+
+## Performance Benchmark
+Open GPU Prefill, max_num_batched_tokens=8192 (Row 1), max_num_batched_tokens=32768 (Row 2)
+| Model | Version | CPU | Memory | GPU | Prefill | Decode | Speculative Decoding |
+|-------|---------|-----|--------|-----|---------|--------|---------|
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 7642 *2 | 16 channels ddr4 3200 | 5060Ti * 2 | 780 t/s [input 32768]| 25 t/s [input 32768]| 35~47 t/s |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24 channels ddr5 4800 | pro 6000 * 1 | 4600 t/s [input 131072]| 75 t/s [input 131072]| 100~132 t/s |
 
 ## Version Changes
  

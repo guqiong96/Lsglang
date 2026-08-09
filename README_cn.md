@@ -17,6 +17,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 注1：x86带有AVX2以上指令集的CPU和Nvidia GPU sm80以上架构
 
 ## 使用说明 [[English]](./README.md)
+- [性能基准](#性能基准)
 - [版本变更](#版本变更)
 - [支持的模型](#支持的模型)
 - [支持的量化格式](#支持的量化格式)
@@ -24,6 +25,14 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 - [配置参数](#配置参数)
 - [安装步骤](#安装步骤)
 - [优化](#优化)
+
+
+## 性能基准
+Open GPU Prefill, max_num_batched_tokens=8192 (Row 1), max_num_batched_tokens=32768 (Row 2)
+| Model | Version | CPU | Memory | GPU | Prefill | Decode | Speculative Decoding |
+|-------|---------|-----|--------|-----|---------|--------|---------|
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 7642 *2 | 16 channels ddr4 3200 | 5060Ti * 2 | 780 t/s [input 32768]| 25 t/s [input 32768]| 35~47 t/s |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24 channels ddr5 4800 | pro 6000 * 1 | 4600 t/s [input 131072]| 75 t/s [input 131072]| 100~132 t/s |
 
 ## 版本变更
  
