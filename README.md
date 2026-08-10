@@ -311,11 +311,11 @@ Generally: 2, 4, 8 nodes, supports up to 32 nodes, more nodes is better, node co
 
 ### Thread Count Settings
 ```bash
-# Thread count <= (core count - x) / tensor parallelism (TP size)  x is threads reserved for other tasks, at least 4 threads
-# 96 cores, 2 GPUs, 44 threads per GPU, 88 threads total, 8 threads remaining for other tasks
-LK_THREADS=44                    
-# Total threads exceeding physical core count may cause performance issues   
-# Although the system will automatically adjust thread count, manual setting is recommended for testing     
+# Hyper-Threading enabled: total physical cores ÷ number of GPUs
+# Hyper-Threading disabled: (total physical cores - 2) ÷ number of GPUs
+# 96 cores, 2 GPUs → 48 threads per GPU
+LK_THREADS=48
+# Total threads exceeding physical core count may cause performance issues    
 ```
 
 ### VRAM Settings
