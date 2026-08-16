@@ -206,8 +206,9 @@ python -m sglang.launch_server \
 | `LK_THREAD_BINDING` | Performance Parameter | `CPU_CORE` | Thread binding strategy: `CPU_CORE`-bind by CPU core, `NUMA_NODE`-bind by NUMA node | Default bind by CPU core, try NUMA node binding when encountering performance issues |
 | `LK_THREADS` | Performance Parameter | - | Thread count: (total physical cores) ÷ number of GPUs | Hyper-Threading disabled: (total physical cores - 2) ÷ number of GPUs |
 | `OMP_NUM_THREADS` | Performance Parameter | - | OpenMP thread count: set to same as `LK_THREADS` |   | 
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | None | MOE expert layers resident on GPU: `0`-layer 0, `0-1`-layers 0 to 1, `0,9`-layers 0 and 9 | After reserving KV Cache VRAM, allocating multiple layers improves performance and reduces corresponding memory usage |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | None | Prefetch window size: `1`-prefetch 1 layer of MOE experts | Typically prefetch 1 to 2 layers |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Parameter | None | MOE expert layers resident on GPU: `0`-layer 0, `0-1`-layers 0 to 1, `0,9`-layers 0 and 9 | After reserving KV Cache VRAM, allocating multiple layers improves performance and reduces corresponding memory usage |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK` | GPU Parameter | None | DSpark draft model on GPU: `0-2`-layers 0 to 2| Used to accelerate speculative decoding |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | None | Prefetch window size: `1`-prefetch 1 layer of MOE experts | Typically prefetch 1 layer |
 | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | None | Minimum input length for GPU prefill: `4096`-GPU prefill starts when input length reaches this value | Should not be set too small, set to 0 to disable GPU prefill |
 | `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable | Recommended: `0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`: fast model loading, `1`: slow loading to avoid OOM | Recommendation: use `0` when memory is abundant, `1` when memory is tight |
