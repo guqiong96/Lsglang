@@ -4559,6 +4559,8 @@ def init_cublas():
     c = a @ b
     return c
 
+from typing import Optional
+
 def get_str_env_var(var_name: str, default: str = None) -> str:
     return os.getenv(var_name, default) 
 
@@ -4597,20 +4599,43 @@ def get_gpu_prefill_min_batch_size() -> int:
 def get_gpu_prefetch_window() -> int:
     return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
 
-def is_lk_moe_gpu_prefill_layer(layer_id: str) -> bool:
-    return is_lk_moe_use_gpu_prefill() and not is_lk_moe_gpu_resident_layer(layer_id)
-    
-def is_lk_moe_cpu_layer(layer_id: str)-> bool:
 
-    return is_lk_moe_feature_enabled() and not is_lk_moe_gpu_resident_layer(layer_id) and not is_lk_moe_gpu_prefill_layer(layer_id)
+def get_model_type_from_layer_name(layer_name: str) -> str:
+    if not layer_name:
+        return "main"
     
-def is_lk_moe_gpu_resident_layer(layer_id: str) -> bool:
+    if layer_name.startswith('stages.'):
+        return "dspark"
     
+    if layer_name.startswith('model.layers.'):
+        return "main"
+    
+    return "main"
+
+def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
+    if model_type == "dspark":
+        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK", None)
+        if env_value is not None:
+            return env_value
+        
+        return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+    
+    return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+
+def is_lk_moe_gpu_prefill_layer(layer_id: str, model_type: str = "main") -> bool:
+    return (is_lk_moe_use_gpu_prefill() and 
+            not is_lk_moe_gpu_resident_layer(layer_id, model_type))
+    
+def is_lk_moe_cpu_layer(layer_id: str, model_type: str = "main") -> bool:
+    return (is_lk_moe_feature_enabled() and 
+            not is_lk_moe_gpu_resident_layer(layer_id, model_type) and 
+            not is_lk_moe_gpu_prefill_layer(layer_id, model_type))
+    
+def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
     if not is_lk_moe_feature_enabled():
         return True
      
-  
-    disabled_layers_env = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+    disabled_layers_env = get_gpu_resident_env_var(model_type)
     if not disabled_layers_env:
         return False   
     

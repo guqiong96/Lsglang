@@ -106,7 +106,7 @@ logger = logging.getLogger(__name__)
 
 import threading
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, get_model_type_from_layer_name
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -425,9 +425,20 @@ class FusedMoE(torch.nn.Module):
         self.gpu_prefetch_window = get_gpu_prefetch_window()
         self.lk_moe = None
         self.lk_moe_config = None 
-        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id) 
-        self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_id)
-        self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_id) 
+        self.model_type = get_model_type_from_layer_name(self.layer_name)
+        
+        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(
+            self.layer_id, 
+            self.model_type
+        )
+        self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(
+            self.layer_id, 
+            self.model_type
+        )
+        self.is_cpu_layer = is_lk_moe_cpu_layer(
+            self.layer_id, 
+            self.model_type
+        )
    
         
       
