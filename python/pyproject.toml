@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsglang"
-version = "1.4.8"
+version = "1.4.9"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -69,7 +69,7 @@ dependencies = [
   "setproctitle",
   "sgl-deep-gemm==0.1.5.post1",
   "sglang-kernel==0.4.5",
-  "lk_moe==2.3.2",
+  "lk_moe==2.3.3",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",

@@ -211,7 +211,7 @@ python -m sglang.launch_server \
 | `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | None | Prefetch window size: `1`-prefetch 1 layer of MOE experts | Typically prefetch 1 layer |
 | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | None | Minimum input length for GPU prefill: `4096`-GPU prefill starts when input length reaches this value | Should not be set too small, set to 0 to disable GPU prefill |
 | `LK_POWER_SAVING` | CPU Power Saving | 0 | `1`: enable CPU power saving mode, `0`: disable | Recommended: `0` |
-| `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`: fast model loading, `1`: slow loading to avoid OOM | Recommendation: use `0` when memory is abundant, `1` when memory is tight |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 1 | `1`: avoid numa node OOM | Recommended: `1` for large MoE models |
 
 ## Installation Steps
 

@@ -458,6 +458,8 @@ class FusedMoE(torch.nn.Module):
             self.activation_type = 2  # relu2
             
         self.swiglu_limit = swiglu_limit
+        
+        self.use_gpu_prefill = is_lk_moe_use_gpu_prefill()
 
         self.quant_method.create_weights(
             layer=self,
@@ -1939,6 +1941,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.activation_type = self.activation_type
         if self.swiglu_limit is not None:
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
+        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
@@ -2018,6 +2021,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.activation_type = self.activation_type
         if self.swiglu_limit is not None:
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
+        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
@@ -2066,6 +2070,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.activation_type = self.activation_type
+        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
         
         # no scale
         if self.params_dtype == torch.bfloat16:
@@ -2137,6 +2142,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.activation_type = self.activation_type
         if self.swiglu_limit is not None:
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
+        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
          
         if self.params_dtype == torch.bfloat16:
             self.lk_moe = lk_moe.MOE_NVFP4(
@@ -2196,6 +2202,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.activation_type = self.activation_type
         if self.swiglu_limit is not None:
             self.lk_moe_config.swiglu_limit = self.swiglu_limit
+        self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
 
         # no global scale
         if self.params_dtype == torch.bfloat16:
