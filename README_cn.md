@@ -131,7 +131,6 @@ python -m sglang.launch_server \
 ```bash 
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=1,0 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 LVLLM_MOE_NUMA_ENABLED=1 \
@@ -169,11 +168,10 @@ python -m sglang.launch_server \
 ### GLM-5.2-NVFP4 [RTX 3090 * 2]
 ```bash 
 
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 \
-OMP_NUM_THREADS=44 \
+LK_THREADS=48 \
+OMP_NUM_THREADS=48 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 python -m sglang.launch_server \
     --model /home/guqiong/Models/GLM-5.2-NVFP4 \

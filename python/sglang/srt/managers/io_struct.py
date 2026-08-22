@@ -849,7 +849,7 @@ class GenerateReqInput:
         if i in cache:
             return cache[i]
         sub = GenerateReqInput(
-            rid=self.rid[logical_index],
+            rid=self.rid[i],
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
