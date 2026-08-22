@@ -255,8 +255,9 @@ pip install lsglang
 git clone https://github.com/guqiong96/Lsglang.git
 cd Lsglang
 pip install -U setuptools wheel scikit-build-core cmake
-pip install torchaudio triton torchvision torch==2.11.0
+pip install torchaudio triton torchvision torch==2.13.0
 pip install grpcio-tools 
+pip install wheel-stub
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release  CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 ```
 
