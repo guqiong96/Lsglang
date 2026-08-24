@@ -1627,7 +1627,14 @@ class FusedMoE(torch.nn.Module):
                 dispatch_output.topk_output.topk_weights,
                 dispatch_output.topk_output.topk_ids,
             )
-        
+
+        if (
+            not self.should_fuse_routed_scaling_factor_in_topk
+            and self.moe_runner_config.routed_scaling_factor is not None
+            and self.moe_runner_config.routed_scaling_factor != 1.0
+        ):
+            lk_result = lk_result * self.moe_runner_config.routed_scaling_factor
+
         return StandardCombineInput(hidden_states=lk_result)
 
     @classmethod
@@ -2258,7 +2265,6 @@ class FusedMoE(torch.nn.Module):
     def _initialize_cuda_graph_buffers(self): 
         if not hasattr(FusedMoE, 'cuda_graphs'):
             max_batch_size = self.max_num_seqs
-            FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, max_batch_size + 1, 8))
             
             current_device = torch.cuda.current_device()
              
@@ -2268,32 +2274,6 @@ class FusedMoE(torch.nn.Module):
                 dtype=torch.float32,
                 requires_grad=False
             ).contiguous()
-         
-    def _find_best_graph_index(self, total_tokens: int) -> int:
-        if not hasattr(FusedMoE, 'cuda_graphs') or not FusedMoE.cuda_graphs:
-            raise ValueError("No CUDA graphs initialized.")
-        
-        cuda_graphs = FusedMoE.cuda_graphs
-        
-        low, high = 0, len(cuda_graphs) - 1
-        best_index = len(cuda_graphs) - 1  
-        
-        while low <= high:
-            mid = (low + high) // 2
-            if cuda_graphs[mid] >= total_tokens:
-                best_index = mid
-                high = mid - 1
-            else:
-                low = mid + 1
-         
-        if best_index >= len(cuda_graphs):
-            best_index = len(cuda_graphs) - 1
-             
-        if cuda_graphs[best_index] < total_tokens:
-            raise ValueError(f"No suitable CUDA graph found for {total_tokens} tokens. "
-                            f"Maximum available buffer size: {cuda_graphs[-1]}")
-        
-        return best_index
     
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
         stream_ptr = torch.cuda.current_stream().cuda_stream

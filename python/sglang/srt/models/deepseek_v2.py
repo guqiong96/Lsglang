@@ -995,14 +995,11 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
-        from sglang.srt.utils.common import is_lk_moe_feature_enabled
-        server_args = get_server_args()
         if (
             not _is_cuda
             and not _is_musa
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            or (is_lk_moe_feature_enabled() and server_args.model_config.hf_config.architectures[0] == "KimiK25ForConditionalGeneration")
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1144,15 +1141,12 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
-        from sglang.srt.utils.common import is_lk_moe_feature_enabled
-        server_args = get_server_args()
         if (
             not _is_cuda
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            or (is_lk_moe_feature_enabled() and server_args.model_config.hf_config.architectures[0] == "KimiK25ForConditionalGeneration")
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
