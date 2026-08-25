@@ -718,6 +718,8 @@ class FusedMoE(torch.nn.Module):
         # w3, up_proj: Load into second logical weight of w13.
         # trtllm cutlass kernel assumes differently
         switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
+        if not self.is_gpu_resident_layer: 
+            switch_w13 = False
         if (
             (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3")
         ) and self.moe_runner_config.is_gated:
@@ -2104,6 +2106,8 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
         self.lk_moe_config.activation_type = self.activation_type
+        if self.swiglu_limit is not None:
+            self.lk_moe_config.swiglu_limit = self.swiglu_limit
         self.lk_moe_config.use_gpu_prefill = self.use_gpu_prefill
         
         # no scale
