@@ -1627,13 +1627,23 @@ class FusedMoE(torch.nn.Module):
                 dispatch_output.topk_output.topk_weights,
                 dispatch_output.topk_output.topk_ids,
             )
+            
+        fused = isinstance(
+                self.quant_method,
+                (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                    Mxfp4FlashinferCutlassMoEMethod,
+                    Mxfp4MarlinMoEMethod,
+                ),
+            )
 
         if (
             not self.should_fuse_routed_scaling_factor_in_topk
             and self.moe_runner_config.routed_scaling_factor is not None
             and self.moe_runner_config.routed_scaling_factor != 1.0
+            and not fused
         ):
-            lk_result = lk_result * self.moe_runner_config.routed_scaling_factor
+            lk_result.mul_(self.moe_runner_config.routed_scaling_factor)
 
         return StandardCombineInput(hidden_states=lk_result)
 
