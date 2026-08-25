@@ -436,7 +436,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         else:
             w2_weight_data = torch.empty(
-                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype
+                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype, device=device
             )
         w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
