@@ -4740,6 +4740,11 @@ def is_lk_moe_feature_enabled() -> bool:
 def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
  
+# Whether to keep the (very large) n-gram embedding table resident on CPU /
+# NUMA host memory and gather it via lk_moe, instead of VRAM. Defaults to the
+# original GPU-resident behavior.
+def is_lk_embedding_cpu_enabled() -> bool:
+    return get_bool_env_var("LVLLM_EMBEDDING_NUMA_ENABLED")
 
 def is_lk_moe_use_gpu_prefill() -> bool:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0

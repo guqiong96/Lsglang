@@ -150,7 +150,15 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer: 
+    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer:
+        yield module
+        return
+    # lk embedding tables (e.g. n-gram oe_embeder) stay CPU/NUMA resident;
+    # never move them to the GPU target device.
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    if isinstance(module, VocabParallelEmbedding) and getattr(
+        module, "is_lk_embedding", False
+    ):
         yield module
         return
     if target_device.type == "cpu":
