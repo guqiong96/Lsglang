@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 
@@ -54,8 +55,11 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
     # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
     # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
     # that collide with fused dense MLP names by plain substring.
-    ignored = ignored.rstrip(".")
-    prefix = prefix.rstrip(".")
+    ignored = normalize_prefix(ignored.rstrip("."))
+    prefix = normalize_prefix(prefix.rstrip("."))
+    if any(char in ignored for char in "*?["):
+        candidates = (prefix, prefix if prefix.startswith("model.") else f"model.{prefix}")
+        return any(fnmatchcase(candidate, ignored) for candidate in candidates)
     if ignored == prefix:
         return True
     if prefix.startswith(ignored + "."):
