@@ -702,13 +702,12 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 def resolve_auto_parsers(server_args) -> None:
     """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, before anything publishes ``server_args``.
+    chat template, in place, before anything publishes ``server_args``.
 
-    Performs a lightweight tokenizer load, so it runs once in engine init. The
-    decision goes to this instance's declaration stash, so every holder of it
-    carries it -- the schedulers it forks, the HTTP server, the tokenizer
-    workers it is serialized for -- and each publishes bags projected from it.
-    The fields stay what the operator passed.
+    Performs a lightweight tokenizer load, so it runs once in engine init. In
+    place because everyone who holds this instance must see the resolved value:
+    the schedulers it forks, the HTTP server, and the tokenizer workers it is
+    serialized for.
     """
     cfg = resolving_view(server_args)
     needs = tuple(
