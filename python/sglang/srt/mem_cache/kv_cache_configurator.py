@@ -1421,7 +1421,7 @@ class KVCacheConfigurator:
         return SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=swa_max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             head_num=0,
             head_dim=0,
@@ -1610,7 +1610,6 @@ class KVCacheConfigurator:
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        server_args=self.server_args,
                     ),
                     index_kpool=dsa_index_kpool,
                     index_kpool_compress=get_dsa_index_kpool_compress(
