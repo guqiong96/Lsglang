@@ -4474,6 +4474,25 @@ class MLATokenToKVPool(KVCache):
                 fp8_dtype,
             )
         elif self.dsa_kv_cache_store_fp8:
+            # FlashInfer's SM120 sparse MLA cubin expects the packed DeepSeek
+            # layout: 512 FP8 NoPE bytes, four FP32 scales, and a 64-wide BF16
+            # RoPE tail.  GLM-5.3 has no RoPE, so materialize a zero tail when
+            # the configured packed cache reserves it.  The zero block is
+            # mathematically inert in QK dot products.
+            if cache_k_rope is None or cache_k_rope.numel() == 0:
+                scale_bytes = self.kv_lora_rank // self.quant_block_size * 4
+                rope_bytes = self.kv_cache_dim - self.kv_lora_rank - scale_bytes
+                assert rope_bytes >= 0
+                assert rope_bytes % self.rope_storage_dtype.itemsize == 0
+                storage_rope_head_dim = (
+                    rope_bytes // self.rope_storage_dtype.itemsize
+                )
+                if storage_rope_head_dim:
+                    cache_k_rope = cache_k_nope.new_zeros(
+                        (*cache_k_nope.shape[:-1], storage_rope_head_dim),
+                        dtype=self.rope_storage_dtype,
+                    )
+
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes

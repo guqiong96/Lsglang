@@ -3,6 +3,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.models.deepseek_nextn import (
+    _should_clear_modelopt_fp4_nextn_quant_config,
+)
 from sglang.srt.models.glm5_next_nextn import (
     Glm5NextForConditionalGenerationNextN,
 )
@@ -20,6 +23,24 @@ class _FakeParam:
 
 
 class TestGlm5NextNextNWeightLoading(unittest.TestCase):
+    def test_keeps_modelopt_fp4_for_glm5_nextn(self):
+        quant_config = SimpleNamespace(get_name=lambda: "modelopt_fp4")
+        glm_config = SimpleNamespace(
+            architectures=["Glm5NextForConditionalGenerationNextN"]
+        )
+        deepseek_config = SimpleNamespace(
+            architectures=["DeepseekV3ForCausalLMNextN"]
+        )
+
+        self.assertFalse(
+            _should_clear_modelopt_fp4_nextn_quant_config(glm_config, quant_config)
+        )
+        self.assertTrue(
+            _should_clear_modelopt_fp4_nextn_quant_config(
+                deepseek_config, quant_config
+            )
+        )
+
     def test_checkpoint_qkv_sources_load_fused_projection(self):
         fused_param = _FakeParam()
         model = SimpleNamespace(

@@ -28,6 +28,8 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):
@@ -710,13 +712,42 @@ def flashinfer_sparse_mla_forward(
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
 ) -> torch.Tensor:
     """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
-    topk = indices.shape[1]
+    topk_capacity = sparse_mla_top_k
+    kernel_qk_rope_head_dim = qk_rope_head_dim
+    empty_rows = None
+    sparse_mla_top_k_lens = None
+    if qk_rope_head_dim == 0:
+        from sglang.kernels.ops.attention.dsa.transform_index import (
+            prepare_trtllm_nope_sparse_metadata,
+        )
+
+        sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(indices)
+        # The SM120 kernel inventory has only the DeepSeek 576-wide query /
+        # 64-wide RoPE geometry.  Appending zeros presents that geometry while
+        # preserving GLM-5.3's native NoPE math.
+        q = torch.nn.functional.pad(q, (0, 64))
+        kernel_qk_rope_head_dim = 64
+
+        # index_kpool may reserve overflow columns for an in-progress tail.
+        # The compiled kernel accepts exactly index_topk columns.  KPool now
+        # compacts the tail inside this capacity; keep this guard for old or
+        # graph-captured buffers.
+        if indices.shape[1] > topk_capacity:
+            indices = indices[:, :topk_capacity].contiguous()
+            sparse_mla_top_k_lens = sparse_mla_top_k_lens.clamp(max=topk_capacity)
+
+        empty_rows = sparse_mla_top_k_lens == 0
+        indices[:, 0] = indices[:, 0].masked_fill(empty_rows, 0)
+        seq_lens = sparse_mla_top_k_lens.clamp(min=1)
+
+    topk_capacity = min(topk_capacity, indices.shape[1])
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),
         kv_cache=kv_cache.view(torch.uint8)
@@ -725,14 +756,23 @@ def flashinfer_sparse_mla_forward(
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
+        qk_rope_head_dim=kernel_qk_rope_head_dim,
         block_tables=indices.unsqueeze(1),
         seq_lens=seq_lens,
-        max_seq_len=topk,
-        sparse_mla_top_k=topk,
+        max_seq_len=topk_capacity,
+        sparse_mla_top_k=topk_capacity,
+        # Once the NoPE tensors are padded to the DeepSeek RoPE64 geometry,
+        # FlashInfer selects the compiled RoPE64 kernel.  Its active lengths
+        # are carried by seq_lens; the native-NoPE-only metadata argument must
+        # stay unset or the public wrapper rejects the call before dispatch.
+        sparse_mla_top_k_lens=None,
         bmm1_scale=float(sm_scale),
         bmm2_scale=1.0,
         kv_scale_format="arbitrary_fp32",
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        enable_pdl=False,
     )
-    return result.squeeze(1)
+    result = result.squeeze(1)
+    if empty_rows is not None:
+        result.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+    return result

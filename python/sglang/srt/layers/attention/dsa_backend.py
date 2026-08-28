@@ -877,12 +877,12 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashInfer sparse MLA DSA {phase} "
             "backend."
         )
 
@@ -4002,6 +4002,7 @@ class DeepseekSparseAttnBackend(
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
+            sparse_mla_top_k=self.dsa_index_topk,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
