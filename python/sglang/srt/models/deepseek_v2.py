@@ -203,7 +203,6 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
-    get_server_args,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

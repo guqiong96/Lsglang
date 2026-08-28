@@ -192,20 +192,11 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
-        # lk embedding tables (e.g. the huge n-gram oe_embeder) are kept
-        # resident on CPU / NUMA host memory and gathered via lk_moe, so
-        # allocate them on CPU instead of the (GPU) target_device context.
-        if getattr(layer, "is_lk_embedding", False):
-            device = "cpu"
-            layer.is_gpu_resident_layer = False
-        else:
-            device = None
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
-                device=device,
             ),
             requires_grad=False,
         )
@@ -221,30 +212,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
-    def _embedding_lk(
-        self, layer: torch.nn.Module, input_: torch.Tensor
-    ) -> torch.Tensor:
-        """Gather via lk_moe LKEmbedding (CPU-resident table, graph-capturable).
-        ``input_`` holds GPU token ids masked to the local shard. Output goes to
-        a pre-allocated fixed GPU buffer so the decode CUDA graph can capture
-        the D2H / host-function / H2D sequence.
-        """
-        input_c = input_.contiguous()
-        qlen = input_c.numel()
-        layer.lk_embeder.decode(
-            torch.cuda.current_stream().cuda_stream,
-            qlen,
-            input_c.data_ptr(),
-            layer.lk_output_gpu.data_ptr(),
-        )
-        # input_ is [n_grams, seq_len] (2D); restore the same leading shape.
-        return layer.lk_output_gpu[:qlen].view(*input_.shape, -1)
-
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        if getattr(layer, "is_lk_embedding", False) and getattr(
-            layer, "lk_embeder", None
-        ) is not None:
-            return self._embedding_lk(layer, input_)
         return F.embedding(input_, layer.weight)
 
 
