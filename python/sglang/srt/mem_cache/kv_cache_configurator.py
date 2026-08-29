@@ -2293,6 +2293,21 @@ def calculate_mla_kv_cache_dim(
 
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
+    # FlashInfer's SM120 sparse MLA kernel is compiled for the DeepSeek packed
+    # geometry, which always reserves a 64-wide BF16 RoPE tail.  GLM-5.3 is a
+    # native NoPE model, so reserve the same inert tail in storage and write
+    # zeros into it.  This keeps the existing high-performance kernel usable
+    # without changing GLM's attention scores.
+    uses_flashinfer_sparse_mla = (
+        get_exec().kernel.dsa_prefill_backend == "flashinfer_sparse_mla"
+        or get_exec().kernel.dsa_decode_backend == "flashinfer_sparse_mla"
+    )
+    storage_rope_head_dim = (
+        64
+        if uses_flashinfer_sparse_mla and qk_rope_head_dim == 0
+        else qk_rope_head_dim
+    )
+
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
@@ -2305,7 +2320,7 @@ def calculate_mla_kv_cache_dim(
         return (
             kv_lora_rank
             + kv_lora_rank // quant_block_size * 4
-            + qk_rope_head_dim * rope_storage_dtype.itemsize
+            + storage_rope_head_dim * rope_storage_dtype.itemsize
         )
 
     return kv_cache_dim

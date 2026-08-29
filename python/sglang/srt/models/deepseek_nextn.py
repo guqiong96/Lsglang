@@ -98,6 +98,17 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+def _should_clear_modelopt_fp4_nextn_quant_config(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Keep GLM-5 NextN on its checkpoint-declared ModelOpt NVFP4 path."""
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return False
+    architectures = getattr(config, "architectures", None) or []
+    return "Glm5NextForConditionalGenerationNextN" not in architectures
+
+
 class DeepseekModelNextN(nn.Module):
 
     def __init__(
@@ -116,7 +127,7 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if _should_clear_modelopt_fp4_nextn_quant_config(config, quant_config):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )

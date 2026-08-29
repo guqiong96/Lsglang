@@ -438,9 +438,16 @@ def append_kpool_tail_to_topk(
         return topk_result
 
     rows, n_cols = topk_result.shape
-    out_cols = n_cols + tail_pool
-    out = torch.empty(
-        (rows, out_cols), dtype=topk_result.dtype, device=topk_result.device
+    # Keep the expanded history and the in-progress tail inside the model's
+    # fixed index_topk capacity.  For GLM (topk=2048, kpool=4), retain 2044
+    # history slots, append up to three tail tokens, and leave one -1 sentinel.
+    out_cols = n_cols
+    history_capacity = ((out_cols - tail_pool) // pool_size) * pool_size
+    out = torch.full(
+        (rows, out_cols),
+        -1,
+        dtype=topk_result.dtype,
+        device=topk_result.device,
     )
 
     if page_table is None:
@@ -478,6 +485,7 @@ def append_kpool_tail_to_topk(
         out.stride(1),
         N_COLS=n_cols,
         OUT_COLS=out_cols,
+        HISTORY_CAPACITY=history_capacity,
         PAGE_TABLE_COLS=page_table_cols,
         POOL_SIZE=pool_size,
         HAS_PAGE_TABLE=has_page_table,
@@ -503,6 +511,7 @@ def _append_kpool_tail_to_topk_kernel(
     out_stride_1,
     N_COLS: tl.constexpr,
     OUT_COLS: tl.constexpr,
+    HISTORY_CAPACITY: tl.constexpr,
     PAGE_TABLE_COLS: tl.constexpr,
     POOL_SIZE: tl.constexpr,
     HAS_PAGE_TABLE: tl.constexpr,
@@ -516,7 +525,7 @@ def _append_kpool_tail_to_topk_kernel(
     seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
     pool_len = tl.load(pool_lens_ptr + row).to(tl.int32)
     tail_start = pool_len * POOL_SIZE
-    history_len = tl.minimum(tail_start, N_COLS)
+    history_len = tl.minimum(tail_start, HISTORY_CAPACITY)
     tail_count = seq_len % POOL_SIZE
 
     is_history = cols < history_len

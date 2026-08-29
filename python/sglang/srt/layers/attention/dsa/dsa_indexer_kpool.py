@@ -1176,8 +1176,9 @@ class IndexerKPool(MultiPlatformOp):
         page_size = get_token_to_kv_pool().page_size
         token_nums = q_fp8.shape[0]
         tail_pool = pool_size - 1
-        topk_result = torch.empty(
-            (token_nums, self.index_topk + tail_pool),
+        topk_result = torch.full(
+            (token_nums, self.index_topk),
+            -1,
             device=q_fp8.device,
             dtype=torch.int32,
         )
