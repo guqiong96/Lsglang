@@ -32,6 +32,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     cp_zigzag_full_plan_rows,
     dsa_use_prefill_cp,
+    get_paged_mqa_logits_metadata,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
 )
@@ -164,6 +165,61 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @staticmethod
+    def _fp8_mqa_logits(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+        *,
+        clean_logits: bool,
+    ) -> torch.Tensor:
+        """Non-paged FP8 MQA logits, portable across CUDA SM8x and DeepGEMM.
+
+        ``deep_gemm.fp8_mqa_logits`` only ships SM90/SM100/SM120 cubins, so on
+        SM80/SM86/SM89 we use a portable Triton kernel with identical math.
+        """
+        if is_hip():
+            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits as aiter_fn
+
+            return aiter_fn(
+                q_fp8,
+                k_fp8,
+                k_scale,
+                weights,
+                starts,
+                ends,
+                clean_logits=clean_logits,
+            )
+
+        if is_cuda():
+            arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
+            if arch_major < 9:
+                from sglang.kernels.ops.attention.dsa.triton_fp8_mqa_logits import (
+                    triton_fp8_mqa_logits,
+                )
+
+                return triton_fp8_mqa_logits(
+                    q_fp8,
+                    k_fp8,
+                    k_scale,
+                    weights,
+                    starts,
+                    ends,
+                    clean_logits=clean_logits,
+                )
+
+        return deep_gemm.fp8_mqa_logits(
+            q_fp8,
+            (k_fp8, k_scale),
+            weights,
+            starts,
+            ends,
+            clean_logits=clean_logits,
+        )
 
     @staticmethod
     def _cp_gather_concat(
@@ -756,7 +812,7 @@ class IndexerKPool(MultiPlatformOp):
             ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
-                pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                pool_schedule_metadata = get_paged_mqa_logits_metadata(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
                 )
             return (
@@ -791,7 +847,7 @@ class IndexerKPool(MultiPlatformOp):
 
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
-            pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            pool_schedule_metadata = get_paged_mqa_logits_metadata(
                 pool_context_lens.clamp(min=1), blocksize, self.sm_count
             )
 
@@ -832,6 +888,14 @@ class IndexerKPool(MultiPlatformOp):
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
         num_heads = q_fp8.shape[2]
+        # SM90 (Hopper) preferred when head count is not a DeepGEMM-supported
+        # variant; SM8x (Ampere/Ada) has no DeepGEMM cubins at all, so the
+        # portable TileLang kernel is the default there. Honors
+        # SGLANG_OPT_USE_TILELANG_INDEXER to force TileLang on any SM.
+        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            return True
+        if arch_major == 8:
+            return True
         return arch_major == 9 and num_heads not in (32, 64)
 
     def _get_topk_paged(
@@ -892,20 +956,40 @@ class IndexerKPool(MultiPlatformOp):
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_tilelang_paged_mqa:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits,
-            )
+            if not is_cuda() or torch.cuda.get_device_capability(q_fp8.device)[0] < 9:
+                # TileLang's fp8 paged MQA codegen needs the SM89 F32 MMA (not
+                # enabled in this build); use the portable Triton kernel on
+                # SM8x/Ampere-Ada. It reads the same page-granular uint8 buffer
+                # laid out by index_buf_accessor.
+                from sglang.kernels.ops.attention.dsa.triton_fp8_mqa_logits import (
+                    triton_fp8_paged_mqa_logits,
+                )
 
-            logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                pool_seqlens,
-                pool_block_tables,
-                pool_schedule_metadata,
-                pool_max_seq_len,
-                clean_logits=False,
-            )
+                logits = triton_fp8_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    pool_seqlens,
+                    pool_block_tables,
+                    pool_schedule_metadata,
+                    pool_max_seq_len,
+                    clean_logits=False,
+                )
+            else:
+                from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits,
+                )
+
+                logits = tilelang_fp8_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    pool_seqlens,
+                    pool_block_tables,
+                    pool_schedule_metadata,
+                    pool_max_seq_len,
+                    clean_logits=False,
+                )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8,
@@ -1001,9 +1085,10 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
                 weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
@@ -1115,9 +1200,10 @@ class IndexerKPool(MultiPlatformOp):
             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
                 torch.int32
             )
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._fp8_mqa_logits(
                 q_work,
-                (k_fp8.contiguous(), k_scale.contiguous()),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
                 weights_work,
                 ks,
                 ke,
@@ -1350,9 +1436,10 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
+                local_logits = self._fp8_mqa_logits(
                     q_fp8[q_slice].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
                     weights[q_slice].contiguous(),
                     row_starts,
                     local_pool_lens,

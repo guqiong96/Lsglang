@@ -1394,7 +1394,52 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        cap = torch.cuda.get_device_capability()
+        is_sm8 = cap[0] == 8
+        if is_sm8:
+            # Ampere (SM80/86/89) caps per-block dynamic shared memory at
+            # 101376 B.  The GLM DSA MLA decode is a full (non-lora-absorbed)
+            # query with dim = v_head_dim = kv_lora_rank = 512, so the default
+            # block_I=64 needs 196608 B (num_stages=2) / 131072 B
+            # (num_stages=1) > 101376 B.  Shrink block_I to 32 with threads=128
+            # so the kernel fits: 2*32*512*2 + 2*32*32*2 + 2*32*512*2 =
+            # 100352 B <= 101376 B, while keeping 4 warps for good throughput
+            # (~296 us vs ~541 us for block_I=16/threads=64, ~1.8x faster, and
+            # it fits the shared-memory budget with ~1 KB to spare; it launches
+            # cleanly on SM86).  Smaller block_I (<32) either trips the
+            # tilelang "Layout infer conflict between m_i and alpha" (at >=128
+            # threads) or wastes parallelism ("warp_row_tiles must be greater
+            # than 16").  SM90+ keeps the tuned config.
+            if tail_dim == 0:
+                kernel = kernel_factory(
+                    num_heads,
+                    d_v,
+                    tail_dim,
+                    topk,
+                    sm_scale=sm_scale,
+                    block_I=32,
+                    num_stages=1,
+                    threads=128,
+                )
+            else:
+                kernel = kernel_factory(
+                    num_heads,
+                    d_v,
+                    tail_dim,
+                    topk,
+                    sm_scale=sm_scale,
+                    block_I=32,
+                )
+        else:
+            kernel = kernel_factory(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=64,
+                num_stages=2,
+            )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
@@ -1525,7 +1570,9 @@ def tilelang_fp8_paged_mqa_logits(
         split_kv=split_kv,
     )
     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
-    kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    kvcache_u8 = kvcache_fp8.contiguous().view(torch.uint8).view(
+        -1, block_size * (head_dim + 4)
+    )
     kernel(q_fp8, kvcache_u8, weight, seq_lens, page_table, logits)
     return logits
 

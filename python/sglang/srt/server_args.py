@@ -5979,6 +5979,29 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
+        elif model_arch in [
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
+        ]:
+            # GLM-5.3-Flash (index_kpool=4 + NoPE) on Ampere/Ada (SM8x): the
+            # sm120-only `flashinfer_sparse_mla` backend and the DeepGEMM-backed
+            # `flashmla_*` paths are unavailable here, so the DSA backend
+            # resolution routes prefill+decode to TileLang. Set the supporting
+            # env vars: TileLang indexer paged MQA, TileLang MHC (instead of
+            # DeepGEMM), a bf16-compatible non-paged MQA fallback, and turn off
+            # DeepGEMM-only features. This block is deliberately gated to SM8x
+            # so it never alters the working sm120 / sm90 paths.
+            import torch
+
+            _glm5_major, _ = torch.cuda.get_device_capability()
+            if _glm5_major == 8 and not is_hip() and not is_npu() and not is_xpu():
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).

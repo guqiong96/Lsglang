@@ -9,6 +9,72 @@ INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+@triton.jit
+def _f32_to_e4m3_uint8(x):
+    """Encode f32 -> ``e4m3fn`` (1-4-3, exp bias 7, max 448, no inf) raw uint8
+    bits, for Ampere (SM80/SM86/SM89) where Triton cannot materialize the
+    ``fp8e4nv`` type in a kernel. Inverse of ``_fp8_e4m3_to_f16`` in
+    ``triton_fp8_mqa_logits.py``. Round-to-nearest-even (RNE); saturates
+    |x| > 448, NaN/Inf -> +/-448.
+
+    NOTE: the upstream vLLM reference (``fp8_utils._f32_to_e4m3_uint8``) derives
+    the exponent via ``tl.log2``, which on our Triton rounds ``log2(v)`` up to
+    the next integer for values just below a power of two (e.g. ``log2(127.99)``
+    -> 7.0), wrongly routing them through the subnormal path and encoding to a
+    tiny value. That is a real bug for activation quantization. This version
+    derives the exponent exactly from the fp32 bit pattern (no ``tl.log2``), so
+    it is correct at every power-of-two boundary.
+    """
+    x = x.to(tl.float32)
+    sign = tl.where(x < 0, 1, 0).to(tl.int32)
+    a = tl.abs(x)
+    a = tl.where(a != a, 0.0, a)  # NaN -> 0 magnitude
+    a = tl.minimum(a, 448.0)
+    is_zero = a == 0.0
+    a_safe = tl.where(is_zero, 1.0, a)
+    bits = a_safe.to(tl.int32, bitcast=True)
+    exp8 = (bits >> 23) & 0xFF
+    man = bits & 0x7FFFFF
+
+    # ---- fp8 normal output (a >= 2^-6): exact via fp32 bit manipulation ----
+    # value = 2^(exp8-127) * (1 + man/2^23).  e4m3 keeps 4 mantissa bits
+    # (1 implicit + 3), so RNE-round the 24-bit mantissa to a multiple of 2^20.
+    man24 = (1 << 23) | man  # in [2^23, 2^24)
+    low20 = man24 & 0xFFFFF
+    r = man24 + (1 << 19)  # add half ulp (2^19)
+    is_tie = low20 == (1 << 19)
+    bit20 = (man24 >> 20) & 1  # LSB of the kept 4-bit mantissa
+    r = tl.where(is_tie & (bit20 == 0), r - 1, r)  # ties-to-even
+    e4 = exp8 - 120  # e4m3 biased exponent
+    m4 = (r >> 20) - 8  # strip implicit leading 1
+    carry = r >= (1 << 24)
+    m4 = tl.where(carry, 0, m4)
+    e4 = e4 + carry
+    e4 = tl.minimum(e4, 15)  # overflow -> max (a<=448 so e4<=15 normally)
+    byte_n = (sign << 7) | (e4 << 3) | m4
+
+    # ---- fp8 subnormal output (a < 2^-6): value = m * 2^-9, m in [0,7] ----
+    # m = RNE(a * 512).  a*512 in [0, 8); RNE via round-half-to-even.
+    t = a * 512.0
+    ti = tl.floor(t)
+    frac = t - ti
+    rne = ti + tl.where(
+        frac > 0.5,
+        1.0,
+        tl.where(frac == 0.5, tl.where((ti.to(tl.int32) & 1) == 1, 1.0, 0.0), 0.0),
+    )
+    m_s = rne.to(tl.int32)  # in [0, 8]
+    is_promote = m_s >= 8  # rounds up to min normal 2^-6
+    m_s2 = tl.where(is_promote, 0, m_s)
+    byte_s = tl.where(
+        is_promote, (sign << 7) | (1 << 3), (sign << 7) | m_s2
+    )
+
+    byte = tl.where(a >= 0.015625, byte_n, byte_s)  # 2^-6 boundary
+    byte = tl.where(is_zero, (sign << 7), byte)  # +0 -> 0x00, -0 -> 0x80
+    return byte.to(tl.uint8)
+
+
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
     """Return the most pools an N-token write can close at any start offset."""
     return (num_draft_tokens + pool_size - 1) // pool_size
@@ -722,29 +788,28 @@ def kpool_softmax_rotate_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     if return_compressed:
-        compressed_k = torch.empty(
+        compressed_k_u8 = torch.empty(
             (slot_k.shape[0], slot_k.shape[2]),
-            dtype=torch.float8_e4m3fn,
+            dtype=torch.uint8,
             device=slot_k.device,
         )
         compressed_scale = torch.empty(
             (slot_k.shape[0],), dtype=torch.float32, device=slot_k.device
         )
     else:
-        compressed_k = buf_fp8
+        compressed_k_u8 = buf
         compressed_scale = buf_fp32
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
-        buf_fp8,
+        buf,
         buf_fp32,
         slot_k,
         slot_score,
         ape,
         loc,
         write_mask,
-        compressed_k,
+        compressed_k_u8,
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -763,7 +828,7 @@ def kpool_softmax_rotate_write_cache(
         BLOCK_D=triton.next_power_of_2(slot_k.shape[2]),
     )
     if return_compressed:
-        return compressed_k, compressed_scale
+        return compressed_k_u8.view(torch.float8_e4m3fn), compressed_scale
     return None
 
 
@@ -819,10 +884,9 @@ def kpool_decode_update_and_maybe_write_cache(
     assert block_tables.ndim == 2
     assert block_tables.shape[0] >= batch
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         tail_k,
         tail_score,
@@ -881,7 +945,7 @@ def _hadamard128(x):
 
 @triton.jit
 def _kpool_softmax_rotate_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     slot_k_ptr,
     slot_score_ptr,
@@ -986,12 +1050,12 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_uint8(quantized), mask=mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            _f32_to_e4m3_uint8(quantized),
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -999,7 +1063,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
 
 @triton.jit
 def _kpool_decode_update_and_maybe_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     tail_k_ptr,
     tail_score_ptr,
@@ -1151,7 +1215,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+        tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_uint8(quantized), mask=dim_mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale)
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
@@ -1181,7 +1245,7 @@ def _hadamard_quantize_fp8(acc, denom, ROUND_SCALE: tl.constexpr):
 
 @triton.jit
 def _kpool_assemble_softmax_rotate_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     chunk_k_ptr,
     chunk_score_ptr,
@@ -1259,7 +1323,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+    tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_uint8(quantized), mask=mask)
     tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1295,12 +1359,11 @@ def kpool_assemble_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     slots_per_page = pool.slots_per_page
 
     _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         chunk_k,
         chunk_score,
@@ -1549,7 +1612,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     write_loc_ptr,
     out_cache_loc_ptr,
     effective_n_ptr,
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_fp32_ptr,
     key_stride_0,
     score_stride_0,
@@ -1639,7 +1702,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(buf_u8_ptr + out_k_offsets, _f32_to_e4m3_uint8(quantized), mask=dim_mask)
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1693,7 +1756,6 @@ def kpool_write_tail_and_maybe_compress(
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
     slots_per_page = pool.slots_per_page
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
         key,
@@ -1707,7 +1769,7 @@ def kpool_write_tail_and_maybe_compress(
         write_loc,
         out_cache_loc,
         effective_n_per_batch,
-        buf_fp8,
+        buf,
         buf_fp32,
         key.stride(0),
         score.stride(0),

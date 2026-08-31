@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    get_paged_mqa_logits_metadata,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     is_graph_dsa_split_op_surface,
@@ -881,7 +882,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -926,7 +927,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
-                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                chunk_schedule_metadata = get_paged_mqa_logits_metadata(
                     chunk_context_lens, blocksize, self.sm_count
                 )
                 logits_chunks.append(
@@ -971,7 +972,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                get_paged_mqa_logits_metadata_fn=get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(

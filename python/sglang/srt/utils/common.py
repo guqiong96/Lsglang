@@ -4841,7 +4841,7 @@ def get_model_type_from_layer_name(layer_name: str) -> str:
 
 def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
     if model_type == "dspark":
-        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK", None)
+        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_SPEC ", None)
         if env_value is not None:
             return env_value
         

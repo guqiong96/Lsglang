@@ -74,6 +74,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
+    get_paged_mqa_logits_metadata,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
@@ -946,7 +947,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        new_schedule = get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
         if metadata.paged_mqa_schedule_metadata is None:
@@ -1684,7 +1685,7 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            paged_mqa_schedule_metadata = get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
@@ -2039,7 +2040,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            paged_mqa_schedule_metadata = get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
@@ -2604,7 +2605,7 @@ class DeepseekSparseAttnBackend(
         num_sms = deep_gemm.get_num_sms()
         if dg_in_graph:
             metadata.paged_mqa_schedule_metadata.copy_(
-                deep_gemm.get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
+                get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
             )
         if ctx_lens_copy_src is not None:
             metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_copy_src)
@@ -2680,7 +2681,7 @@ class DeepseekSparseAttnBackend(
             _update_kpool_write_plan_kernel).
         """
         schedule_dst = metadata.paged_mqa_schedule_metadata
-        dg_get = deep_gemm.get_paged_mqa_logits_metadata
+        dg_get = get_paged_mqa_logits_metadata
         pool_size = self.dsa_index_kpool
         slots_per_page = self._kpool_slots_per_page()
         kpool_plan = metadata.kpool_write_plan if pool_size > 1 else None

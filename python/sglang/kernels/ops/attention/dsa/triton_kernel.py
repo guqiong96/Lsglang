@@ -5,11 +5,77 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _f32_to_e4m3_uint8(x):
+    """Encode f32 -> ``e4m3fn`` (1-4-3, exp bias 7, max 448, no inf) raw uint8
+    bits, for Ampere (SM80/SM86/SM89) where Triton cannot materialize the
+    ``fp8e4nv`` type in a kernel. Round-to-nearest-even (RNE), saturates
+    |x| > 448, NaN/Inf -> +/-448.
+
+    NOTE: the upstream vLLM reference (``fp8_utils._f32_to_e4m3_uint8``) derives
+    the exponent via ``tl.log2``, which on our Triton rounds ``log2(v)`` up to
+    the next integer for values just below a power of two (e.g. ``log2(127.99)``
+    -> 7.0), wrongly routing them through the subnormal path and encoding to a
+    tiny value (127.99 -> ~0.0156 instead of ~128). That is a real bug for
+    activation quantization (activations routinely reach ~128). This version
+    derives the exponent exactly from the fp32 bit pattern (no ``tl.log2``), so
+    it is correct at every power-of-two boundary.
+    """
+    x = x.to(tl.float32)
+    sign = tl.where(x < 0, 1, 0).to(tl.int32)
+    a = tl.abs(x)
+    a = tl.where(a != a, 0.0, a)  # NaN -> 0 magnitude
+    a = tl.minimum(a, 448.0)
+    is_zero = a == 0.0
+    a_safe = tl.where(is_zero, 1.0, a)
+    bits = a_safe.to(tl.int32, bitcast=True)
+    exp8 = (bits >> 23) & 0xFF
+    man = bits & 0x7FFFFF
+
+    # ---- fp8 normal output (a >= 2^-6): exact via fp32 bit manipulation ----
+    # value = 2^(exp8-127) * (1 + man/2^23).  e4m3 keeps 4 mantissa bits
+    # (1 implicit + 3), so RNE-round the 24-bit mantissa to a multiple of 2^20.
+    man24 = (1 << 23) | man  # in [2^23, 2^24)
+    low20 = man24 & 0xFFFFF
+    r = man24 + (1 << 19)  # add half ulp (2^19)
+    is_tie = low20 == (1 << 19)
+    bit20 = (man24 >> 20) & 1  # LSB of the kept 4-bit mantissa
+    r = tl.where(is_tie & (bit20 == 0), r - 1, r)  # ties-to-even
+    e4 = exp8 - 120  # e4m3 biased exponent
+    m4 = (r >> 20) - 8  # strip implicit leading 1
+    carry = r >= (1 << 24)
+    m4 = tl.where(carry, 0, m4)
+    e4 = e4 + carry
+    e4 = tl.minimum(e4, 15)  # overflow -> max (a<=448 so e4<=15 normally)
+    byte_n = (sign << 7) | (e4 << 3) | m4
+
+    # ---- fp8 subnormal output (a < 2^-6): value = m * 2^-9, m in [0,7] ----
+    # m = RNE(a * 512).  a*512 in [0, 8); RNE via round-half-to-even.
+    t = a * 512.0
+    ti = tl.floor(t)
+    frac = t - ti
+    rne = ti + tl.where(
+        frac > 0.5,
+        1.0,
+        tl.where(frac == 0.5, tl.where((ti.to(tl.int32) & 1) == 1, 1.0, 0.0), 0.0),
+    )
+    m_s = rne.to(tl.int32)  # in [0, 8]
+    is_promote = m_s >= 8  # rounds up to min normal 2^-6
+    m_s2 = tl.where(is_promote, 0, m_s)
+    byte_s = tl.where(
+        is_promote, (sign << 7) | (1 << 3), (sign << 7) | m_s2
+    )
+
+    byte = tl.where(a >= 0.015625, byte_n, byte_s)  # 2^-6 boundary
+    byte = tl.where(is_zero, (sign << 7), byte)  # +0 -> 0x00, -0 -> 0x80
+    return byte.to(tl.uint8)
+
+
 # Triton implementation
 @triton.jit
 def _act_quant_kernel(
     X_ptr,
-    Y_ptr,
+    Y_u8_ptr,
     S_ptr,
     M,
     N,
@@ -73,8 +139,8 @@ def _act_quant_kernel(
     y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
 
     # Store quantized output
-    y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
-    tl.store(y_ptrs, y, mask=mask)
+    y_ptrs = Y_u8_ptr + rows[:, None] * N + cols[None, :]
+    tl.store(y_ptrs, _f32_to_e4m3_uint8(y), mask=mask)
 
     # Store scales
     s_cols = pid_n
@@ -108,8 +174,9 @@ def act_quant(
     x_flat = x.view(-1, N)
     M = x_flat.size(0)
 
-    # Allocate output tensors
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    # Allocate output tensors (fp8 produced as raw uint8 bytes for sm8x, where
+    # Triton cannot represent the fp8e4nv type; returned as an fp8 view below).
+    y = torch.empty_like(x, dtype=torch.uint8)
     y_flat = y.view(-1, N)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     s_flat = s.view(-1, N // block_size)
@@ -133,7 +200,7 @@ def act_quant(
         num_stages=0 if round_scale else 2,
     )
 
-    return y, s
+    return y.view(torch.float8_e4m3fn), s
 
 
 @triton.jit

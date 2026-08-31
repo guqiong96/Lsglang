@@ -727,3 +727,33 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
+
+
+@lru_cache(maxsize=1)
+def _deep_gemm_supports_sm8() -> bool:
+    """Whether deep_gemm's paged MQA metadata/logits kernels can run on this arch.
+
+    deep_gemm ships precompiled cubins only for newer architectures (sm90+); on
+    sm80/sm86/sm89 the native ``deep_gemm.get_paged_mqa_logits_metadata`` raises
+    "Unsupported architecture". For those we fall back to the portable JIT CUDA
+    implementation used by the DSV4 path.
+    """
+    if not is_cuda():
+        return False
+    major = torch.cuda.get_device_capability()[0]
+    return major >= 9
+
+
+def get_paged_mqa_logits_metadata(
+    seqlens_32_2d: torch.Tensor,
+    blocksize: int,
+    num_sm: int,
+) -> torch.Tensor:
+    """deep_gemm.get_paged_mqa_logits_metadata with an sm8-compatible fallback."""
+    if _deep_gemm_supports_sm8():
+        from deep_gemm import get_paged_mqa_logits_metadata as _dg
+
+        return _dg(seqlens_32_2d, blocksize, num_sm)
+    from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata as _jit
+
+    return _jit(seqlens_32_2d, blocksize, num_sm)

@@ -624,6 +624,22 @@ class C4IndexerBackendMixin:
         )
         k_fp8 = k_u8.view(FP8_DTYPE)
         k_scale = scale_u8.view(torch.float32).squeeze(-1)
+        if not is_hip() and torch.cuda.get_device_capability()[0] < 9:
+            # deep_gemm.fp8_mqa_logits has no SM8x cubins; use the portable
+            # Triton replacement with identical math.
+            from sglang.kernels.ops.attention.dsa.triton_fp8_mqa_logits import (
+                triton_fp8_mqa_logits,
+            )
+
+            return triton_fp8_mqa_logits(
+                q_indexer[: plan.query_rows],
+                k_fp8,
+                k_scale,
+                weights[: plan.query_rows],
+                plan.ks,
+                plan.ke,
+                clean_logits=False,
+            )
         return deep_gemm.fp8_mqa_logits(
             q_indexer[: plan.query_rows],
             (k_fp8, k_scale),
