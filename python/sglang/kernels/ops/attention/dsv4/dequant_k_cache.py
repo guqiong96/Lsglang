@@ -21,6 +21,26 @@ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 
+@triton.jit
+def _e4m3_uint8_to_f32(u):
+    """Decode an ``e4m3fn`` byte (1-4-3, exp bias 7) to f32 without ever
+    materializing Triton's ``fp8e4nv`` type, which Ampere (SM80/SM86) cannot
+    represent. ``u`` is the raw uint8 bit pattern. NaN (S.1111.111) is not
+    produced by quantized weights and is decoded as a finite value."""
+    ui = u.to(tl.int32)
+    sign = (ui >> 7) & 1
+    exp = (ui >> 3) & 0xF
+    man = ui & 0x7
+    mant = man.to(tl.float32) * 0.125
+    # normal: 2^(exp-7) * (1+mant); subnormal (exp==0): 2^-6 * mant
+    val = tl.where(
+        exp != 0,
+        tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant),
+        0.015625 * mant,
+    )
+    return tl.where(sign != 0, -val, val)
+
+
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -50,8 +70,7 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Two typed views over the same underlying bytes.
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -67,7 +86,6 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
@@ -222,7 +240,6 @@ def cast_q_fp8_for_q8kv8_prefill(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
@@ -252,8 +269,11 @@ def _dequantize_k_cache_paged_kernel(
 
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
+        # Load e4m3 bytes as uint8 and decode in-register. This works on every
+        # arch (including Ampere, which cannot materialize Triton's fp8e4nv
+        # type) and is numerically lossless: e4m3 widens exactly into fp32.
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        fp8_vals = _e4m3_uint8_to_f32(tl.load(buf_uint8_ptr + fp8_off))
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))

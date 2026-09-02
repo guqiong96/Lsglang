@@ -57,6 +57,7 @@ from sglang.srt.utils.common import (
     is_mps,
     is_musa,
     is_npu,
+    is_sm80_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -1421,7 +1422,12 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             and cfg.moe_a2a_backend == "none"
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
-            and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
+            and (
+                is_sm80_supported()
+                or is_sm90_supported()
+                or is_sm100_supported()
+                or is_sm120_supported()
+            )
         ):
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.info(

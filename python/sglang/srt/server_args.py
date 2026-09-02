@@ -93,6 +93,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_sm80_supported,
     is_sm90_supported,
     is_sm100_or_sm110_supported,
     is_sm100_supported,
@@ -5967,6 +5968,31 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            elif is_sm80_supported():
+                # SM80/SM86/SM89 (Ampere) has no FP8 tensor cores. The DSV4
+                # deep_gemm-backed paths (MHC prenorm, fp8 MQA logits,
+                # topk_v2, fp8 dense linear) are unavailable here, so disable
+                # them and route to the portable TileLang/Triton/bf16
+                # equivalents. Mirror the GLM-5.3 SM8x block. sm120/sm90+
+                # paths are untouched.
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                # NOTE: SGLANG_OPT_USE_TILELANG_INDEXER stays False here. In
+                # the DSV4 indexer dispatch (dsv4/indexer.py) the TileLang
+                # branch takes priority over FP8_PAGED_MQA_LOGITS_TORCH and
+                # `tilelang_fp8_paged_mqa_logits` needs SM89 F32 MMA, which
+                # SM80/86 lacks. Leaving it False lets the fp8->bf16 torch
+                # paged MQA fallback (fp8_paged_mqa_logits_torch) win.
+                # FP4 experts: keep the checkpoint's native MXFP4 (E2M1)
+                # layout and let LK MoE (MOE_MXFP4, dispatch<80>/<86>) dequant
+                # E2M1 -> bf16 internally during compute. This is the same
+                # path SM120 uses; SGLANG_DSV4_FP4_DEQUANT stays False so the
+                # weights are NOT dequantized to fp8 (which would route the
+                # layer to the FP8 LK MoE path instead).
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)

@@ -82,7 +82,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_sm8 = is_sm80_supported() and not is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -100,6 +101,14 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+@functools.lru_cache(maxsize=None)
+def _device_minus_one(device: str) -> torch.Tensor:
+    # Pre-allocated per-device int32 scalar for rebased index masking. Must be
+    # created outside CUDA graph capture (torch.tensor(...) does a CPU->GPU copy
+    # which is illegal during capture unless the CPU tensor is pinned).
+    return torch.tensor(-1, dtype=torch.int32, device=device)
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1718,7 +1727,19 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _is_sm8:
+                o = self._forward_decode_sm8_tilelang(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    token_to_kv_pool=token_to_kv_pool,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                )
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1762,6 +1783,112 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_decode_sm8_tilelang(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """SM80/SM86/SM89 (Ampere) decode/small-extend path.
+
+        There are no FP8 tensor cores on Ampere, so the packed fp8 KV cache
+        cannot be consumed by ``sgl_kernel.flash_mla_with_kvcache`` (no sm80
+        cubin) nor the SM120 kernel. Instead dequantize the SWA + compressed
+        KV regions into a flat bf16 workspace and run the portable TileLang
+        ``tilelang_sparse_fwd`` (v1 kernel, bf16 tensor cores, tail=64).
+
+        ``swa_page_indices`` already lives in SWA-cache token-id space
+        (``full_to_swa_mapping`` applied by ``BuildCausalSwaPageIndices`` /
+        ``BuildDsparkSwaPageIndices``), and the compressed page indices live in
+        full-pool token-id space. Both are laid out positionally in the flat
+        workspace so the combined index vector is just a per-query rebase.
+        """
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        # q: (b, 1, h, dim+tail=512) -> (b, h, 512) for tilelang_sparse_fwd.
+        q_flat = q.squeeze(1)
+        b = q_flat.shape[0]
+        device = q.device
+        minus_one = _device_minus_one(str(device))
+
+        # --- SWA region -------------------------------------------------
+        # Rows [0, b*n_swa): row (i*n_swa + j) = dequant of swa token id
+        # swa_page_indices[i, j]. Rebased index for (i, j) is (i*n_swa + j),
+        # masked to -1 beyond swa_topk_lengths[i].
+        n_swa = swa_page_indices.shape[-1]
+        assert n_swa % 64 == 0, f"swa width {n_swa} not a multiple of 64"
+        # Padding entries (-1, from BuildCausalSwaPageIndices) must not be
+        # dereferenced as KV locations by dequantize_k_cache_paged (it does no
+        # -1 masking and would OOB-read into garbage/inf). Clamp -1 -> 0; the
+        # affected rows are masked to -1 in `combined` via swa_topk_lengths, so
+        # the attention kernel never attends to them. Mirrors ensure_c128.
+        swa_workspace = dequantize_k_cache_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            swa_page_indices.reshape(-1).clamp_min(0),
+            page_size=token_to_kv_pool.swa_window_size,
+        )  # (b*n_swa, 1, 512) bf16
+        n_swa_total = b * n_swa
+
+        swa_row = torch.arange(n_swa, dtype=torch.int32, device=device)
+        rebased_swa = swa_row[None, :].expand(b, -1) + (
+            torch.arange(b, dtype=torch.int32, device=device) * n_swa
+        )[:, None]
+        rebased_swa = torch.where(
+            swa_row[None, :] >= swa_topk_lengths[:b, None],
+            minus_one,
+            rebased_swa,
+        )
+        combined = rebased_swa
+        workspace = swa_workspace
+
+        # --- Compressed region (c4 / c128) ------------------------------
+        if compress_ratio != 0:
+            assert extra_indices is not None and extra_topk_lengths is not None
+            n_extra = extra_indices.shape[-1]
+            assert n_extra % 64 == 0, f"extra width {n_extra} not a multiple of 64"
+            # Same -1 clamp as the SWA region (c4/c128 metadata pads beyond the
+            # live compressed extent with -1). Extra rows masked to -1 via
+            # extra_topk_lengths are never attended to, so clamping only affects
+            # the already-excluded rows and removes the OOB read.
+            extra_workspace = dequantize_k_cache_paged(
+                token_to_kv_pool.get_extra_key_buffer(layer_id),
+                extra_indices.reshape(-1).clamp_min(0),
+                page_size=token_to_kv_pool.get_extra_key_page_size(layer_id),
+            )  # (b*n_extra, 1, 512) bf16
+
+            extra_row = torch.arange(n_extra, dtype=torch.int32, device=device)
+            rebased_extra = n_swa_total + extra_row[None, :].expand(b, -1) + (
+                torch.arange(b, dtype=torch.int32, device=device) * n_extra
+            )[:, None]
+            rebased_extra = torch.where(
+                extra_row[None, :] >= extra_topk_lengths[:b, None],
+                minus_one,
+                rebased_extra,
+            )
+            workspace = torch.cat([workspace, extra_workspace], dim=0)
+            combined = torch.cat([rebased_swa, rebased_extra], dim=-1)
+
+        # combined: (b, topk) int32, topk = n_swa + n_extra (multiple of 64).
+        o = tilelang_sparse_fwd(
+            q=q_flat,
+            kv=workspace,
+            indices=combined.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            sink=attn_sink,
+        )
+        # o: (1, b, h, d_v) -> (b, 1, h, d_v); the caller squeezes dim 1.
+        o_attn = o.squeeze(0)  # (b, h, d_v)
+        return o_attn.unsqueeze(1)
 
     def _forward_prefill_sparse(
         self,
@@ -1870,6 +1997,26 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
         )
         kv = workspace
+
+        if _is_sm8:
+            # No FP8 tensor cores on Ampere: use the portable TileLang v1
+            # kernel over the bf16 workspace instead of flash_mla_sparse_fwd
+            # (SM90+). combined_indices is already padded to a multiple of 64.
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                tilelang_sparse_fwd,
+            )
+
+            o = tilelang_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                sink=attn_sink,
+            )
+            # (1, num_qo, h, d_v) -> (num_qo, h, d_v)
+            o_attn = o.squeeze(0)
+            return o_attn
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
