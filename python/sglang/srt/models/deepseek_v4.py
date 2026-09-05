@@ -174,6 +174,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -215,6 +216,11 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+
+# SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
+# and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
+# RoPE (see deepseek_v4_wo_a_einsum.py).
+_IS_SM8 = is_sm80_supported() and not is_sm120_supported()
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -348,21 +354,40 @@ _wo_a_aiter_batched_gemm_disabled = False
 
 
 def _apply_wo_a_bf16_matmul(
-    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+    o: torch.Tensor,
+    wo_a: torch.Tensor,
+    is_decode: bool,
+    fuse_inv_rope: bool = False,
+    freqs_cis: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
 
     ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
     ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
 
-    Dispatch contract: on the decode path, when the reroute is enabled
-    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
-    been disabled by a prior runtime failure, call the pre-imported aiter
-    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
-    gate off, or after a failure -- use the numerically-equivalent
-    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
-    disables the reroute for the process (logged once).
+    Dispatch contract: when ``fuse_inv_rope`` (SM8 decode) use the fused
+    inverse-RoPE + Triton grouped einsum. Otherwise, on the decode path, when
+    the reroute is enabled (``_wo_a_aiter_batched_gemm_enabled``, computed once
+    at import) and has not been disabled by a prior runtime failure, call the
+    pre-imported aiter ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``).
+    Otherwise -- prefill, any gate off, or after a failure -- use the
+    numerically-equivalent ``torch.einsum("tgd,grd->tgr", ...)``. The first
+    runtime kernel failure disables the reroute for the process (logged once).
     """
+    if fuse_inv_rope:
+        from sglang.srt.models.deepseek_v4_wo_a_einsum import (
+            wo_a_bf16_einsum_with_rope,
+        )
+
+        return wo_a_bf16_einsum_with_rope(
+            o,
+            wo_a,
+            is_decode=is_decode,
+            freqs_cis=freqs_cis,
+            positions=positions,
+        )
+
     global _wo_a_aiter_batched_gemm_disabled
     if (
         is_decode
@@ -1674,6 +1699,11 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+
+        # On SM8 decode, the inverse RoPE is fused into the wo_a bf16 einsum
+        # below (skip the standalone pass; keep `o` roped). Prefill and non-SM8
+        # still apply it here as usual.
+        fuse_wo_a_rope = _IS_SM8 and forward_batch.forward_mode.is_decode()
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -1686,13 +1716,14 @@ class MQALayer(MqaAttentionBase):
                 qk_nope_dim=self.qk_nope_head_dim,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
+            if not fuse_wo_a_rope:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
@@ -1731,7 +1762,12 @@ class MQALayer(MqaAttentionBase):
             if wo_a_weight is not None:
                 wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 o = _apply_wo_a_bf16_matmul(
-                    o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                    o,
+                    wo_a,
+                    is_decode=forward_batch.forward_mode.is_decode(),
+                    fuse_inv_rope=fuse_wo_a_rope,
+                    freqs_cis=self.freqs_cis if fuse_wo_a_rope else None,
+                    positions=positions if fuse_wo_a_rope else None,
                 )
             else:
                 o = _apply_gguf_grouped_wo_a(

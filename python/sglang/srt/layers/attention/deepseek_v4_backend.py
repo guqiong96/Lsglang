@@ -19,11 +19,17 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    DIM_NOPE,
+    DIM_ROPE,
     cast_q_fp8_for_q8kv8_prefill,
+    dequantize_combined_kv_paged,
     dequantize_k_cache_paged,
     fp8_dtype,
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
+)
+from sglang.kernels.ops.attention.dsv4.sparse_mla_kernels import (
+    matmul_sparse_mla_attention_with_sink,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -586,6 +592,7 @@ class DeepseekV4AttnBackend(
         self._q8kv8_qpad_buf = None
         self._q8kv8_attn_sink_pad = None
         self._q8kv8_identity_scale = None
+        self._sm8_attn_buffers = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -1801,94 +1808,92 @@ class DeepseekV4AttnBackend(
         There are no FP8 tensor cores on Ampere, so the packed fp8 KV cache
         cannot be consumed by ``sgl_kernel.flash_mla_with_kvcache`` (no sm80
         cubin) nor the SM120 kernel. Instead dequantize the SWA + compressed
-        KV regions into a flat bf16 workspace and run the portable TileLang
-        ``tilelang_sparse_fwd`` (v1 kernel, bf16 tensor cores, tail=64).
+        KV regions directly into a gathered bf16 buffer
+        (``dequantize_combined_kv_paged``, single Triton pass, fused valid
+        mask) and run the sink-aware sparse MLA as bmm + Triton finish
+        (``matmul_sparse_mla_attention_with_sink``). This is ~3x faster than
+        the TileLang v1 kernel (which only launches 2 replicated blocks on
+        SM86) and matches vllm-ds4's operator selection.
 
         ``swa_page_indices`` already lives in SWA-cache token-id space
         (``full_to_swa_mapping`` applied by ``BuildCausalSwaPageIndices`` /
         ``BuildDsparkSwaPageIndices``), and the compressed page indices live in
-        full-pool token-id space. Both are laid out positionally in the flat
-        workspace so the combined index vector is just a per-query rebase.
+        full-pool token-id space. The combined dequant writes them into the
+        gathered buffer positionally.
         """
-        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-            tilelang_sparse_fwd,
-        )
-
-        # q: (b, 1, h, dim+tail=512) -> (b, h, 512) for tilelang_sparse_fwd.
+        # q: (b, 1, h, dim+tail=512) -> (b, h, 512).
         q_flat = q.squeeze(1)
-        b = q_flat.shape[0]
+        b, h, _ = q_flat.shape
         device = q.device
-        minus_one = _device_minus_one(str(device))
-
-        # --- SWA region -------------------------------------------------
-        # Rows [0, b*n_swa): row (i*n_swa + j) = dequant of swa token id
-        # swa_page_indices[i, j]. Rebased index for (i, j) is (i*n_swa + j),
-        # masked to -1 beyond swa_topk_lengths[i].
         n_swa = swa_page_indices.shape[-1]
         assert n_swa % 64 == 0, f"swa width {n_swa} not a multiple of 64"
-        # Padding entries (-1, from BuildCausalSwaPageIndices) must not be
-        # dereferenced as KV locations by dequantize_k_cache_paged (it does no
-        # -1 masking and would OOB-read into garbage/inf). Clamp -1 -> 0; the
-        # affected rows are masked to -1 in `combined` via swa_topk_lengths, so
-        # the attention kernel never attends to them. Mirrors ensure_c128.
-        swa_workspace = dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            swa_page_indices.reshape(-1).clamp_min(0),
-            page_size=token_to_kv_pool.swa_window_size,
-        )  # (b*n_swa, 1, 512) bf16
-        n_swa_total = b * n_swa
+        n_extra = extra_indices.shape[-1] if compress_ratio != 0 else 0
+        topk = n_swa + n_extra
 
-        swa_row = torch.arange(n_swa, dtype=torch.int32, device=device)
-        rebased_swa = swa_row[None, :].expand(b, -1) + (
-            torch.arange(b, dtype=torch.int32, device=device) * n_swa
-        )[:, None]
-        rebased_swa = torch.where(
-            swa_row[None, :] >= swa_topk_lengths[:b, None],
-            minus_one,
-            rebased_swa,
-        )
-        combined = rebased_swa
-        workspace = swa_workspace
-
-        # --- Compressed region (c4 / c128) ------------------------------
-        if compress_ratio != 0:
-            assert extra_indices is not None and extra_topk_lengths is not None
-            n_extra = extra_indices.shape[-1]
-            assert n_extra % 64 == 0, f"extra width {n_extra} not a multiple of 64"
-            # Same -1 clamp as the SWA region (c4/c128 metadata pads beyond the
-            # live compressed extent with -1). Extra rows masked to -1 via
-            # extra_topk_lengths are never attended to, so clamping only affects
-            # the already-excluded rows and removes the OOB read.
-            extra_workspace = dequantize_k_cache_paged(
-                token_to_kv_pool.get_extra_key_buffer(layer_id),
-                extra_indices.reshape(-1).clamp_min(0),
-                page_size=token_to_kv_pool.get_extra_key_page_size(layer_id),
-            )  # (b*n_extra, 1, 512) bf16
-
-            extra_row = torch.arange(n_extra, dtype=torch.int32, device=device)
-            rebased_extra = n_swa_total + extra_row[None, :].expand(b, -1) + (
-                torch.arange(b, dtype=torch.int32, device=device) * n_extra
-            )[:, None]
-            rebased_extra = torch.where(
-                extra_row[None, :] >= extra_topk_lengths[:b, None],
-                minus_one,
-                rebased_extra,
+        # Reuse cached buffers across steps (CUDA-graph friendly: torch.empty
+        # during capture allocates from the graph memory pool). The cache key
+        # must include the candidate width topk and the head count so that
+        # differing capture shapes (bs=1 vs bs=2, varying seqlen -> topk) don't
+        # reuse a stale-width score/valid buffer.
+        buf = self._sm8_attn_buffers
+        if (
+            buf is None
+            or buf[0].shape != (b, topk, DIM_NOPE + DIM_ROPE)
+            or buf[1].shape != (b, h, self.head_dim_v)
+            or buf[2].shape != (b, h, topk)
+            or buf[3].shape != (b, topk)
+        ):
+            combined_kv = torch.empty(
+                (b, topk, DIM_NOPE + DIM_ROPE),
+                dtype=torch.bfloat16,
+                device=device,
             )
-            workspace = torch.cat([workspace, extra_workspace], dim=0)
-            combined = torch.cat([rebased_swa, rebased_extra], dim=-1)
+            out = torch.empty(
+                (b, h, self.head_dim_v), dtype=torch.bfloat16, device=device
+            )
+            score_buffer = torch.empty(
+                (b, h, topk), dtype=torch.float32, device=device
+            )
+            valid_buf = torch.empty((b, topk), dtype=torch.bool, device=device)
+            buf = (combined_kv, out, score_buffer, valid_buf)
+            self._sm8_attn_buffers = buf
+        combined_kv, out, score_buffer, valid_buf = buf
 
-        # combined: (b, topk) int32, topk = n_swa + n_extra (multiple of 64).
-        o = tilelang_sparse_fwd(
-            q=q_flat,
-            kv=workspace,
-            indices=combined.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            sink=attn_sink,
+        dequantize_combined_kv_paged(
+            combined_kv=combined_kv,
+            swa_quant_k_cache=token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            swa_page_table=swa_page_indices,
+            swa_page_size=token_to_kv_pool.swa_window_size,
+            extra_quant_k_cache=(
+                token_to_kv_pool.get_extra_key_buffer(layer_id)
+                if compress_ratio != 0
+                else None
+            ),
+            extra_page_table=extra_indices if compress_ratio != 0 else None,
+            extra_page_size=(
+                token_to_kv_pool.get_extra_key_page_size(layer_id)
+                if compress_ratio != 0
+                else None
+            ),
+            swa_topk_lengths=swa_topk_lengths[:b],
+            extra_topk_lengths=extra_topk_lengths[:b] if compress_ratio != 0 else None,
+            valid_out=valid_buf,
         )
-        # o: (1, b, h, d_v) -> (b, 1, h, d_v); the caller squeezes dim 1.
-        o_attn = o.squeeze(0)  # (b, h, d_v)
-        return o_attn.unsqueeze(1)
+
+        matmul_sparse_mla_attention_with_sink(
+            q=q_flat,
+            kv=combined_kv,
+            valid_tokens=valid_buf,
+            scale=self.softmax_scale,
+            attn_sink=attn_sink,
+            output=out,
+            num_heads=h,
+            score_buffer=score_buffer,
+            value_block_size=512 if b <= 16 else 256,
+            candidate_block_size=128 if b <= 16 else None,
+        )
+        # out: (b, h, d_v) -> (b, 1, h, d_v); the caller squeezes dim 1.
+        return out.unsqueeze(1)
 
     def _forward_prefill_sparse(
         self,
