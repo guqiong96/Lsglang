@@ -75,6 +75,9 @@ from sglang.srt.layers.attention.verify_mask import (
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_c128_width,
+)
 from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
@@ -496,11 +499,13 @@ class DSV4RawDecodeMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    c128_width: Optional[int] = None
 
     def copy_(self, other: DSV4RawDecodeMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
+        self.c128_width = other.c128_width
 
 
 class _GraphBucket(enum.Enum):
@@ -548,6 +553,33 @@ class DeepseekV4AttnBackend(
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
+        # The c128 decode metadata always allocates the full compressed-page
+        # budget (page_table.shape[1] * page_size // 128), which is sized from
+        # the model's max context_len (1M) and is ~16x larger than the real
+        # pool cap. Feeding all of it to the finish kernel makes it loop 8384
+        # candidates/layer (~355us) instead of the live count (~300). Cap the
+        # c128 decode candidate width at the memory-pool cap (max_total_tokens,
+        # defaulting to context_len when unset) so the graph captures a fixed
+        # (smaller) shape; the live length is always <= max_total_tokens//128
+        # so no valid entry is dropped.
+        _pool_cap = getattr(
+            getattr(model_runner, "server_args", None), "max_total_tokens", None
+        ) or self.max_context_len
+        self._c128_decode_max_topk = (max(1, _pool_cap) // 128 + 63) // 64 * 64
+        # Multi-bucket decode widths. The graph is captured once per width; at
+        # replay we pick the smallest bucket covering the current max seq_len.
+        # Smaller buckets let short contexts skip the (large) full-width c128
+        # candidate work. Degrades to a single bucket when the pool cap is small.
+        self._c128_topk_buckets: List[int] = []
+        for _bucket in [512, 1024, 2048, 4096]:
+            if _bucket < self._c128_decode_max_topk:
+                self._c128_topk_buckets.append(_bucket)
+        if self._c128_decode_max_topk not in self._c128_topk_buckets:
+            self._c128_topk_buckets.append(self._c128_decode_max_topk)
+        self._c128_topk_buckets.sort()
+        self._sm8_attn_buffers: Dict[Tuple[int, int, int], Tuple[torch.Tensor, ...]] = (
+            {}
+        )
         head_dim = model_runner.model_config.head_dim
         assert (
             head_dim == 512
@@ -592,7 +624,6 @@ class DeepseekV4AttnBackend(
         self._q8kv8_qpad_buf = None
         self._q8kv8_attn_sink_pad = None
         self._q8kv8_identity_scale = None
-        self._sm8_attn_buffers = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -726,6 +757,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
+        c128_width: Optional[int] = None,
     ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
         assert (
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
@@ -735,6 +767,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
+            c128_width=c128_width,
         )
 
     def init_forward_metadata_prefill(
@@ -1015,6 +1048,32 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
+        # c128 multi-bucket decode: the captured graph bakes in a fixed bucket
+        # width (raw_metadata.c128_width, resolved by the runner from the
+        # current max seq_len at replay / capture signal at capture). The raw
+        # c128_page_indices here is the full compressed-page budget (~16x the
+        # live count); narrow it to the bucket so the replay graph shape matches
+        # capture. The bucket-selection invariant (current seq_len <= bucket*128)
+        # guarantees no valid live candidate is dropped. When c128_width is unset
+        # (eager / non-bucket path) fall back to the max width for a bounded
+        # graph shape.
+        c128_page_indices = core_attn_metadata.c128_page_indices
+        if c128_page_indices is not None:
+            width = raw_metadata.c128_width
+            if width is None:
+                width = self._c128_decode_max_topk
+            cur = c128_page_indices.shape[-1]
+            if cur > width:
+                core_attn_metadata.c128_page_indices = c128_page_indices.narrow(
+                    -1, 0, width
+                )
+            elif cur < width:
+                core_attn_metadata.c128_page_indices = torch.nn.functional.pad(
+                    c128_page_indices,
+                    (0, width - cur),
+                    mode="constant",
+                    value=-1,
+                )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
         create = functools.partial(
@@ -1212,7 +1271,7 @@ class DeepseekV4AttnBackend(
             logger.debug(
                 f"[IDLE replay] bs={bs}, "
                 f"local_seq_lens_len={len(seq_lens)}, "
-                f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
+                f"has_graph={(bs, None) in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
@@ -1233,6 +1292,12 @@ class DeepseekV4AttnBackend(
             assert actual_max_seq_len <= chosen_max_seq_len
 
         graph_key = bs
+        # c128 multi-bucket: at replay the runner resolved the width from the
+        # current max seq_len (fb_view.c128_width); during capture the runner
+        # signals the width being baked in via get_capture_c128_width().
+        c128_width = getattr(forward_batch, "c128_width", None)
+        if c128_width is None:
+            c128_width = get_capture_c128_width()
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
@@ -1252,6 +1317,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
+                c128_width=c128_width,
             )
         elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
             block_size = self.speculative_num_draft_tokens - 1
@@ -1286,7 +1352,7 @@ class DeepseekV4AttnBackend(
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                     bucket
-                ][graph_key]
+                ][(graph_key, None)]
                 return
             assert out_cache_loc is not None
             assert num_tokens_v >= len(out_cache_loc), (
@@ -1344,7 +1410,10 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
-            bs=graph_key, temp_metadata=temp_metadata, bucket=bucket
+            bs=graph_key,
+            temp_metadata=temp_metadata,
+            bucket=bucket,
+            c128_width=c128_width,
         )
 
         if in_capture:
@@ -1506,10 +1575,14 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        # Keyed by (bs, c128_width): decode graphs are captured once per c128
+        # multi-bucket width, so metadata must be keyed the same way to stay in
+        # sync with the runner's ShapeKey(size, c128_width). Non-decode buckets
+        # always use c128_width=None.
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Tuple[int, Optional[int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -1550,11 +1623,13 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ],
         bucket: _GraphBucket,
+        c128_width: Optional[int] = None,
     ) -> None:
         bucket_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket]
-        chosen_metadata = bucket_metadata.get(bs)
+        key = (bs, c128_width)
+        chosen_metadata = bucket_metadata.get(key)
         if chosen_metadata is None:
-            bucket_metadata[bs] = temp_metadata
+            bucket_metadata[key] = temp_metadata
             self.forward_metadata = temp_metadata
             return
         chosen_metadata.copy_(temp_metadata)
@@ -1831,18 +1906,15 @@ class DeepseekV4AttnBackend(
         topk = n_swa + n_extra
 
         # Reuse cached buffers across steps (CUDA-graph friendly: torch.empty
-        # during capture allocates from the graph memory pool). The cache key
-        # must include the candidate width topk and the head count so that
-        # differing capture shapes (bs=1 vs bs=2, varying seqlen -> topk) don't
-        # reuse a stale-width score/valid buffer.
-        buf = self._sm8_attn_buffers
-        if (
-            buf is None
-            or buf[0].shape != (b, topk, DIM_NOPE + DIM_ROPE)
-            or buf[1].shape != (b, h, self.head_dim_v)
-            or buf[2].shape != (b, h, topk)
-            or buf[3].shape != (b, topk)
-        ):
+        # during capture allocates from the graph memory pool). The cache is
+        # keyed by (topk, b, h) so each c128 multi-bucket width / batch size
+        # gets its own independent buffer set, and replay of a graph always
+        # reuses the exact width the graph was captured with (the metadata has
+        # already narrowed c128_page_indices to the bucket width, so topk is
+        # fixed per captured graph).
+        key = (topk, b, h)
+        buf = self._sm8_attn_buffers.get(key)
+        if buf is None:
             combined_kv = torch.empty(
                 (b, topk, DIM_NOPE + DIM_ROPE),
                 dtype=torch.bfloat16,
@@ -1856,7 +1928,7 @@ class DeepseekV4AttnBackend(
             )
             valid_buf = torch.empty((b, topk), dtype=torch.bool, device=device)
             buf = (combined_kv, out, score_buffer, valid_buf)
-            self._sm8_attn_buffers = buf
+            self._sm8_attn_buffers[key] = buf
         combined_kv, out, score_buffer, valid_buf = buf
 
         dequantize_combined_kv_paged(

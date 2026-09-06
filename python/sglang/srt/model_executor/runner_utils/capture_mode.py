@@ -81,6 +81,23 @@ def _set_capture_dsa_variant(variant: Optional[str]) -> None:
     _capture_dsa_variant = variant
 
 
+# c128 multi-bucket decode variant: the effective c128 candidate width being
+# baked into the graph currently being captured. None when multi-bucket capture
+# is inactive (the backend then uses its fixed default width).
+_capture_c128_width: Optional[int] = None
+
+
+def get_capture_c128_width() -> Optional[int]:
+    """Return the c128 candidate width of the decode graph being captured, or
+    None when c128 multi-bucket capture is inactive."""
+    return _capture_c128_width
+
+
+def _set_capture_c128_width(width: Optional[int]) -> None:
+    global _capture_c128_width
+    _capture_c128_width = width
+
+
 @contextmanager
 def model_capture_mode():
     global is_capture_mode
