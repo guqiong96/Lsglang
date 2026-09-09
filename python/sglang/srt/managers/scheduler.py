@@ -5545,21 +5545,6 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    # Set the current CUDA device to this rank's own GPU BEFORE any platform
-    # probe (is_sm120_supported / is_sm80_supported / get_platform().is_sm120
-    # / get_platform().is_sm80) is evaluated. Those probes are lru_cache'd on
-    # torch.cuda.current_device() at first call. In a homogeneous TP group the
-    # incidental cuda:0 happens to be the same arch everywhere, but in a
-    # heterogeneous TP group (e.g. mixed SM86 3090 + SM120 5060Ti) a rank whose
-    # GPU is not device 0 would cache the device-0 arch and mis-dispatch the
-    # DeepSeek-V4 decode kernel (SM120 rank falling into the SM90 sgl_kernel
-    # path -> "Unsupported architecture for sparse decode fwd"). Setting the
-    # device before model modules import fixes every probe and module-level
-    # constant (_is_sm8 / _IS_SM8) at once.
-    try:
-        torch.cuda.set_device(gpu_id)
-    except Exception:
-        pass
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     # Publish before anything in this process reads configuration.

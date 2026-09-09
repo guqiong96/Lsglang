@@ -64,8 +64,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
             and (
-                get_platform().is_sm80
-                or get_platform().is_sm90
+                get_platform().is_sm90
                 or get_platform().is_sm100
                 or get_platform().is_sm120
             )

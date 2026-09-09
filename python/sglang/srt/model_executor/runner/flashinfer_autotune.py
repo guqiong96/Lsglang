@@ -52,27 +52,6 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     return skip_ops
 
 
-def _tp_group_min_sm_major(model_runner: ModelRunner) -> int:
-    """SM major of the lowest-capability rank in the TP group.
-
-    FlashInfer autotune must be enabled/disabled identically on every TP rank:
-    they run the same dummy forward and reduce timings over the TP group. A
-    per-process capability check is fine for homogeneous TP, but deadlocks
-    heterogeneous groups (e.g. mixed SM86 3090 + SM120 5060 Ti): the SM<9 ranks
-    would skip autotune and proceed to cuda-graph capture (blocking in a
-    capture barrier) while the SM>=9 ranks enter autotune and block in its
-    all_gather. Resolve the gate over the whole TP group so every rank agrees.
-    """
-    local = torch.cuda.get_device_capability()[0]
-    tp_group = model_runner.tp_group
-    if tp_group is None or tp_group.world_size <= 1:
-        return local
-    group = tp_group.cpu_group
-    majors = [0] * tp_group.world_size
-    torch.distributed.all_gather_object(majors, local, group=group)
-    return min(majors)
-
-
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -145,7 +124,7 @@ def should_run_flashinfer_autotune(
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
 
-    if _tp_group_min_sm_major(model_runner) < 9:
+    if torch.cuda.get_device_capability()[0] < 9:
         return False
 
     if mr.spec_algorithm.is_speculative():

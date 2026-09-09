@@ -97,7 +97,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 | 模型 | 版本 | CPU | 内存 | GPU | Prefill | Decode | 推测解码 |
 |-------|---------|-----|--------|-----|---------|--------|---------|
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 | EPYC 7642 *2 | 16ch ddr4 3200 | 5060Ti * 2 | 780 t/s [输入 32768] | 29 t/s [输入 32768] | 35~50 t/s |
-| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 | EPYC 7642 *2 | 16ch ddr4 3200 | 3090 * 2 | 1060 t/s [输入 32768] | 31 t/s [输入 32768] | 35~50 t/s |
+| deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 [ 分支: 0.5.19-lkmoe-deepseekv4-sm80plus]| EPYC 7642 *2 | 16ch ddr4 3200 | 3090 * 2 | 1060 t/s [输入 32768] | 31 t/s [输入 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [输入 131072] | 75 t/s [输入 131072] | 100~132 t/s |
 
 ### 版本变更

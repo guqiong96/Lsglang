@@ -39,4 +39,3 @@ class ShapeKey:
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
     dsa_variant: Optional[str] = None
-    c128_width: Optional[int] = None

@@ -271,26 +271,20 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
-    use_sink=False,
-    max_head_per_block=64,
 ):
-    assert (
-        dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0
-    ), f"dim={dim} must be a power of 2 or a multiple of 64"
-    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
         tail_dim
-    ), f"tail_dim={tail_dim} must be 0 or a power of 2"
-    has_tail = tail_dim > 0
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
     assert is_causal == True, "non-casual is not supported"
     assert (
         topk % block_I == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    use_sink = bool(use_sink)
     if sm_scale is None:
-        true_scale = (1.0 / (dim + tail_dim)) ** 0.5
-        sm_scale = true_scale * 1.44269504  # log2(e)
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
-        true_scale = sm_scale
         sm_scale = sm_scale * 1.44269504  # log2(e)
 
     batch = T.symbolic("batch")
@@ -315,22 +309,19 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > max_head_per_block:
-        assert head_kv % max_head_per_block == 0, (
-            "head_kv should be a multiple of max_head_per_block"
-        )
-        REPLICATE_H = head_kv // max_head_per_block
-        H_per_block = max_head_per_block
+    if head_kv > 64:
+        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
+        REPLICATE_H = head_kv // 64
     else:
         REPLICATE_H = 1
-        H_per_block = padded_H
+
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
 
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        Sink: T.Tensor([num_heads], FP32),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -339,11 +330,9 @@ def sparse_attention_fwd_kernel_v1(
             bz,
         ):
             Q_shared = T.alloc_shared([H_per_block, D], dtype)
-            if has_tail:
-                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
-            if has_tail:
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
@@ -365,27 +354,11 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (
-                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
-            )
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
 
-            if use_sink:
-                # The learned sink logit ``Sink[h]`` lives in the same scaled
-                # domain as ``true_scale * (Q.K)``. It contributes a weight
-                # ``exp(Sink[h])`` to the denominator and no value, matching
-                # vllm-ds4's ``_finish_materialized_scores_with_sink_kernel``.
-                # Seed the online softmax state with it: the running max in raw
-                # score domain is ``Sink[h] / true_scale`` (so the sink term
-                # ``exp2(sm_scale*(m0 - m0)) = 1``), and the denominator starts
-                # at 1. acc_o stays 0, so the sink adds no output value.
-                for h_i in T.Parallel(H_per_block):
-                    m_i[h_i] = Sink[H0 + h_i] / true_scale
-                T.fill(sumexp, 1)
-
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            if has_tail:
-                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
 
@@ -396,14 +369,10 @@ def sparse_attention_fwd_kernel_v1(
                     KV_shared[bi_i, d_i] = KV[
                         b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
                     ]
-                if has_tail:
-                    for bi_i, d_i in T.Parallel(BI, D_tail):
-                        K_tail_shared[bi_i, d_i] = KV[
-                            b_i,
-                            Indices[b_i, s_i, g_i, i_i * BI + bi_i],
-                            g_i,
-                            D + d_i,
-                        ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                    ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -416,14 +385,13 @@ def sparse_attention_fwd_kernel_v1(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                if has_tail:
-                    T.gemm(
-                        Q_tail_shared,
-                        K_tail_shared,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullCol,
-                    )
+                T.gemm(
+                    Q_tail_shared,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
@@ -1352,14 +1320,13 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    sink: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk % 64 == 0, "topk must be padded to a multiple of 64"
+    assert topk == 2048
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1413,68 +1380,10 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        cap = torch.cuda.get_device_capability()
-        is_sm8 = cap[0] == 8
-        if is_sm8:
-            # Ampere (SM80/86/89) caps per-block dynamic shared memory at
-            # 101376 B. The GLM DSA MLA decode is a full (non-lora-absorbed)
-            # query with dim = v_head_dim = kv_lora_rank = 512, so the default
-            # block_I=64 needs 196608 B (num_stages=2) / 131072 B
-            # (num_stages=1) > 101376 B. Shrink block_I to 32 with threads=128
-            # (see below) -- SM90+ keeps the tuned config.
-            #
-            # DSV4 (tail_dim = 512 - 448 = 64) must use the v1 kernel (which
-            # handles tail via T.Pipelined, no T.alloc_barrier) on SM8: the v2
-            # kernel uses T.alloc_barrier which is SM90+-only and won't compile
-            # on Ampere. Shared-memory budget for dim=448/tail=64 with
-            # block_I=32, num_stages=1: 32*448*2*3(Q/KV/O) + 32*64*2*2(Q/K tail)
-            # + 32*32*2(S) = 28672*3 + 4096*2 + 2048 = 96256 B <= 101376 B.
-            #
-            # SM8 serving (both the main TP>1 MQA decode and the DSPARK
-            # self-draft worker) pads Q up to 64 heads before calling this
-            # (deepseek_v4.py MQA / deepseek_v4_dspark.py DSparkAttention both
-            # pad to _PAD_NUM_HEADS=64). Keeping all 64 heads in one block's
-            # shared memory blows the 101376 B Ampere budget (155648/163840 B).
-            # Cap max_head_per_block=32 so heads are split across replicated
-            # blocks (REPLICATE_H=2 for H=64, H_per_block=32), each block
-            # staying within the 96256 B budget.
-            kernel = sparse_attention_fwd_kernel_v1(
-                num_heads,
-                d_v,
-                tail_dim,
-                topk,
-                sm_scale=sm_scale,
-                block_I=32,
-                num_stages=1,
-                threads=128,
-                use_sink=(sink is not None),
-                max_head_per_block=32,
-            )
-        else:
-            kernel_factory = (
-                sparse_attention_fwd_kernel_v1
-                if tail_dim == 0
-                else sparse_attention_fwd_kernel_v2
-            )
-            kernel_kwargs = dict(sm_scale=sm_scale, block_I=64, num_stages=2)
-            if tail_dim == 0:
-                kernel_kwargs["use_sink"] = sink is not None
-            kernel = kernel_factory(
-                num_heads,
-                d_v,
-                tail_dim,
-                topk,
-                **kernel_kwargs,
-            )
-        if sink is None:
-            sink_arg = torch.empty(
-                (num_heads,), dtype=torch.float32, device=q.device
-            )
-        else:
-            sink_arg = sink
-        out = kernel(
-            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), sink_arg
-        )  # type: ignore
+        kernel = sparse_attention_fwd_kernel_v2(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+        )
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
 
