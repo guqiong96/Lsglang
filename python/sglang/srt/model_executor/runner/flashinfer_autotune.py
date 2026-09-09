@@ -30,7 +30,9 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_model,
+    get_schedule,
     get_spec,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
@@ -48,6 +50,27 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
+
+
+def _tp_group_min_sm_major(model_runner: ModelRunner) -> int:
+    """SM major of the lowest-capability rank in the TP group.
+
+    FlashInfer autotune must be enabled/disabled identically on every TP rank:
+    they run the same dummy forward and reduce timings over the TP group. A
+    per-process capability check is fine for homogeneous TP, but deadlocks
+    heterogeneous groups (e.g. mixed SM86 3090 + SM120 5060 Ti): the SM<9 ranks
+    would skip autotune and proceed to cuda-graph capture (blocking in a
+    capture barrier) while the SM>=9 ranks enter autotune and block in its
+    all_gather. Resolve the gate over the whole TP group so every rank agrees.
+    """
+    local = torch.cuda.get_device_capability()[0]
+    tp_group = model_runner.tp_group
+    if tp_group is None or tp_group.world_size <= 1:
+        return local
+    group = tp_group.cpu_group
+    majors = [0] * tp_group.world_size
+    torch.distributed.all_gather_object(majors, local, group=group)
+    return min(majors)
 
 
 def should_run_flashinfer_autotune(
@@ -122,7 +145,7 @@ def should_run_flashinfer_autotune(
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
 
-    if torch.cuda.get_device_capability()[0] < 9:
+    if _tp_group_min_sm_major(model_runner) < 9:
         return False
 
     if mr.spec_algorithm.is_speculative():
@@ -342,9 +365,7 @@ def maybe_flashinfer_autotune_extend(
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
-    num_tokens = (
-        mr.server_args.max_prefill_buffer_tokens() or mr.server_args.max_prefill_tokens
-    )
+    num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
     is_pd_prefill_target = (

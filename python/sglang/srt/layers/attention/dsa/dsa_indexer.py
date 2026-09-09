@@ -28,7 +28,6 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
-    get_paged_mqa_logits_metadata,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
     is_graph_dsa_split_op_surface,
@@ -133,15 +132,18 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+if _is_cuda or _is_hip:
+    # Plain-torch graph helpers: usable wherever the split-op surface is.
+    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+        logits_head_gate_graph,
+        scale_head_gate_graph,
+    )
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
@@ -155,11 +157,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
+    # PyNCCL is the faster path under capture, but it is not a precondition:
+    # a split attn-TP group is built without one (parallel_state.py), and the
+    # process-group broadcast captures and replays correctly.
+    if (
+        topk_indices.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+        and group.pynccl_comm is not None
+    ):
         with group.pynccl_comm.change_state(enable=True):
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
@@ -201,6 +206,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
+    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -249,7 +256,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = get_parallel().config.pp_size
+            pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -479,6 +486,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
+                # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
@@ -868,21 +876,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
-        elif ctx_2d is not None:
-            if ctx_2d.size(1) == 1:
-                seqlens_32_2d = ctx_2d
-            else:
-                seqlens_32_2d = ctx_2d.reshape(-1).contiguous().view(-1, 1)
         elif seqlens_32.dim() == 2:
-            if seqlens_32.size(1) == 1:
-                seqlens_32_2d = seqlens_32.contiguous()
-            else:
-                seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
+            seqlens_32_2d = seqlens_32
         else:
-            seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
+            seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = get_paged_mqa_logits_metadata(
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -895,54 +895,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-
-        # DeepGEMM SM100 paged MQA misaligns when batch_size exceeds num_sms:
-        # chunk per sm_count with per-chunk schedule metadata, else defer to the
-        # plain kernel. Injected into the shared helpers as the kernel fn.
-        def _chunked_fp8_paged_mqa_logits(
-            q: torch.Tensor,
-            kv_cache: torch.Tensor,
-            w: torch.Tensor,
-            context_lens: torch.Tensor,
-            block_table: torch.Tensor,
-            mqa_schedule_metadata: torch.Tensor,
-            max_len: int,
-            clean_logits: bool = False,
-        ) -> torch.Tensor:
-            batch_size, chunk_next_n = q.shape[:2]
-            if batch_size == 0:
-                return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
-            if batch_size <= self.sm_count:
-                return deep_gemm.fp8_paged_mqa_logits(
-                    q,
-                    kv_cache,
-                    w,
-                    context_lens,
-                    block_table,
-                    mqa_schedule_metadata,
-                    max_len,
-                    clean_logits=clean_logits,
-                )
-            logits_chunks = []
-            for start in range(0, batch_size, self.sm_count):
-                end = min(start + self.sm_count, batch_size)
-                chunk_context_lens = context_lens[start:end]
-                chunk_schedule_metadata = get_paged_mqa_logits_metadata(
-                    chunk_context_lens, blocksize, self.sm_count
-                )
-                logits_chunks.append(
-                    deep_gemm.fp8_paged_mqa_logits(
-                        q[start:end],
-                        kv_cache,
-                        w[start * chunk_next_n : end * chunk_next_n],
-                        chunk_context_lens,
-                        block_table[start:end],
-                        chunk_schedule_metadata,
-                        max_len,
-                        clean_logits=clean_logits,
-                    )
-                )
-            return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -972,11 +924,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=get_paged_mqa_logits_metadata,
+                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                _chunked_fp8_paged_mqa_logits,
+                deep_gemm.fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -990,7 +942,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                _chunked_fp8_paged_mqa_logits,
+                deep_gemm.fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -1056,7 +1008,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
         """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Detect whether we need to chunk the MQA logits computation to avoid OOM,
+        and on ROCm to stay under aiter's 2 GiB logits limit
         Return: (need_chunk, logits_budget_bytes)
         """
         # Quick static check for normal batches
@@ -1065,6 +1018,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        if _is_hip:
+            logits_budget_bytes = min(
+                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+            )
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes

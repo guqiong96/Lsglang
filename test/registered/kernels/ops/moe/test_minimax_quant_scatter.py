@@ -1,13 +1,13 @@
 import random
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import sglang.srt.layers.moe.moe_runner.deep_gemm as deep_gemm_runner
 from sglang.kernels.ops.moe.ep_moe_kernels import (
-    ep_scatter,
     fill_gateup_input_triton_kernel,
     moe_ep_deepgemm_preprocess,
 )
@@ -140,44 +140,6 @@ def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
             )
 
 
-def test_ep_scatter_initializes_compact_expert_offsets():
-    hidden_states = torch.arange(3 * 128, device=dev, dtype=torch.bfloat16).reshape(
-        3, 128
-    )
-    topk_ids = torch.tensor([[0], [1], [0]], device=dev, dtype=torch.int32)
-    padded_tokens_per_expert = torch.tensor([128, 128], device=dev, dtype=torch.int32)
-    valid_tokens_per_expert = torch.tensor([2, 1], device=dev, dtype=torch.int32)
-    expert_start_loc = torch.zeros(2, device=dev, dtype=torch.int32)
-    packed_hidden_states = torch.zeros(256, 128, device=dev, dtype=torch.bfloat16)
-    m_indices = torch.full((256,), -2, device=dev, dtype=torch.int32)
-    src2dst = torch.full((3, 1), -1, device=dev, dtype=torch.int32)
-
-    ep_scatter(
-        hidden_states,
-        None,
-        topk_ids,
-        padded_tokens_per_expert,
-        valid_tokens_per_expert,
-        expert_start_loc,
-        packed_hidden_states,
-        torch.empty(0, device=dev),
-        m_indices,
-        src2dst,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(
-        expert_start_loc.cpu(), torch.tensor([2, 129], dtype=torch.int32)
-    )
-    src2dst_cpu = src2dst.cpu().flatten()
-    assert set(src2dst_cpu[[0, 2]].tolist()) == {0, 1}
-    assert src2dst_cpu[1].item() == 128
-    assert torch.equal(m_indices[:2].cpu(), torch.tensor([0, 0], dtype=torch.int32))
-    assert torch.equal(m_indices[128:129].cpu(), torch.tensor([1], dtype=torch.int32))
-    for token_id, dst in enumerate(src2dst_cpu.tolist()):
-        assert torch.equal(packed_hidden_states[dst], hidden_states[token_id])
-
-
 @pytest.mark.parametrize(
     "num_assignments,num_experts,expected",
     [
@@ -196,6 +158,42 @@ def test_compact_all_tokens_uses_tight_routing_independent_bound(
         deep_gemm_runner._get_compact_all_tokens(num_assignments, num_experts)
         == expected
     )
+
+
+def test_compact_eager_keeps_masked_layout_for_cuda_graph(monkeypatch):
+    config = MoeRunnerConfig(
+        num_experts=128,
+        num_local_experts=16,
+        hidden_size=2048,
+        intermediate_size_per_partition=4096,
+        top_k=4,
+        activation="silu",
+        is_gated=True,
+        inplace=False,
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner.envs.SGLANG_OPT_DG_COMPACT_EAGER, "get", lambda: True
+    )
+    capture = SimpleNamespace(disable_dispose_tensor=False)
+    monkeypatch.setattr(
+        deep_gemm_runner, "get_flags", lambda: SimpleNamespace(capture=capture)
+    )
+    hidden_states = torch.empty((128, 2048), device="meta")
+    quant_info = DeepGemmMoeQuantInfo(
+        w13_weight=torch.empty((1, 4096, 1), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((1, 2048, 1), dtype=torch.float8_e4m3fn),
+        use_fp8=True,
+        block_shape=[128, 128],
+    )
+    with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("masked"):
+        assert not deep_gemm_runner._should_use_masked_standard_layout(
+            config, quant_info, hidden_states
+        )
+
+        capture.disable_dispose_tensor = True
+        assert deep_gemm_runner._should_use_masked_standard_layout(
+            config, quant_info, hidden_states
+        )
 
 
 def test_standard_layout_auto_memory_policy(monkeypatch):

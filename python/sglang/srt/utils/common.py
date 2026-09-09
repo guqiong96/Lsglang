@@ -87,7 +87,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -100,7 +100,10 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
+    get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -254,68 +257,69 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
+# Per-device capability lookup so the arch probes below can key on the
+# *current* device rather than a single import-time global. In a heterogeneous
+# TP group (e.g. mixed SM86 3090 + SM120 5060Ti, CUDA_VISIBLE_DEVICES=0,1,2,3)
+# the current device at module import is whatever cuda:0 happens to be, so a
+# global lru_cache would cache one rank's arch for every rank and mis-dispatch
+# the DSV4 decode kernel on the others. Keying on current_device() lets each
+# rank resolve correctly once it has set_device(gpu_id).
+@lru_cache(maxsize=16)
+def _cuda_device_capability_major(device_id: int) -> int:
+    return torch.cuda.get_device_capability(device_id)[0]
+
+
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
 ):
     if not is_cuda():
         return False
+    device_id = torch.cuda.current_device()
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        _cuda_device_capability_major(device_id) in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
-    )
-)
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
-    )
-)
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-    )
-)
+def is_ampere_with_cuda_12_3():
+    return _check_cuda_device_version([8], (12, 3))
+
+
+def is_hopper_with_cuda_12_3():
+    return _check_cuda_device_version([9], (12, 3))
+
+
+def is_blackwell_supported():
+    return _check_cuda_device_version([10, 11, 12], (12, 8))
+
+
+is_blackwell = is_blackwell_supported
+
+
+def is_sm120_supported():
+    return _check_cuda_device_version([12], (12, 8))
+
+
+def is_sm100_supported():
+    return _check_cuda_device_version([10], (12, 8))
+
+
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
-    )
-)
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
-    )
-)
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
+def is_sm100_or_sm110_supported():
+    return _check_cuda_device_version([10, 11], (12, 8))
+
+
+def is_sm80_supported():
+    return _check_cuda_device_version([8], (11, 0))
+
+
+def is_sm90_supported():
+    return _check_cuda_device_version([9], (12, 3))
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
 # _check_cuda_device_version, which only matches on the major.
-@lru_cache(maxsize=1)
 def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
@@ -352,10 +356,6 @@ def xpu_has_xmx_support():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
-
-
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -1049,6 +1049,18 @@ def is_gfx942_supported():
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
         return False
 
@@ -1806,14 +1818,6 @@ class ImageData:
     content_hash: Optional[str] = None
 
 
-GLM_MEDIA_CONFIG_KEYS = (
-    "fps",
-    "max_frames",
-    "max_tokens_per_frame",
-    "max_image_tokens",
-)
-
-
 @dataclass
 class VideoData:
     url: str
@@ -1822,45 +1826,6 @@ class VideoData:
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
-
-
-def smart_to_rgb(
-    image: Union[torch.Tensor, Image.Image],
-) -> Union[torch.Tensor, Image.Image]:
-    if not isinstance(image, Image.Image):
-        return image
-
-    image = ImageOps.exif_transpose(image)
-    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
-        image = image.convert("RGBA")
-        width, height = image.size
-        edge_pixels = []
-
-        for x in range(0, width, max(1, width // 20)):
-            for y in (0, height - 1):
-                pixel = image.getpixel((x, y))
-                if pixel[3] > 128:
-                    edge_pixels.append(pixel[:3])
-
-        for y in range(0, height, max(1, height // 20)):
-            for x in (0, width - 1):
-                pixel = image.getpixel((x, y))
-                if pixel[3] > 128:
-                    edge_pixels.append(pixel[:3])
-
-        if edge_pixels:
-            avg_brightness = sum(sum(pixel) for pixel in edge_pixels) / (
-                len(edge_pixels) * 3
-            )
-            background_color = (32, 32, 32) if avg_brightness > 128 else (240, 240, 240)
-        else:
-            background_color = (255, 255, 255)
-
-        background = Image.new("RGB", image.size, background_color)
-        background.paste(image, mask=image.getchannel("A"))
-        return background
-
-    return image.convert("RGB")
 
 
 def is_jpeg_with_cuda(
@@ -1919,7 +1884,20 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return _fully_load_pil_image(image)
+
+
+def _fully_load_pil_image(image: Image.Image) -> Image.Image:
+    """Force PIL's lazy decode while malformed input is still request-local."""
+    try:
+        image.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
@@ -1936,7 +1914,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
@@ -1959,8 +1937,6 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-    if image_size is not None and isinstance(image, Image.Image):
-        image_size = (image.width, image.height)
     return image, image_size
 
 
@@ -2208,7 +2184,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.17")
+        min_version: Minimum version required (e.g., "0.6.18")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2282,14 +2258,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2302,10 +2281,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -2400,6 +2379,8 @@ def configure_logger(server_args, prefix: str = ""):
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
+        # Runs before publish, and for multimodal_gen's ServerArgs, which
+        # never publishes these bags -- so the record, not the bag.
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -3752,8 +3733,6 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
-    from sglang.srt.runtime_context import get_flags
-
     if get_flags().capture.disable_dispose_tensor:
         return
 
@@ -3787,11 +3766,10 @@ def require_mlp_tp_gather():
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().config.enable_dp_attention:
-        assert get_parallel().config.dp_size > 1, "dp_size must be greater than 1"
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3800,10 +3778,10 @@ def require_mlp_tp_gather():
             if elastic_expanded_world_enabled():
                 return True
         if (
-            get_parallel().config.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not get_parallel().config.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3817,10 +3795,23 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+            "SGLANG_MORI_RECV_BOUND", "false"
+        ):
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
         else:
             return (
-                get_parallel().config.moe_dense_tp_size
-                > get_parallel().config.tp_size // get_parallel().config.dp_size
+                get_parallel().moe_dense_tp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3834,19 +3825,18 @@ def require_attn_tp_gather():
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    from sglang.srt.runtime_context import get_parallel
 
-    if get_parallel().config.disable_attn_tp_gather:
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if (
         not get_moe_a2a_backend().is_none()
-        or get_parallel().config.moe_dense_tp_size is not None
+        or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().config.enable_dp_attention:
-            return get_parallel().config.dp_size < get_parallel().config.tp_size
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:
@@ -3858,9 +3848,8 @@ def require_gathered_buffer():
 
 
 def require_mlp_sync():
-    from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().config.enable_dp_attention or require_gathered_buffer()
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
@@ -4694,7 +4683,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     resolution's answers.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
@@ -4841,7 +4829,7 @@ def get_model_type_from_layer_name(layer_name: str) -> str:
 
 def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
     if model_type == "dspark":
-        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_SPEC ", None)
+        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK", None)
         if env_value is not None:
             return env_value
         

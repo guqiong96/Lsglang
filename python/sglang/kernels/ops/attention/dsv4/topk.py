@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu
 
 from .utils import make_name
 
@@ -58,6 +59,10 @@ def topk_transform_512(
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
+    elif is_xpu():
+        torch.ops.sgl_kernel.topk_transform(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
     else:
         module = _jit_topk_v1_module()
         module.topk_transform(
@@ -70,11 +75,7 @@ def topk_transform_512(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(
-    seq_lens: torch.Tensor,
-    static_threshold: int = 0,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
     """Preprocess the per-batch routing plan for :func:`topk_transform_512_v2`.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
@@ -83,17 +84,12 @@ def plan_topk_v2(
     the plan, and drives the transform kernel into an illegal memory access.
     Producers of padded rows must clamp their lengths to 0 (0 selects the
     trivial all-(-1) output path, which is safe).
-
-    ``out``, when given, must be a plan previously produced by this function
-    for the same batch size (shape ``(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)``)
-    and is rewritten in place instead of allocating a fresh buffer.
     """
     module = _jit_topk_v2_module()
-    if out is None:
-        bs = seq_lens.shape[0]
-        out = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
-    module.topk_plan(seq_lens, out, static_threshold)
-    return out
+    bs = seq_lens.shape[0]
+    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    module.topk_plan(seq_lens, metadata, static_threshold)
+    return metadata
 
 
 def topk_transform_ragged_v2(
@@ -120,6 +116,15 @@ def topk_transform_ragged_v2(
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
+    if is_xpu():
+        torch.ops.sgl_kernel.topk_transform_ragged(
+            scores,
+            seq_lens,
+            out_indices,
+            out_offsets,
+            row_starts,
+        )
+        return
     module = _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
@@ -152,6 +157,16 @@ def topk_transform_512_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if is_xpu():
+        torch.ops.sgl_kernel.topk_transform_paged(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            metadata,
+        )
+        return
     module = _jit_topk_v2_module()
     module.topk_transform_paged(
         scores,

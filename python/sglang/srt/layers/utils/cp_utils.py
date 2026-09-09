@@ -63,18 +63,18 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    return get_parallel().config.enable_prefill_context_parallel
+    return get_parallel().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
     return (
         is_prefill_context_parallel_enabled()
-        and get_parallel().config.prefill_cp_mode == "in-seq-split"
+        and get_parallel().prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_mla_prefill_cp_enabled() -> bool:
-    return get_parallel().config.enable_prefill_context_parallel and uses_mla_backend()
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -83,9 +83,7 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     return (
         forward_batch.attn_cp_metadata is not None
         and mla_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend(
-            include_draft_extend_v2=True
-        )
+        and forward_batch.forward_mode.is_context_parallel_extend()
     )
 
 

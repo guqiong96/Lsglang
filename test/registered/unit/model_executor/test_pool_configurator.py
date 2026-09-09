@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,11 +124,9 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
-    mc.hf_config.model_type = "llama"
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
     mc.context_len = 8192
-    mc.is_draft_model = False
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
 
@@ -313,7 +316,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             )
 
             cfg = create_memory_pool_configurator(mr)
-            config = cfg.calculate_pool_sizes(available_bytes, mr.server_args.page_size)
+            config = cfg.calculate_pool_sizes(available_bytes, get_schedule().page_size)
         return mr, cfg, config
 
     def test_memory_utilization(self):
@@ -415,7 +418,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         user_limit = original.full_max_total_num_tokens // 2
         with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(
-                user_limit, mr.server_args.page_size
+                user_limit, get_schedule().page_size
             )
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
@@ -699,51 +702,18 @@ class TestEagleConfigurator(CustomTestCase):
         mr.spec_algorithm.is_none.return_value = False
         mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
 
-        full_pt = _full_per_token(mr)
-        for dcp_size in (1, 4):
-            with self.subTest(dcp_size=dcp_size):
-                mr.ps = ParallelState.trivial(attn_dcp_size=dcp_size)
-                with mock_cpu_env():
-                    from sglang.srt.model_executor.pool_configurator import (
-                        create_memory_pool_configurator,
-                    )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
 
-                    cfg = create_memory_pool_configurator(mr)
-                    config = cfg.calculate_pool_sizes(available, 1)
-
-                total_layers = num_layers + eagle_draft_num_layers * dcp_size
-                used = config.max_total_num_tokens * full_pt * total_layers
-                self.assertLessEqual(used, available)
-
-    def test_hybrid_swa_scales_draft_budget_with_dcp(self):
-        mr = _make_model_runner(
-            self,
-            is_hybrid_swa=True,
-            full_attention_layer_ids=list(range(16)),
-            swa_attention_layer_ids=list(range(16, 32)),
-            swa_num_kv_heads=4,
-        )
-        mr.spec_algorithm.is_eagle.return_value = True
-        mr.spec_algorithm.is_none.return_value = False
-        mr.spec_aux_config.eagle_draft_num_layers = 4
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
 
         full_pt = _full_per_token(mr)
-        swa_pt = _swa_per_token(mr)
-        for dcp_size in (1, 4):
-            with self.subTest(dcp_size=dcp_size):
-                mr.ps = ParallelState.trivial(attn_dcp_size=dcp_size)
-                with mock_cpu_env():
-                    from sglang.srt.model_executor.pool_configurator import (
-                        create_memory_pool_configurator,
-                    )
-
-                    cfg = create_memory_pool_configurator(mr)
-
-                expected = (
-                    full_pt * (16 + 4 * dcp_size)
-                    + mr.server_args.swa_full_tokens_ratio * swa_pt * 16
-                )
-                self.assertEqual(cfg._cell_size, expected)
+        total_layers = num_layers + eagle_draft_num_layers
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
@@ -1030,7 +1000,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
                 cfg = create_memory_pool_configurator(mr)
-                config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))

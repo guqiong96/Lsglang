@@ -156,7 +156,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -169,6 +175,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_gfx1250_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -219,8 +226,12 @@ _MHC_POST_MULT_VALUE = 2.0
 
 # SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
 # and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
-# RoPE (see deepseek_v4_wo_a_einsum.py).
-_IS_SM8 = is_sm80_supported() and not is_sm120_supported()
+# RoPE (see deepseek_v4_wo_a_einsum.py). Evaluated lazily (not at import) so it
+# reflects this rank's own GPU: the probes are device-keyed on
+# torch.cuda.current_device(), which in a heterogeneous TP group (mixed SM86 +
+# SM120) is only correct after set_device(gpu_id) has run.
+def _IS_SM8() -> bool:
+    return is_sm80_supported() and not is_sm120_supported()
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -303,9 +314,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
-    if _is_gfx95_supported:
+    if _is_gfx95_supported or _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
@@ -554,6 +566,10 @@ def deepseek_v4_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        output.zero_()
+        return
 
     query = query[:real_num_tokens]
     key_value = key_value[:real_num_tokens]
@@ -873,9 +889,7 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams = None
             self.alt_streams_indexer = None
 
-        from sglang.srt.utils import is_blackwell_supported
-
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
         self.compressor = None
         self.indexer = None
@@ -1080,8 +1094,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -1092,6 +1104,7 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+        del qkv_a
 
         return q
 
@@ -1174,8 +1187,6 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
             q.record_stream(stream_q)
 
-        del qkv_a
-
         # Indexer + compressor: serial on current.
         if self.indexer is not None:
             self.indexer(
@@ -1195,6 +1206,7 @@ class MQALayer(MqaAttentionBase):
         # Join stream_kv + stream_q before downstream attention.
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_q)
+        del qkv_a
         return q
 
     def _forward_prepare_multi_stream_hip(
@@ -1242,7 +1254,7 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1359,7 +1371,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1703,7 +1715,7 @@ class MQALayer(MqaAttentionBase):
         # On SM8 decode, the inverse RoPE is fused into the wo_a bf16 einsum
         # below (skip the standalone pass; keep `o` roped). Prefill and non-SM8
         # still apply it here as usual.
-        fuse_wo_a_rope = _IS_SM8 and forward_batch.forward_mode.is_decode()
+        fuse_wo_a_rope = _IS_SM8() and forward_batch.forward_mode.is_decode()
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -2093,6 +2105,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
+            # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
+            # <=64 tokens, or gfx1250 all sizes) -> TileLang -> None.
             input_norm_weight = (
                 self._input_layernorm_weight_bf16
                 if self._input_layernorm_weight_bf16 is not None
@@ -2118,11 +2132,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # The Triton fused post+pre returns the layer input WITHOUT
-                    # the input layernorm applied (norm_fused=False). Apply it
-                    # (fp8-quant on aiter gfx95) before attention, exactly as the
-                    # unfused hc_pre path below does; otherwise unnormalized
-                    # activations reach self_attn.
+                    # Triton fused post+pre (gfx95 small-batch or gfx1250) returns
+                    # norm_fused=False — the input layernorm is NOT folded.
+                    # gfx95 takes the fp8-quant path; gfx1250 takes plain layernorm.
                     if _use_aiter and _is_gfx95_supported:
                         x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                             hidden_states,
@@ -2135,10 +2147,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 else:
                     x_quant = None
             else:
-                # Fused dispatch declined: close the previous layer's deferred
-                # mHC post (prev_residual/prev_post/prev_comb) before opening this
-                # layer's pre. Skipping hc_post here would drop the previous-layer
-                # post state and corrupt all subsequent layers.
                 hidden_states = self.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
@@ -2220,9 +2228,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # The Triton fused post+pre skips the post-attention
-                    # layernorm (norm_fused=False); apply it before the MoE,
-                    # matching the unfused hc_pre path below.
                     hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -2336,10 +2341,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "CP requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
-                    f"Got {moe_a2a_backend.value}."
+                assert (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_megamoe()
+                    or moe_a2a_backend.is_mori()
+                ), (
+                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
+                    f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
@@ -2444,7 +2452,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if not norm_fused:
-            if _use_aiter and _is_gfx95_supported:
+            if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                 x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                     hidden_states,
                     self.input_layernorm.weight,
@@ -3266,7 +3274,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()

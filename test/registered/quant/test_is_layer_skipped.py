@@ -58,24 +58,6 @@ class TestIsLayerSkipped(CustomTestCase):
             is_layer_skipped("model.layers.340.mlp.experts.0.down_proj", ignored, {})
         )
 
-    def test_glob_patterns_skip_fused_qkv(self):
-        ignored = [
-            "*.self_attn.q_proj",
-            "*.self_attn.k_proj",
-            "*.self_attn.v_proj",
-        ]
-        self.assertTrue(
-            is_layer_skipped("model.layers.3.self_attn.qkv_proj", ignored, {})
-        )
-        self.assertFalse(
-            is_layer_skipped("model.layers.3.self_attn.o_proj", ignored, {})
-        )
-
-    def test_model_prefixed_glob_matches_normalized_prefix(self):
-        self.assertTrue(
-            is_layer_skipped("model.visual.encoder.proj", ["model.visual.*"], {})
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

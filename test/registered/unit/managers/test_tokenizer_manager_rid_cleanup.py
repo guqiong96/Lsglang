@@ -10,12 +10,11 @@ Covers:
   - _handle_batch_output cleans up rid_to_state on finished requests
   - _init_req_state rejects duplicate rids
   - Resubmission succeeds after cleanup
-  - Handler failures clean up pending and dispatched requests
 """
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
 
@@ -129,8 +128,6 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
-    tm.logical_rid_to_child_rids = {}
-    tm.child_rid_to_logical_rid = {}
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -140,11 +137,10 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
-    tm._dispatch_to_scheduler = Mock()
     return tm
 
 
-def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqState:
+def _make_req_state(rid: str = "test_rid") -> ReqState:
     """Create a minimal ReqState for testing."""
     obj = Mock(spec=GenerateReqInput)
     obj.rid = rid
@@ -158,7 +154,6 @@ def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqSt
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
-        dispatched=dispatched,
     )
 
 
@@ -360,19 +355,6 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
 
-    def test_batch_duplicate_preflight_does_not_insert_partial_state(self):
-        tm = _make_tokenizer_manager()
-        existing_rid = "existing"
-        existing_state = _make_req_state(existing_rid)
-        tm.rid_to_state[existing_rid] = existing_state
-        obj = _make_generate_obj(["new", existing_rid], is_single=False)
-
-        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
-            tm._init_req_state(obj)
-
-        self.assertNotIn("new", tm.rid_to_state)
-        self.assertIs(tm.rid_to_state[existing_rid], existing_state)
-
 
 class TestResubmitAfterCompletion(CustomTestCase):
     """End-to-end test: complete a request, then resubmit with the same rid."""
@@ -472,91 +454,40 @@ def _make_generate_obj(rid, is_single):
     return obj
 
 
-class TestReleaseReqStatesOnFailure(CustomTestCase):
-    """Direct tests for _release_req_states_on_failure."""
+class TestDiscardPendingReqStates(CustomTestCase):
+    """Direct tests for _discard_pending_req_states."""
 
-    def test_undelivered_single_is_dropped(self):
+    def test_discard_single(self):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid)
-        tm._release_req_states_on_failure([rid])
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        tm._discard_pending_req_states(obj)
         self.assertNotIn(rid, tm.rid_to_state)
-        abort_req = tm._dispatch_to_scheduler.call_args.args[0]
-        self.assertEqual(abort_req.rid, rid)
-        self.assertFalse(abort_req.abort_all)
 
-    def test_undelivered_batch_removes_all(self):
+    def test_discard_batch_removes_all(self):
         tm = _make_tokenizer_manager(self)
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
-        tm._release_req_states_on_failure(rids)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = list(rids)
+        tm._discard_pending_req_states(obj)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
-        tm._dispatch_to_scheduler.assert_not_called()
 
-    def test_ignores_already_removed(self):
-        """A rid that is no longer present must not raise."""
+    def test_discard_ignores_already_removed(self):
+        """Popping a rid that is no longer present must not raise."""
         tm = _make_tokenizer_manager(self)
         tm.rid_to_state["p1"] = _make_req_state("p1")
-        tm._release_req_states_on_failure(["p1", "already_gone"])
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = ["p1", "already_gone"]
+        tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
-
-    def test_dispatched_single_is_aborted_and_state_kept(self):
-        tm = _make_tokenizer_manager(self)
-        tm.server_args.tokenizer_worker_num = 1
-        tm._dispatch_to_scheduler = Mock()
-        tm.enable_metrics = True
-        tm.metrics_collector = MagicMock()
-        rid = "d_live"
-        state = _make_req_state(rid)
-        state.dispatched = True
-        tm.rid_to_state[rid] = state
-        tm._release_req_states_on_failure([rid])
-        tm._release_req_states_on_failure([rid])
-
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        self.assertEqual(
-            [type(m) for m in sent], [AbortReq], "expected exactly one AbortReq"
-        )
-        self.assertEqual(sent[0].rid, rid)
-        self.assertIn(rid, tm.rid_to_state)
-        self.assertTrue(state.abort_sent)
-        tm.metrics_collector.observe_one_aborted_request.assert_called_once()
-
-    def test_dispatched_batch_aborts_delivered_and_drops_rest(self):
-        tm = _make_tokenizer_manager(self)
-        tm.server_args.tokenizer_worker_num = 1
-        tm._dispatch_to_scheduler = Mock()
-        delivered, undelivered = "d_delivered", "d_undelivered"
-        live = _make_req_state(delivered)
-        live.dispatched = True
-        tm.rid_to_state[delivered] = live
-        tm.rid_to_state[undelivered] = _make_req_state(undelivered)
-        tm._release_req_states_on_failure([delivered, undelivered])
-
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        self.assertEqual([type(m) for m in sent], [AbortReq])
-        self.assertEqual(sent[0].rid, delivered)
-        self.assertIn(delivered, tm.rid_to_state)
-        self.assertNotIn(undelivered, tm.rid_to_state)
-
-    def test_abort_failure_does_not_stop_cleanup(self):
-        tm = _make_tokenizer_manager(self)
-        tm.server_args.tokenizer_worker_num = 1
-        tm._dispatch_to_scheduler = Mock(side_effect=RuntimeError("send failed"))
-        delivered, undelivered = "live", "pending"
-        live = _make_req_state(delivered)
-        live.dispatched = True
-        tm.rid_to_state[delivered] = live
-        tm.rid_to_state[undelivered] = _make_req_state(undelivered)
-
-        with self.assertLogs(level="ERROR"):
-            tm._release_req_states_on_failure([delivered, undelivered])
-
-        self.assertIn(delivered, tm.rid_to_state)
-        self.assertFalse(live.abort_sent)
-        self.assertNotIn(undelivered, tm.rid_to_state)
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
@@ -639,7 +570,6 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # Got past _init_req_state (which created the entry) ...
         tm._tokenize_one_request.assert_awaited_once()
         tm._send_one_request.assert_not_called()
-        tm._dispatch_to_scheduler.assert_not_called()
         # ... and the entry was cleaned up rather than leaked.
         self.assertNotIn(rid, tm.rid_to_state)
 
@@ -665,27 +595,6 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
 
-    def test_parallel_sampling_failure_cleans_generated_rid(self):
-        tm = _make_tm_for_generate(self)
-        obj = GenerateReqInput(
-            text=["hello"],
-            rid=["base"],
-            sampling_params={"n": 2},
-        )
-        tokenized = MagicMock()
-        tokenized.mm_inputs = None
-        tokenized.sampling_params = MagicMock()
-        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
-        tm._send_one_request = Mock(side_effect=RuntimeError("dispatch failed"))
-
-        async def drive():
-            await tm.generate_request(obj).__anext__()
-
-        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-            asyncio.run(drive())
-
-        self.assertFalse(tm.rid_to_state)
-
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate(self)
         obj = GenerateReqInput(
@@ -704,48 +613,32 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertFalse(tm.rid_to_state)
 
 
-class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
-    """Cancellation after dispatch must stop the scheduler request."""
+class TestWaitOneResponseAfterStateFreed(CustomTestCase):
+    """A waiter built before its request finishes must still deliver the output.
 
-    @patch(
-        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
-        side_effect=lambda obj: obj,
-    )
-    def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):
-        tm = _make_tm_for_generate(self)
-        tm.cuda_vmm_feature_transport = Mock()
-        tm._dispatch_to_scheduler = Mock()
-        rid = "disconnect_zombie"
-        obj = _make_generate_obj(rid, is_single=True)
-        obj.return_prompt_token_ids = False
-        tokenized = MagicMock()
-        tokenized.rid = rid
-        tokenized.mm_inputs = None
-        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+    Batch dispatch builds every waiter before advancing any, and the
+    scheduler-response path drops rid_to_state as soon as a request finishes.
+    """
+
+    def test_generator_built_before_finish_still_delivers_output(self):
+        tm = _make_tokenizer_manager(self)
+        tm.request_logger = Mock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        rid = "freed_state_rid"
+        state = _make_req_state(rid)
+        state.obj.background = True  # skip the fastapi disconnect probe
+        tm.rid_to_state[rid] = state
 
         async def drive():
-            task = asyncio.create_task(tm.generate_request(obj).__anext__())
-            for _ in range(100):
-                await asyncio.sleep(0)
-                if tm._dispatch_to_scheduler.called:
-                    break
-            self.assertTrue(
-                tm._dispatch_to_scheduler.called, "request never dispatched"
-            )
-            state = tm.rid_to_state.get(rid)
-            self.assertIsNotNone(state)
-            self.assertTrue(state.dispatched)
+            waiter = tm._wait_one_response(state.obj, None)
+            await tm._handle_batch_output(_make_batch_str_output(rid))
+            self.assertNotIn(rid, tm.rid_to_state)
+            return await waiter.__anext__()
 
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-
-        asyncio.run(drive())
-
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
-        self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
-        self.assertIn(rid, tm.rid_to_state)
+        out = asyncio.run(drive())
+        self.assertEqual(out["meta_info"]["id"], rid)
+        self.assertEqual(out["text"], "hello")
 
 
 if __name__ == "__main__":

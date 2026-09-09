@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -80,6 +81,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 )
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
@@ -90,8 +92,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
-from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
+from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -100,10 +101,17 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
-_is_sm120 = is_sm120_supported()
-_is_sm8 = is_sm80_supported() and not is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+
+
+def _is_sm8() -> bool:
+    # Evaluated lazily (not at import): the platform probes are device-keyed on
+    # torch.cuda.current_device(), which only reflects this rank's GPU after
+    # set_device(gpu_id) has run. In a heterogeneous TP group (mixed SM86 +
+    # SM120) an import-time evaluation would lock in cuda:0's arch for every
+    # rank and mis-dispatch the decode kernel on the SM120 ranks.
+    return get_platform().is_sm80 and not get_platform().is_sm120
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +173,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -426,10 +434,10 @@ class DSV4Metadata:
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
-    # Lazily populated on the first call to ``_forward_prefill_sparse`` and
-    # reused across every layer in the chunk. Reset to ``None`` when graph
-    # metadata is refreshed so replay rebuilds it from the live batch.
+    # Built at the runner's prefill WAR boundary when the fast path is on,
+    # otherwise lazily by ``_forward_prefill_sparse``.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+    prefill_shared_reads_snapshotted: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -443,6 +451,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        self.prefill_shared_reads_snapshotted = False
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -462,6 +471,7 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+        self.prefill_shared_reads_snapshotted = False
 
 
 @dataclass
@@ -473,6 +483,7 @@ class DSV4RawVerifyMetadata:
     extend_seq_lens: Optional[torch.Tensor] = None
     seq_lens_cpu: Optional[List[int]] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
+    c128_width: Optional[int] = None
 
     extend_start_loc: Optional[torch.Tensor] = None
     verify_lens: Optional[torch.Tensor] = None
@@ -488,6 +499,7 @@ class DSV4RawVerifyMetadata:
         self.c128_compress_metadata = _copy_or_replace(
             self.c128_compress_metadata, other.c128_compress_metadata
         )
+        self.c128_width = other.c128_width
 
         self.extend_start_loc = other.extend_start_loc
         self.verify_lens = other.verify_lens
@@ -539,6 +551,13 @@ class DeepseekV4AttnBackend(
             if self.model_runner.spec_algorithm.is_dspark():
                 return SharedReadEnds.IN_REPLAY
             return SharedReadEnds.POST_REPLAY
+        metadata = self.forward_metadata
+        if (
+            fm == ForwardMode.EXTEND
+            and isinstance(metadata, DSV4Metadata)
+            and metadata.prefill_shared_reads_snapshotted
+        ):
+            return SharedReadEnds.PRE_REPLAY
         return super().shared_read_ends(fm)
 
     def __init__(
@@ -569,9 +588,35 @@ class DeepseekV4AttnBackend(
         # Multi-bucket decode widths. The graph is captured once per width; at
         # replay we pick the smallest bucket covering the current max seq_len.
         # Smaller buckets let short contexts skip the (large) full-width c128
-        # candidate work. Degrades to a single bucket when the pool cap is small.
+        # candidate work, so short inputs (e.g. 1024 tokens) cut finish cost a
+        # lot. The max bucket is still bounded by the pool cap so we never
+        # waste on widths nobody can reach; the min bucket just has to be legal
+        # (>= the smallest capture width). Degrades to a single bucket when the
+        # pool cap is small.
+        #
+        # The candidate width list is arch-dependent: SM120's CUTLASS
+        # sparse-MLA kernels are instantiated only for topk in {128, 512,
+        # 1024} (decode) / {128, 512, 1024, 2048} (prefill), so any other width
+        # would have to be right-padded to the next instantiated bucket
+        # (extra split-K blocks, wasted). Use only native widths on SM120. The
+        # SM80+ (tilelang/bmm) path accepts any width, so we keep finer 64/256
+        # buckets there for short contexts.
+        #
+        # IMPORTANT: In a heterogeneous TP group (e.g. mixed SM86 + SM120),
+        # every rank must use the SAME bucket list. Otherwise the decode
+        # cuda-graph capture loop iterates a different number of times per
+        # rank, so the cross-rank NCCL allreduces (TP attention allreduce, MoE
+        # reduce_scatter) inside each captured forward no longer pair up and the
+        # capture deadlocks. Take the union of the arch-specific candidates on
+        # every rank so the loop trip count is identical everywhere. SM120
+        # right-pads the non-native extra widths, which is only a small
+        # capture-time overhead.
+        _bucket_candidates = sorted(
+            set([64, 128, 256, 512, 1024, 2048, 4096])
+            | set([128, 512, 1024, 2048])
+        )
         self._c128_topk_buckets: List[int] = []
-        for _bucket in [512, 1024, 2048, 4096]:
+        for _bucket in _bucket_candidates:
             if _bucket < self._c128_decode_max_topk:
                 self._c128_topk_buckets.append(_bucket)
         if self._c128_decode_max_topk not in self._c128_topk_buckets:
@@ -612,7 +657,7 @@ class DeepseekV4AttnBackend(
             model_runner.server_args, "dsv4_prefill_backend", "auto"
         )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
-            if not is_sm90_supported():
+            if not get_platform().is_sm90:
                 raise ValueError(
                     "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
                 )
@@ -743,10 +788,11 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and _is_sm120
+                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
@@ -885,6 +931,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
+        c128_width: Optional[int] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         assert out_cache_loc is not None
         bs = len(seq_lens)
@@ -921,6 +968,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph,
                 online_c128_state_slot_offset,
             ),
+            c128_width=c128_width,
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
             total_verify_tokens=total_verify_tokens,
@@ -1007,6 +1055,12 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
+        # Narrow the verify c128 candidate page indices to the resolved bucket
+        # width (mirror of make_forward_metadata_from_raw_decode): the capture
+        # graph bakes in c128_width, so replay must match it or the finish
+        # kernel would loop the full compressed-page budget (8384) instead of
+        # the live bucket count.
+        self._narrow_c128_page_indices(core_attn_metadata, raw_metadata.c128_width)
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
             create_paged_compressor_data,
@@ -1031,6 +1085,41 @@ class DeepseekV4AttnBackend(
             c4_compress_metadata=create(compress_ratio=4),
             c128_compress_metadata=c128_compress_metadata,
         )
+
+    def _narrow_c128_page_indices(
+        self, core_attn_metadata: DSV4AttnMetadata, c128_width: Optional[int]
+    ) -> None:
+        # SM8-only: SM120's native flash_mla_sm120 kernel handles the full
+        # width directly (it is not the SM8 bmm path), so leave it untouched
+        # there.
+        if not _is_sm8():
+            return
+        c128_page_indices = core_attn_metadata.c128_page_indices
+        if c128_page_indices is None:
+            return
+        width = c128_width
+        if width is None:
+            width = self._c128_decode_max_topk
+        cur = c128_page_indices.shape[-1]
+        import os
+        if os.environ.get("SGLANG_DEBUG_C128"):
+            import traceback
+            print(
+                f"[C128-DEBUG] narrow: cur={cur} c128_width={c128_width} "
+                f"resolved={width}",
+                flush=True,
+            )
+        if cur > width:
+            core_attn_metadata.c128_page_indices = c128_page_indices.narrow(
+                -1, 0, width
+            )
+        elif cur < width:
+            core_attn_metadata.c128_page_indices = torch.nn.functional.pad(
+                c128_page_indices,
+                (0, width - cur),
+                mode="constant",
+                value=-1,
+            )
 
     def make_forward_metadata_from_raw_decode(
         self,
@@ -1057,23 +1146,7 @@ class DeepseekV4AttnBackend(
         # guarantees no valid live candidate is dropped. When c128_width is unset
         # (eager / non-bucket path) fall back to the max width for a bounded
         # graph shape.
-        c128_page_indices = core_attn_metadata.c128_page_indices
-        if c128_page_indices is not None:
-            width = raw_metadata.c128_width
-            if width is None:
-                width = self._c128_decode_max_topk
-            cur = c128_page_indices.shape[-1]
-            if cur > width:
-                core_attn_metadata.c128_page_indices = c128_page_indices.narrow(
-                    -1, 0, width
-                )
-            elif cur < width:
-                core_attn_metadata.c128_page_indices = torch.nn.functional.pad(
-                    c128_page_indices,
-                    (0, width - cur),
-                    mode="constant",
-                    value=-1,
-                )
+        self._narrow_c128_page_indices(core_attn_metadata, raw_metadata.c128_width)
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
         create = functools.partial(
@@ -1382,6 +1455,7 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=True,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
+                c128_width=c128_width,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(
@@ -1436,6 +1510,66 @@ class DeepseekV4AttnBackend(
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
+        # first layer. DFLASH/DSPARK have no later prefill draft-extend reader;
+        # CP-v2 shards the query layout that this global snapshot assumes.
+        metadata = self.forward_metadata
+        if isinstance(metadata, DSV4Metadata):
+            metadata.prefill_shared_reads_snapshotted = False
+        snapshot_shared_prefill_reads = (
+            envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self.model_runner.spec_algorithm.is_dflash_family()
+            and not is_cp_v2_active(forward_batch)
+        )
+        if not snapshot_shared_prefill_reads:
+            return
+
+        assert isinstance(metadata, DSV4Metadata)
+        use_sparse_prefill = not get_platform().is_sm120 and (
+            num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
+        if use_sparse_prefill:
+            metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        # Marked for dense prefill too: that path reads only core_attn_metadata,
+        # which init_forward_metadata already snapshotted.
+        metadata.prefill_shared_reads_snapshotted = True
+
+    def _build_sparse_prefill_chunk_cache(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SparsePrefillChunkCache:
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert seq_lens_cpu is not None
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        assert extend_seq_lens_cpu is not None
+        seq_lens_cpu_list = seq_lens_cpu.tolist()
+        total_swa = sum(
+            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+            for seq_len, extend_len in zip(
+                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+            )
+        )
+        # ``swa_window_size`` on the pool is its storage page size, not the
+        # model's SWA window, so pass both explicitly.
+        return SparsePrefillChunkCache.build(
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_to_token=self.req_to_token,
+            full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
+            swa_window_size=SWA_WINDOW,
+            swa_page_size=self.token_to_kv_pool.swa_window_size,
+            num_qo_tokens=num_qo_tokens,
+            max_seq_len=max(seq_lens_cpu_list),
+            total_swa=total_swa,
+        )
 
     def _build_forward_metadata(
         self,
@@ -1783,7 +1917,7 @@ class DeepseekV4AttnBackend(
             # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not get_platform().is_sm120
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1809,7 +1943,19 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm8:
+            if os.environ.get("SGLANG_DEBUG_ARCH"):
+                import torch as _t
+                _rank = get_parallel().tp_rank
+                _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "unset")
+                print(
+                    f"[ARCH-DEBUG] tp_rank={_rank} cvd={_cvd} cur_dev={_t.cuda.current_device()} "
+                    f"cap={_t.cuda.get_device_capability()} "
+                    f"_is_sm8={_is_sm8()} is_sm120={get_platform().is_sm120} "
+                    f"is_sm80={get_platform().is_sm80} is_sm90={get_platform().is_sm90}",
+                    flush=True,
+                )
+
+            if _is_sm8():
                 o = self._forward_decode_sm8_tilelang(
                     q=q,
                     layer_id=layer_id,
@@ -1821,7 +1967,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths=extra_topk_lengths,
                     attn_sink=attn_sink,
                 )
-            elif _is_sm120:
+            elif get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1995,29 +2141,8 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-            assert seq_lens_cpu is not None
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            assert extend_seq_lens_cpu is not None
-            total_swa = sum(
-                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-                for seq_len, extend_len in zip(
-                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
-                )
-            )
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
-            cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
-                req_to_token=self.req_to_token,
-                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
-                swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
-                num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
-                total_swa=total_swa,
+            cache = self._build_sparse_prefill_chunk_cache(
+                forward_batch, num_qo_tokens=q_flat.shape[0]
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -2075,7 +2200,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        if _is_sm8:
+        if _is_sm8():
             # No FP8 tensor cores on Ampere: use the portable TileLang v1
             # kernel over the bf16 workspace instead of flash_mla_sparse_fwd
             # (SM90+). combined_indices is already padded to a multiple of 64.
@@ -2211,27 +2336,8 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-            assert seq_lens_cpu is not None
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            assert extend_seq_lens_cpu is not None
-            total_swa = sum(
-                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-                for seq_len, extend_len in zip(
-                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
-                )
-            )
-            cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
-                req_to_token=self.req_to_token,
-                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
-                swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
-                num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
-                total_swa=total_swa,
+            cache = self._build_sparse_prefill_chunk_cache(
+                forward_batch, num_qo_tokens=q_flat.shape[0]
             )
             self.forward_metadata.sparse_prefill_cache = cache
 

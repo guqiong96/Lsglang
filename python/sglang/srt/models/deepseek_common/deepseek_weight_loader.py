@@ -529,7 +529,7 @@ class DeepseekV2WeightLoaderMixin:
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        if self.model.start_layer <= layer_id < self.model.end_layer:
+                        if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -538,9 +538,6 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
-
-            if not hasattr(self_attn, "kv_b_proj"):
-                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported

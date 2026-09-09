@@ -1420,15 +1420,8 @@ def tilelang_sparse_fwd(
             # 101376 B. The GLM DSA MLA decode is a full (non-lora-absorbed)
             # query with dim = v_head_dim = kv_lora_rank = 512, so the default
             # block_I=64 needs 196608 B (num_stages=2) / 131072 B
-            # (num_stages=1) > 101376 B.  Shrink block_I to 32 with threads=128
-            # so the kernel fits: 2*32*512*2 + 2*32*32*2 + 2*32*512*2 =
-            # 100352 B <= 101376 B, while keeping 4 warps for good throughput
-            # (~296 us vs ~541 us for block_I=16/threads=64, ~1.8x faster, and
-            # it fits the shared-memory budget with ~1 KB to spare; it launches
-            # cleanly on SM86).  Smaller block_I (<32) either trips the
-            # tilelang "Layout infer conflict between m_i and alpha" (at >=128
-            # threads) or wastes parallelism ("warp_row_tiles must be greater
-            # than 16").  SM90+ keeps the tuned config.
+            # (num_stages=1) > 101376 B. Shrink block_I to 32 with threads=128
+            # (see below) -- SM90+ keeps the tuned config.
             #
             # DSV4 (tail_dim = 512 - 448 = 64) must use the v1 kernel (which
             # handles tail via T.Pipelined, no T.alloc_barrier) on SM8: the v2
@@ -1611,9 +1604,7 @@ def tilelang_fp8_paged_mqa_logits(
         split_kv=split_kv,
     )
     q_fp8 = q_fp8.view(batch_size, num_heads, head_dim)
-    kvcache_u8 = kvcache_fp8.contiguous().view(torch.uint8).view(
-        -1, block_size * (head_dim + 4)
-    )
+    kvcache_u8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     kernel(q_fp8, kvcache_u8, weight, seq_lens, page_table, logits)
     return logits
 

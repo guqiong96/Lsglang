@@ -485,16 +485,27 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
+def get_draft_recurrent_hidden_state_spec_from_config(
+    model_config, spec_algorithm
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return hidden_states width/dtype carried between draft decode steps.
+
+    Config-only so callers without a draft runner can reach it: prefill-side PP
+    builds the draft on the last stage alone, but the PD metadata wire schema it
+    feeds has to come out identical on every rank.
+    """
+    if spec_algorithm.is_standalone():
+        return None, None
+    return model_config.spec_hidden_size, model_config.dtype
+
+
 def get_draft_recurrent_hidden_state_spec(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
     """Return hidden_states width/dtype carried between draft decode steps."""
-    if model_runner.spec_algorithm.is_standalone():
-        return None, None
-    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
-
-
-_PREPARE_FOR_VERIFY_DEPS = None
+    return get_draft_recurrent_hidden_state_spec_from_config(
+        model_runner.model_config, model_runner.spec_algorithm
+    )
 
 
 def eagle_prepare_for_verify(
@@ -502,36 +513,16 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
-    overlap_plan_stream: bool = False,
 ):
-    # Imports must stay lazy (import-cycle safety) but only need to resolve
-    # once, not on every decode cycle of this hot path.
-    global _PREPARE_FOR_VERIFY_DEPS
-    if _PREPARE_FOR_VERIFY_DEPS is None:
-        from sglang.kernels.ops.speculative.cache_locs import (
-            assign_extend_cache_locs_uniform_func,
-        )
-        from sglang.srt.model_executor.forward_batch_info import (
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-        )
-        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-
-        _PREPARE_FOR_VERIFY_DEPS = (
-            assign_extend_cache_locs_uniform_func,
-            CaptureHiddenMode,
-            ForwardBatch,
-            ForwardMode,
-            prepare_mamba_track_for_verify,
-        )
-    (
+    from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
+    )
+    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-        prepare_mamba_track_for_verify,
-    ) = _PREPARE_FOR_VERIFY_DEPS
+    )
+    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -591,15 +582,7 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    # Pure full-attention backends can preload graph metadata on the plan
-    # stream.  Recurrent backends opt in only after their metadata path has
-    # been audited not to touch state still used by the preceding draft.
-    defer_graph_load = overlap_plan_stream and not getattr(
-        target_worker.model_runner.attn_backend,
-        "supports_overlap_plan_stream_graph_load",
-        True,
-    )
-    if can_run_cuda_graph and not defer_graph_load:
+    if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
         )

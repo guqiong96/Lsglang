@@ -1734,9 +1734,9 @@ class MMReceiverBase(ABC):
         self.host = get_local_ip_auto(get_serving().host)
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        self.tp_size = get_parallel().config.tp_size
+        self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
-        self.nnodes = server_args.nnodes
+        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
@@ -1838,19 +1838,19 @@ class MMReceiverBase(ABC):
 
         extra_kwargs = {}
         if getattr(server_args, "tokenizer_backend", None) is not None:
-            extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
+            extra_kwargs["tokenizer_backend"] = get_serving().tokenizer_backend
 
         _processor = get_processor(
             get_serving().tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
+            tokenizer_mode=get_serving().tokenizer_mode,
             trust_remote_code=get_model().trust_remote_code,
-            revision=server_args.revision,
+            revision=get_model().revision,
             image_processor_backend=resolve_image_processor_backend(get_mm()),
             **extra_kwargs,
         )
 
         enable_adaptive_dispatch_to_encoder = (
-            server_args.enable_adaptive_dispatch_to_encoder
+            get_disagg().enable_adaptive_dispatch_to_encoder
         )
         mm_processor_kwargs = {}
         if model_config is not None:
@@ -1888,7 +1888,6 @@ class MMReceiverBase(ABC):
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
-        encode_task = None
         try:
             # ``self.encode_urls`` is shared by reference with the bootstrap
             # server (when running) so it always reflects the current set.
@@ -1951,21 +1950,7 @@ class MMReceiverBase(ABC):
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - send_time
             logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
-            await self._abort_encode_and_cleanup(encode_task, req_id)
             return None
-        except asyncio.CancelledError:
-            await self._abort_encode_and_cleanup(encode_task, req_id)
-            raise
-
-    async def _abort_encode_and_cleanup(self, encode_task, req_id):
-        if encode_task is not None and not encode_task.done():
-            encode_task.cancel()
-            try:
-                await encode_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if req_id is not None:
-            self._cleanup_mooncake_buffer(req_id)
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         """zmq_to_tokenizer receive: embedding parts arrive as 2-frame ZMQ

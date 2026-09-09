@@ -45,7 +45,6 @@ from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
-    get_dsa_index_kpool,
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
@@ -63,7 +62,6 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
-from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -205,6 +203,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -746,6 +745,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -765,15 +765,15 @@ class DeepseekV2MoE(nn.Module):
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptFp4LinearMethod,
             )
-            from sglang.srt.utils.common import is_sm100_supported
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
-                is_sm100_supported()
+                get_platform().is_sm100
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
                 )
+                and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
                 and isinstance(
                     self.shared_experts.down_proj.quant_method,
                     ModelOptFp4LinearMethod,
@@ -835,6 +835,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_deepep_v2()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -857,6 +858,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -1850,10 +1852,7 @@ class DeepseekV2AttentionMLA(
 
             if not self.skip_topk or is_nextn:
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-                indexer_cls = (
-                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
-                )
-                indexer_kwargs = dict(
+                self.indexer = Indexer(
                     hidden_size=hidden_size,
                     index_n_heads=get_dsa_index_n_heads(config),
                     index_head_dim=get_dsa_index_head_dim(config),
@@ -1872,9 +1871,6 @@ class DeepseekV2AttentionMLA(
                     alt_stream=alt_stream,
                     config=config,
                 )
-                if indexer_cls is IndexerKPool:
-                    indexer_kwargs["skip_rope"] = skip_rope
-                self.indexer = indexer_cls(**indexer_kwargs)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1898,7 +1894,7 @@ class DeepseekV2AttentionMLA(
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
-        if not skip_rope and qk_rope_head_dim > 0:
+        if not skip_rope:
             is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
@@ -2315,7 +2311,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        skip_rope: bool = False,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
     ) -> None:
@@ -2338,10 +2333,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
-        if is_nextn and getattr(config, "mla_nope", False):
-            # The NextN draft must match the NoPE target layers, or its Q/K
-            # and the KV it verifies against live in different spaces.
-            skip_rope = True
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -2361,7 +2352,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
-            skip_rope=skip_rope,
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
@@ -2692,7 +2682,6 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
-                skip_rope=config.qk_rope_head_dim == 0,
                 dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
                 mla_enable_prefill_cp=self.mla_enable_prefill_cp,
             ),
@@ -2752,7 +2741,12 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    is_a2a_moe = is_deepep_class_backend()
+                    # Keep the original deepep-class scope here and only add DeepEP v2,
+                    # so unrelated backends' allocator sizing is unchanged.
+                    is_a2a_moe = (
+                        is_deepep_class_backend()
+                        or get_moe_a2a_backend().is_deepep_v2()
+                    )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -2772,10 +2766,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
@@ -3018,7 +3013,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer

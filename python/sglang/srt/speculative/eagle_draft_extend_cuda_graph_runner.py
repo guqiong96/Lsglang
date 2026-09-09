@@ -55,20 +55,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
-def resolve_draft_extend_seq_len_fill_value(
-    attn_backend, captured_req_width: int
-) -> int:
-    """DRAFT_EXTEND_V2 subtracts the fixed draft width when building the KPool
-    write plan; padding rows need enough synthetic history for that subtraction
-    plus the KPool offset."""
-    fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
-    full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
-    dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
-    if dsa_index_kpool > 1:
-        fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
-    return fill_value
-
-
 @dataclass
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -113,7 +99,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = get_parallel().config.pp_size
+        self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer()
@@ -155,8 +141,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
-            self.draft_extend_attn_backend, self.captured_req_width
+        self.seq_len_fill_value = (
+            self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         self.extend_seq_lens_cpu = [self.captured_req_width] * self.max_bs
 
@@ -189,8 +175,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if _hidden_size is not None
                 else None
             )
-            self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
-                self.draft_extend_attn_backend, self.captured_req_width
+            self.seq_len_fill_value = (
+                self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
@@ -251,7 +237,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.max_num_token, self.eagle_worker.dsa_seed_topk_width),
+                (self.max_num_token, self.eagle_worker.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
