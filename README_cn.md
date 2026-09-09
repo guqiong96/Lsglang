@@ -12,7 +12,7 @@ lk_moe 提供"混合路径", Lsglang 是 lk_moe 集成到 sglang 的具体案例
 
 ---
 
-## 一、为什么要用 lk_moe？
+## 为什么要用 lk_moe？
 
 lk_moe 让 MOE 模型的占用横跨**显存 + 内存**，并在NUMA 感知下把专家计算调度到 **CPU + GPU**：
 
@@ -31,7 +31,7 @@ lk_moe 让 MOE 模型的占用横跨**显存 + 内存**，并在NUMA 感知下�
 
 ---
 
-## 二、如何集成 lk_moe
+## 如何集成 lk_moe
 
 lk_moe 通过 `pip install lk_moe` 安装，它对外暴露少量 C++ 内核类（`MOE_WNA16`、
 `MOE_FP8`、`MOE_MXFP4`、`LKEmbedding` 等），由 `MOEConfigV2` 配置驱动。引擎内部处理专家权重放置
@@ -88,7 +88,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 
 ---
 
-## 三、效果实例 — Lsglang（含基准）
+## 效果实例 — Lsglang（含基准）
 
 ### 性能基准
 

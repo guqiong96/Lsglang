@@ -14,7 +14,7 @@ case of lk_moe into sglang.
 
 ---
 
-## 一、Why lk_moe?
+## Why lk_moe?
 
 lk_moe lets the MOE model footprint span **VRAM + system memory**, and schedules expert
 computation across **CPU + GPU** with NUMA awareness:
@@ -35,7 +35,7 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 
 ---
 
-## 二、How to integrate lk_moe
+## How to integrate lk_moe
 
 lk_moe is a pip-installable package (`pip install lk_moe`). It exposes a small set of C++ kernel
 classes (`MOE_WNA16`, `MOE_FP8`, `MOE_MXFP4`, `LKEmbedding`, ...) driven by a `MOEConfigV2` config.
@@ -96,7 +96,7 @@ DeepSeek-V4 branches: [Lvllmds4](https://github.com/guqiong96/Lvllmds4) (SM120+)
 
 ---
 
-## 三、Example — Lsglang (with benchmarks)
+## Example — Lsglang (with benchmarks)
 
 ### Performance benchmark
 
