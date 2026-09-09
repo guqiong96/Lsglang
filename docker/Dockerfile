@@ -21,8 +21,7 @@ ARG MSCCLPP_VERSION=sglang-v0.9.1
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
-    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+    FLASHINFER_VERSION=${FLASHINFER_VERSION}
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -68,7 +67,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     build-essential \
     cmake \
     perl \
-    patch \
     patchelf \
     ccache \
     git-lfs \
@@ -159,7 +157,6 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
-#     +-- trtllm_cubin_builder (independent)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -412,27 +409,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
     && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
-
-########################################################
-# PARALLEL STAGE 6: TRT-LLM Generated-MoE Cubin Pool
-########################################################
-FROM base AS trtllm_cubin_builder
-
-RUN cubin_archive="/tmp/trtllm_gen_moe_cubin_pool.zip" && \
-    cubin_extract_dir="/tmp/trtllm_gen_moe_cubin_extract" && \
-    wget --no-verbose --output-document="${cubin_archive}" \
-      "${TRTLLM_GEN_MOE_CUBIN_URL}" && \
-    echo "${TRTLLM_GEN_MOE_CUBIN_SHA256}  ${cubin_archive}" | \
-      sha256sum --check --strict - && \
-    mkdir -p "${cubin_extract_dir}" && \
-    unzip -q "${cubin_archive}" -d "${cubin_extract_dir}" && \
-    test ! -e "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    mv "${cubin_extract_dir}/${TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT}" \
-      "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" && \
-    test "$(find "${SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL}" \
-      -type f -name '*.cubin' | wc -l)" -eq 1696 && \
-    rm -f "${cubin_archive}" && \
-    rm -rf "${cubin_extract_dir}"
 
 ########################################################
 ########## Final Framework Image ######################

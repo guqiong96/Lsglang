@@ -1102,15 +1102,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
-    def test_regenerate_rid_with_parent_prefix(self):
-        """Test RID regeneration with a logical parent prefix."""
-        req = GenerateReqInput(text="Hello", rid="logical")
-        req.normalize_batch_and_arguments()
-
-        new_rid = req.regenerate_rid(prefix="logical")
-
-        self.assertTrue(new_rid.startswith("logical_"))
-
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided

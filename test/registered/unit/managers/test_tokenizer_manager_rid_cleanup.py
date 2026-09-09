@@ -128,8 +128,6 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
-    tm.logical_rid_to_child_rids = {}
-    tm.child_rid_to_logical_rid = {}
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -139,11 +137,10 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
-    tm._dispatch_to_scheduler = Mock()
     return tm
 
 
-def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqState:
+def _make_req_state(rid: str = "test_rid") -> ReqState:
     """Create a minimal ReqState for testing."""
     obj = Mock(spec=GenerateReqInput)
     obj.rid = rid
@@ -157,7 +154,6 @@ def _make_req_state(rid: str = "test_rid", *, dispatched: bool = False) -> ReqSt
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
-        dispatched=dispatched,
     )
 
 
@@ -359,19 +355,6 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
 
-    def test_batch_duplicate_preflight_does_not_insert_partial_state(self):
-        tm = _make_tokenizer_manager()
-        existing_rid = "existing"
-        existing_state = _make_req_state(existing_rid)
-        tm.rid_to_state[existing_rid] = existing_state
-        obj = _make_generate_obj(["new", existing_rid], is_single=False)
-
-        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
-            tm._init_req_state(obj)
-
-        self.assertNotIn("new", tm.rid_to_state)
-        self.assertIs(tm.rid_to_state[existing_rid], existing_state)
-
 
 class TestResubmitAfterCompletion(CustomTestCase):
     """End-to-end test: complete a request, then resubmit with the same rid."""
@@ -477,15 +460,12 @@ class TestDiscardPendingReqStates(CustomTestCase):
     def test_discard_single(self):
         tm = _make_tokenizer_manager(self)
         rid = "d_single"
-        tm.rid_to_state[rid] = _make_req_state(rid, dispatched=True)
+        tm.rid_to_state[rid] = _make_req_state(rid)
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid
         tm._discard_pending_req_states(obj)
         self.assertNotIn(rid, tm.rid_to_state)
-        abort_req = tm._dispatch_to_scheduler.call_args.args[0]
-        self.assertEqual(abort_req.rid, rid)
-        self.assertFalse(abort_req.abort_all)
 
     def test_discard_batch_removes_all(self):
         tm = _make_tokenizer_manager(self)
@@ -498,7 +478,6 @@ class TestDiscardPendingReqStates(CustomTestCase):
         tm._discard_pending_req_states(obj)
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
-        tm._dispatch_to_scheduler.assert_not_called()
 
     def test_discard_ignores_already_removed(self):
         """Popping a rid that is no longer present must not raise."""
@@ -591,7 +570,6 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # Got past _init_req_state (which created the entry) ...
         tm._tokenize_one_request.assert_awaited_once()
         tm._send_one_request.assert_not_called()
-        tm._dispatch_to_scheduler.assert_not_called()
         # ... and the entry was cleaned up rather than leaked.
         self.assertNotIn(rid, tm.rid_to_state)
 
