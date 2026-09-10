@@ -113,7 +113,8 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 ### Version history
 
 ```bash
-2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3; + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patch 02). branch: dsv4.1-lkmoe / dsv4.1-lkmoe-sm80plus
+2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patches 01+02). branch: dsv4.1-lkmoe-sm80plus
+2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3, pure lk_moe (patch 01). branch: dsv4.1-lkmoe
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+ support
 2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types, e.g. nvidia/GLM-5.2-NVFP4
 2026-07-05: Lsglang-v1.4.0 - GPU prefill speed, CPU AVX512 opt, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, sglang v0.5.14
