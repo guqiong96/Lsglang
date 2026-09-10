@@ -307,11 +307,20 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
+        # lk embedding tables (e.g. the huge n-gram oe_embeder) are kept
+        # resident on CPU / NUMA host memory and gathered via lk_moe, so
+        # allocate them on CPU instead of the (GPU) target_device context.
+        if getattr(layer, "is_lk_embedding", False):
+            device = "cpu"
+            layer.is_gpu_resident_layer = False
+        else:
+            device = None
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -327,7 +336,30 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
 
+    def _embedding_lk(
+        self, layer: torch.nn.Module, input_: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather via lk_moe LKEmbedding (CPU-resident table, graph-capturable).
+        ``input_`` holds GPU token ids masked to the local shard. Output goes to
+        a pre-allocated fixed GPU buffer so the decode CUDA graph can capture
+        the D2H / host-function / H2D sequence.
+        """
+        input_c = input_.contiguous()
+        qlen = input_c.numel()
+        layer.lk_embeder.decode(
+            torch.cuda.current_stream().cuda_stream,
+            qlen,
+            input_c.data_ptr(),
+            layer.lk_output_gpu.data_ptr(),
+        )
+        # input_ is [n_grams, seq_len] (2D); restore the same leading shape.
+        return layer.lk_output_gpu[:qlen].view(*input_.shape, -1)
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "is_lk_embedding", False) and getattr(
+            layer, "lk_embeder", None
+        ) is not None:
+            return self._embedding_lk(layer, input_)
         return F.embedding(input_, layer.weight)
 
 
@@ -523,6 +555,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         self.with_bias = with_bias
 
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
@@ -545,7 +581,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         else:
             w13_weight_data = torch.empty(
-                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype
+                num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype, device=device
             )
         w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
         layer.register_parameter("w13_weight", w13_weight)
@@ -553,7 +589,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -572,7 +608,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         else:
             w2_weight_data = torch.empty(
-                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype
+                num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype, device=device
             )
         w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
@@ -580,13 +616,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                torch.empty(num_experts, hidden_size, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         _should_use_aiter_moe = (
             _use_aiter
             and (

@@ -91,6 +91,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
+            
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
@@ -139,6 +144,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w13_up_dim,
                 hidden_size,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -151,6 +157,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 hidden_size,
                 w2_down_dim,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -163,10 +170,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, 2, dtype=torch.float32, device=device), requires_grad=False
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             weight_quant_method = FusedMoeWeightScaleSupported.TENSOR.value
         elif self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
@@ -176,11 +183,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     w13_up_dim,
                     1,
                     dtype=torch.float32,
+                    device=device,
                 ),
                 requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32),
+                torch.ones(num_experts, hidden_size, 1, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             weight_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
@@ -191,6 +199,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -200,6 +209,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
                     dtype=torch.float32,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -223,13 +233,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 "Only per-tensor quantization is supported for static input scales"
             )
             w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
             w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
@@ -238,6 +248,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:

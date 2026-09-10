@@ -1269,6 +1269,20 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return int(value)
     except ValueError:
         return default
+    
+def set_int_env_var(name: str, value: int):
+    os.environ[name] = str(value)
+
+
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 @contextmanager
@@ -4809,3 +4823,115 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+from typing import Optional
+
+def get_str_env_var(var_name: str, default: str = None) -> str:
+    return os.getenv(var_name, default) 
+
+def is_lk_moe_feature_enabled() -> bool:
+    return get_bool_env_var("LVLLM_MOE_NUMA_ENABLED")
+
+def is_numa_interleave_enabled() -> bool:
+    return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
+ 
+# Whether to keep the (very large) n-gram embedding table resident on CPU /
+# NUMA host memory and gather it via lk_moe, instead of VRAM. Defaults to the
+# original GPU-resident behavior.
+def is_lk_embedding_cpu_enabled() -> bool:
+    return get_bool_env_var("LVLLM_EMBEDDING_NUMA_ENABLED")
+
+def is_lk_moe_use_gpu_prefill() -> bool:
+    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
+
+def disable_lk_moe_gpu_prefill() -> int:
+    origin_value = get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE")
+    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", 0)
+    return origin_value
+
+def enable_lk_moe_gpu_prefill(value: int) -> int:
+    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", value)
+    return value
+
+_is_in_profile_run = True
+
+def is_in_profile_run(): 
+    return _is_in_profile_run
+
+def set_profile_run(status: bool): 
+    global _is_in_profile_run
+    _is_in_profile_run = status
+
+def get_gpu_prefill_min_batch_size() -> int:
+    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") 
+
+
+def get_gpu_prefetch_window() -> int:
+    return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
+
+
+def get_model_type_from_layer_name(layer_name: str) -> str:
+    if not layer_name:
+        return "main"
+    
+    if layer_name.startswith('stages.'):
+        return "dspark"
+    
+    if layer_name.startswith('model.layers.'):
+        return "main"
+    
+    return "main"
+
+def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
+    if model_type == "dspark":
+        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK", None)
+        if env_value is not None:
+            return env_value
+        
+        return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+    
+    return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+
+def is_lk_moe_gpu_prefill_layer(layer_id: str, model_type: str = "main") -> bool:
+    return (is_lk_moe_use_gpu_prefill() and 
+            not is_lk_moe_gpu_resident_layer(layer_id, model_type))
+    
+def is_lk_moe_cpu_layer(layer_id: str, model_type: str = "main") -> bool:
+    return (is_lk_moe_feature_enabled() and 
+            not is_lk_moe_gpu_resident_layer(layer_id, model_type) and 
+            not is_lk_moe_gpu_prefill_layer(layer_id, model_type))
+    
+def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
+    if not is_lk_moe_feature_enabled():
+        return True
+     
+    disabled_layers_env = get_gpu_resident_env_var(model_type)
+    if not disabled_layers_env:
+        return False   
+    
+    disabled_layers_env = disabled_layers_env.strip()
+    
+    disabled_layers = set()
+    for part in disabled_layers_env.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        
+        if '-' in part:
+            try:
+                start, end = map(int, part.split('-')) 
+                if start <= end:
+                    disabled_layers.update(range(start, end + 1))
+            except ValueError: 
+                continue
+        else:
+            try:
+                disabled_layers.add(int(part))
+            except ValueError: 
+                continue
+     
+    return layer_id in disabled_layers
+
+def enabled_layerwise_load() -> bool:
+    return get_bool_env_var("LVLLM_ENABLE_MOE_LAYERWISE_LOAD")
+

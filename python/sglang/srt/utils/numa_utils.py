@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
+
+    from sglang.srt.utils.common import is_numa_interleave_enabled, is_lk_moe_feature_enabled
+
+    if is_lk_moe_feature_enabled():
+        if is_numa_interleave_enabled():
+            executable, debug_str = _create_numactl_executable(
+                numactl_args="--interleave=all"
+            )
+            with _mp_set_executable(executable=executable, debug_str=debug_str):
+                yield
+                return
+        yield
+        return
+
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:

@@ -6,6 +6,7 @@ from sglang.kernels.ops.speculative.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import is_lk_embedding_cpu_enabled
 
 
 class NgramEmbedding(torch.nn.Module):
@@ -29,6 +30,15 @@ class NgramEmbedding(torch.nn.Module):
         self.over_embedding_n = over_embedding_n
         self.eos_token_id = eos_token_id
 
+        # Keep the (huge) oe_embeder table CPU/NUMA resident and gather via
+        # lk_moe instead of VRAM. Defaults off -> original GPU behavior.
+        self.use_lk_embedding = is_lk_embedding_cpu_enabled()
+        self.lk_embeder = None
+        self.lk_output_gpu = None
+        self.oe_hidden_dim = embedding_dim // (
+            (over_embedding_n - 1) * over_embedding_k
+        )
+
         use_attn_tp_group = is_dp_attention_enabled()
         self.word_embeder = VocabParallelEmbedding(
             num_embeddings,
@@ -51,6 +61,7 @@ class NgramEmbedding(torch.nn.Module):
             num_embeddings=int(self.exclusive_oe_embedder_size_sums[-1]),
             embedding_dim=oe_hidden_dim,
             use_attn_tp_group=use_attn_tp_group,
+            is_lk_embedding=self.use_lk_embedding,
         )
 
         self.oe_projection = nn.Parameter(
@@ -90,6 +101,18 @@ class NgramEmbedding(torch.nn.Module):
         self.exclusive_req_len_sums = torch.zeros(
             max_running_requests + 1, dtype=torch.int32, device=device
         )
+        if self.use_lk_embedding:
+            # Fixed-address GPU output buffer for lk gather (graph-capturable).
+            self.lk_output_gpu = torch.empty(
+                [max_tokens * self.n_grams, self.oe_hidden_dim],
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            # Hand the CPU-resident oe_embeder table to lk_moe and drop the
+            # torch reference; runs here because max_tokens (hence the lk
+            # decode buffer size) is only known after buffers are sized.
+            self.process_weights_after_loading()
+            self.clean_weights_after_loading()
 
     def load_weight(
         self, param: Parameter, weight_name: str, loaded_weight: torch.Tensor
@@ -130,6 +153,49 @@ class NgramEmbedding(torch.nn.Module):
             self.oe_projection[index].copy_(loaded_weight.data.t())
         else:
             assert False, f"Unknown ngram embedding weight name: {weight_name}"
+
+    def process_weights_after_loading(self):
+        """Hand the CPU-resident oe_embeder table to lk_moe's LKEmbedding and
+        pin it for GPU access. Called after all weights are loaded."""
+        if not self.use_lk_embedding or self.lk_embeder is not None:
+            return
+        import lk_moe
+
+        from sglang.srt.runtime_context import get_parallel
+        parallel = get_parallel() 
+ 
+        if self.oe_embeder.use_attn_tp_group:
+            num_processes = parallel.attn_tp_size
+            process_id = parallel.attn_tp_rank
+        else:
+            num_processes = parallel.tp_size
+            process_id = parallel.tp_rank
+
+        cfg = lk_moe.EmbeddingConfigV2()
+        cfg.num_processes = num_processes
+        cfg.process_id = process_id
+        cfg.gpu_id = torch.cuda.current_device()
+        cfg.num_embeddings = self.oe_embeder.num_embeddings_per_partition
+        cfg.embedding_dim = self.oe_hidden_dim
+        cfg.max_batch_size = self.lk_output_gpu.shape[0]
+
+        weight = self.oe_embeder.weight
+        self.lk_embeder = lk_moe.LKEmbedding(
+            cfg, weight.detach().cpu().contiguous().data_ptr()
+        )
+        self.lk_embeder.register_numa_weights()
+        # Expose the lk object on the VocabParallelEmbedding so its
+        # quant_method.embedding() can route the gather to lk_moe.
+        self.oe_embeder.lk_embeder = self.lk_embeder
+        self.oe_embeder.lk_output_gpu = self.lk_output_gpu
+
+    def clean_weights_after_loading(self):
+        """Drop the torch reference to the oe_embeder table; the data now lives
+        only in lk_moe's pinned NUMA host memory."""
+        if not self.use_lk_embedding or self.lk_embeder is None:
+            return
+        if hasattr(self.oe_embeder, "weight"):
+            del self.oe_embeder.weight
 
     def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
         if (

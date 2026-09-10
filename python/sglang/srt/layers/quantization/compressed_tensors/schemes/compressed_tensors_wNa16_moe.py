@@ -106,6 +106,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
@@ -118,6 +122,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 hidden_size // self.packed_factor,
                 2 * intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -130,6 +135,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 intermediate_size_per_partition // self.packed_factor,
                 hidden_size,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -164,6 +170,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_groups_w13,
                 2 * intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -171,7 +178,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype, device=device),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -179,12 +186,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_scale, {"load_full_w2": load_full_w2})
 
         w2_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, device=device), requires_grad=False
         )
         layer.register_parameter("w2_weight_shape", w2_weight_shape)
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
         w13_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, device=device), requires_grad=False
         )
 
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
@@ -221,6 +228,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -232,6 +240,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -243,6 +252,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -254,6 +264,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -280,6 +291,9 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
