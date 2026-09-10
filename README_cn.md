@@ -127,7 +127,7 @@ MiniMax-M2.7/2.5/2.1、GLM-5.2-NVFP4、GLM-5.1/5.0-FP8、GLM-4.7(-Flash)/4.6V、
 运行时支持的量化格式：bfloat16 / float16、fp8、nvfp4、mxfp4、awq 4bit 对称量化（`w4a16`）。
 AWQ 模型：https://hf-mirror.com/cyankiwi
 
-### 快速开始（DeepSeek V4 Flash [RTX 3090 *2 OR 5060Ti *2]）
+### 快速开始（DeepSeek V4 Flash [RTX 5060Ti *2]）
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID \

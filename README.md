@@ -134,7 +134,7 @@ GLM-5.1/5.0-FP8, GLM-4.7(-Flash)/4.6V, Kimi k2.6/k2.5, **deepseek-ai/DeepSeek-V4
 Quantization formats supported at runtime: bfloat16 / float16, fp8, nvfp4, mxfp4,
 awq 4bit symmetric (`w4a16`). AWQ models: https://hf-mirror.com/cyankiwi
 
-### Quick start (DeepSeek V4 Flash [RTX 3090 *2 OR 5060Ti *2])
+### Quick start (DeepSeek V4 Flash [RTX 5060Ti *2])
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
