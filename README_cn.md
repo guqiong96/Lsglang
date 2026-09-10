@@ -103,7 +103,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 ### 版本变更
 
 ```bash
-2026-09-10: Lsglang-v1.6.0 - sglang dsv4.1 + lk_moe v2.4.3（分支: dsv4.1-lkmoe）
+2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3（分支: dsv4.1-lkmoe）
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+支持
 2026-07-08: Lsglang-v1.4.1 - 新增 ModelOpt W4A16 NVFP4 量化类型支持，例如：nvidia/GLM-5.2-NVFP4
 2026-07-05: Lsglang-v1.4.0 - 优化GPU预填充速度，CPU AVX512优化，取消LVLLM_GPU_RESIDENT_MOE_EXPERTS, 更新sglang v0.5.14
