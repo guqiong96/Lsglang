@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.common import is_sm80_supported
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,8 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
             and (
-                get_platform().is_sm90
+                is_sm80_supported()
+                or get_platform().is_sm90
                 or get_platform().is_sm100
                 or get_platform().is_sm120
             )

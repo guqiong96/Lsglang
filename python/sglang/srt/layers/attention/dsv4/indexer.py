@@ -15,6 +15,8 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
@@ -27,6 +29,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
+)
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    _e4m3_uint8_to_f32,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -54,6 +59,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils.common import is_sm80_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -94,6 +100,8 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
@@ -138,6 +146,288 @@ def fp8_paged_mqa_logits_torch(
         scores = scores[:, :max_seq_len]
 
     return scores
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_rowwise_kernel(
+    q_ptr,
+    kv_ptr,
+    scale_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    token_start,
+    num_rows: tl.constexpr,
+    logits_width: tl.constexpr,
+    next_n: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    stride_qb: tl.constexpr,
+    stride_qn: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kvb: tl.constexpr,
+    stride_kvs: tl.constexpr,
+    stride_kvd: tl.constexpr,
+    stride_sb: tl.constexpr,
+    stride_ss: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wh: tl.constexpr,
+    stride_clb: tl.constexpr,
+    stride_cln: tl.constexpr,
+    stride_btb: tl.constexpr,
+    stride_btk: tl.constexpr,
+    stride_lm: tl.constexpr,
+    stride_ln: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Per-row paged-MQA logits kernel (SM80/SM86 Ampere).
+
+    Ported from vllm-ds4 `_fp8_paged_mqa_logits_rowwise_kernel`
+    (vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py:316). Each program
+    handles one logical row (``batch * next_n + q_pos``) across a
+    ``BLOCK_N``-wide window of token positions, and masks to each row's live
+    ``context_len``. Ampere has no fp8 tensor cores, so Q/K are loaded as
+    uint8 and decoded to f32 via ``_e4m3_uint8_to_f32``, and the dot runs at
+    ``input_precision="tf32"``. This replaces the pure-torch
+    ``fp8_paged_mqa_logits_torch`` which dequantizes the ENTIRE padded cache
+    on every decode step.
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_local_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = token_start + offs_local_n
+    offs_d = tl.arange(0, BLOCK_D)
+
+    valid_row = row < num_rows
+    valid_n = offs_local_n < logits_width
+    batch = row // next_n
+    q_pos = row - batch * next_n
+    context_len = tl.load(
+        context_lens_ptr + batch * stride_clb + q_pos * stride_cln,
+        mask=valid_row,
+        other=0,
+    )
+    if token_start + pid_n * BLOCK_N >= context_len:
+        logits = tl.full((BLOCK_N,), float("-inf"), dtype=tl.float32)
+        tl.store(
+            logits_ptr + row * stride_lm + offs_local_n * stride_ln,
+            logits,
+            mask=valid_row & valid_n,
+        )
+        return
+    context_mask = valid_n & (offs_n < context_len)
+
+    block_rank = offs_n // block_size
+    block_offset = offs_n - block_rank * block_size
+    block_idx = tl.load(
+        block_tables_ptr + batch * stride_btb + block_rank * stride_btk,
+        mask=valid_row & context_mask,
+        other=0,
+    )
+
+    scale = tl.load(
+        scale_ptr + block_idx * stride_sb + block_offset * stride_ss,
+        mask=context_mask,
+        other=0.0,
+    )
+    logits = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for h0 in tl.range(0, num_heads, BLOCK_H):
+        heads = h0 + tl.arange(0, BLOCK_H)
+        valid_h = heads < num_heads
+        scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
+        for d0 in tl.range(0, head_dim, BLOCK_D):
+            d = d0 + offs_d
+            q = _e4m3_uint8_to_f32(
+                tl.load(
+                    q_ptr
+                    + batch * stride_qb
+                    + q_pos * stride_qn
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+            )
+            k = _e4m3_uint8_to_f32(
+                tl.load(
+                    kv_ptr
+                    + block_idx[None, :] * stride_kvb
+                    + block_offset[None, :] * stride_kvs
+                    + d[:, None] * stride_kvd,
+                    mask=context_mask[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+            )
+            scores += tl.dot(q, k, input_precision="tf32")
+
+        weighted = tl.maximum(scores * scale[None, :], 0.0)
+        weight = tl.load(
+            weights_ptr + row * stride_wm + heads * stride_wh,
+            mask=valid_row & valid_h,
+            other=0.0,
+        )
+        logits += tl.sum(weighted * weight[:, None], axis=0)
+
+    logits = tl.where(context_mask & valid_row, logits, float("-inf"))
+    tl.store(
+        logits_ptr + row * stride_lm + offs_local_n * stride_ln,
+        logits,
+        mask=valid_row & valid_n,
+    )
+
+
+def _view_packed_fp8_paged_mqa_kv_cache(
+    kv_cache: torch.Tensor,
+    head_dim: int,
+):
+    """Return FP8 values and fp32 scales from indexer cache block storage.
+
+    Ported from vllm-ds4 ``_view_packed_fp8_paged_mqa_kv_cache``
+    (sm12x_mqa.py:13). Parses a ``(num_blocks, block_size, head_dim_with_scale)``
+    (or 4D with a leading KV-head dim) uint8 cache into ``kv_values``
+    ``(num_blocks, block_size, 1, head_dim)`` fp8 and ``kv_scale``
+    ``(num_blocks, block_size)`` fp32 (one scale per token).
+    """
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 kv_cache, got {kv_cache.dtype}")
+    if kv_cache.dim() == 3:
+        num_blocks, block_size, head_dim_with_scale = kv_cache.shape
+        num_kv_heads = 1
+    elif kv_cache.dim() == 4:
+        num_blocks, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
+    else:
+        raise ValueError(
+            f"Expected 3D or 4D kv_cache, got {kv_cache.dim()} dimensions"
+        )
+    if num_kv_heads != 1:
+        raise ValueError(f"Expected one KV head, got {num_kv_heads}")
+
+    scale_bytes = head_dim_with_scale - head_dim
+    if scale_bytes <= 0 or scale_bytes % torch.float32.itemsize != 0:
+        raise ValueError(
+            "Expected kv_cache last dimension to contain FP8 values followed "
+            f"by fp32 scale bytes; got head_dim={head_dim}, "
+            f"last_dim={head_dim_with_scale}"
+        )
+
+    scale_elems = scale_bytes // torch.float32.itemsize
+    # The indexer cache is stored block-major (fp8 region then scale region):
+    #   page b = [ token 0..block_size-1 fp8 (block_size*head_dim bytes) |
+    #              token 0..block_size-1 fp32 scales (block_size*4 bytes) ].
+    # The caller hands us a 4D ``(num_blocks, block_size, 1, head_dim+4)`` view
+    # (a per-token "interleaved" reinterpretation). Do NOT rely on
+    # ``torch.as_strided(...).view(torch.float32)`` for the scale: with
+    # ``scale_bytes=4`` the as_strided inner stride maps each token's 4 scale
+    # bytes as contiguous, and ``.view(fp32)`` re-interprets the storage_offset
+    # (in uint8 bytes) as fp32 elements, silently reading garbage. Instead
+    # flatten back to the real block-major pages and slice the fp8 / scale
+    # regions directly.
+    kv_cache_pages = kv_cache.reshape(num_blocks, block_size * (head_dim + scale_bytes))
+    kv_values = (
+        kv_cache_pages[:, : block_size * head_dim]
+        .view(torch.float8_e4m3fn)
+        .reshape(num_blocks, block_size, 1, head_dim)
+    )
+    kv_scale = (
+        kv_cache_pages[:, block_size * head_dim :]
+        .view(torch.float32)
+        .reshape(num_blocks, block_size, 1, scale_elems)
+    )
+    return kv_values, kv_scale
+
+
+def fp8_paged_mqa_logits_rowwise_triton(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """SM80/SM86 rowwise paged-MQA logits (Triton, live-context only).
+
+    Replaces the pure-torch ``fp8_paged_mqa_logits_torch`` on Ampere, which
+    dequantized and bmm'd over the entire padded C4 cache every decode step.
+    This kernel only computes logits up to each row's live ``context_len``
+    (early-exit programs beyond it), so decode cost stays proportional to the
+    actual sequence length instead of the padded ``max_c4_seq_len`` budget.
+
+    Pre-condition: ``head_dim % 64 == 0`` and ``num_heads % 4 == 0`` so the
+    ``tl.dot`` lands on tensor-core-friendly tiles (DSV4-Flash:
+    head_dim=128, num_heads=64). Mirrors vllm-ds4
+    ``fp8_paged_mqa_logits_rowwise_triton`` (sm12x_mqa.py:447).
+    """
+    _ = deep_gemm_metadata
+    batch_size, next_n, num_heads, head_dim = q_fp8.shape
+    kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kvcache_fp8, head_dim)
+    _, block_size, _, _ = kv_values.shape
+    q = q_fp8.view(torch.uint8)
+    kv_values = kv_values.view(torch.uint8)
+    num_rows = batch_size * next_n
+    token_count = max_seq_len
+    logits = torch.empty(
+        (num_rows, token_count),
+        device=q_fp8.device,
+        dtype=torch.float32,
+    )
+    if num_rows == 0 or token_count == 0:
+        return logits
+
+    if seq_lens.dim() > 1:
+        context_lens = seq_lens.squeeze(-1)
+    else:
+        context_lens = seq_lens
+    context_lens_2d = context_lens.reshape(batch_size, -1)
+    if context_lens_2d.shape[1] == 1 and next_n != 1:
+        context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
+    block_n = 128
+    grid = (num_rows, triton.cdiv(token_count, block_n))
+    _fp8_paged_mqa_logits_rowwise_kernel[grid](
+        q,
+        kv_values,
+        kv_scale,
+        weight,
+        context_lens_2d,
+        page_table,
+        logits,
+        0,
+        num_rows,
+        token_count,
+        next_n,
+        num_heads,
+        head_dim,
+        block_size,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        kv_values.stride(0),
+        kv_values.stride(1),
+        kv_values.stride(3),
+        kv_scale.stride(0),
+        kv_scale.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        context_lens_2d.stride(0),
+        context_lens_2d.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_D=64,
+        BLOCK_H=8,
+        num_warps=4,
+    )
+    return logits
 
 
 def _aiter_fp8_paged_mqa_logits(
@@ -771,6 +1061,8 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if get_platform().is_sm120:
                 fn = fp8_paged_mqa_logits_torch_sm120
+            elif is_sm80_supported():
+                fn = fp8_paged_mqa_logits_rowwise_triton
             else:
                 fn = fp8_paged_mqa_logits_torch
         elif is_xpu():

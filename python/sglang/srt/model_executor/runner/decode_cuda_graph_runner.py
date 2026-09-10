@@ -91,6 +91,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (
+    _set_capture_c128_width,
     _set_capture_dsa_variant,
     _set_capture_lora_variant,
     model_capture_mode,
@@ -154,6 +155,7 @@ def build_replay_fb_view(
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
+    c128_width: Optional[int] = None,
 ) -> SimpleNamespace:
     """Construct a ForwardBatch-like view for backend replay-side init.
 
@@ -203,6 +205,7 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        c128_width=c128_width,
     )
 
 
@@ -301,6 +304,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
+        self.c128_bucket_widths: list = []
+        self.enable_c128_buckets = False
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -358,6 +363,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     "Candidate indexer graph limits: %s; use full filtering above %s.",
                     self.candidate_graph_limits,
                     span,
+                )
+
+        # c128 multi-bucket decode graphs: the DSV4 backend declares a list of
+        # candidate widths. When >1 and this is a pure decode runner (not a
+        # draft/verify/dllm runner, which keep c128_width=None everywhere),
+        # capture one decode graph per width and dispatch at replay on the
+        # current max seq_len so short contexts don't pay the (large) full-width
+        # c128 candidate cost.
+        _attn = self.attn_backend
+        if (
+            _attn is not None
+            and getattr(_attn, "_c128_topk_buckets", None)
+            and self.capture_forward_mode == ForwardMode.DECODE
+        ):
+            self.c128_bucket_widths = list(_attn._c128_topk_buckets)
+            self.enable_c128_buckets = len(self.c128_bucket_widths) > 1
+            if self.enable_c128_buckets:
+                logger.info(
+                    "[c128-bucket] enabling multi-bucket decode graphs: %s",
+                    self.c128_bucket_widths,
                 )
 
         # --- bucket sizes ---------------------------------------------
@@ -595,13 +620,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self, size, stream_idx=None, variant_label=None, dsa_variant=None, c128_width=None
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            c128_width=c128_width,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -638,6 +664,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # No length info: be safe and use the correct-for-all sparse graph.
             return "sparse"
         return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
+
+    def _resolve_c128_width(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Pick the c128 candidate width for the current batch's max seq_len.
+
+        The required width is ceil(seq_len / 128) aligned to 64. We select the
+        smallest pre-captured bucket >= required (the largest bucket always
+        covers max_total_tokens, so it never runs out).
+        """
+        if not self.enable_c128_buckets:
+            return None
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            max_seq_len = int(seq_lens_cpu.max().item())
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+            max_seq_len = int(forward_batch.seq_lens.max().item())
+        else:
+            max_seq_len = 0
+        required = (max_seq_len // 128 + 63) // 64 * 64
+        for w in self.c128_bucket_widths:
+            if w >= required:
+                return w
+        return self.c128_bucket_widths[-1]
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
@@ -1169,6 +1217,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if getattr(self, "candidate_filter_span", None) is not None:
             dsa_variants = [variant for variant, _ in self.candidate_graph_limits]
             dsa_variants.append("candidate_filtered")
+
+        # c128 multi-bucket widths to capture (or [None] when inactive).
+        c128_widths = (
+            self.c128_bucket_widths
+            if getattr(self, "enable_c128_buckets", False)
+            else [None]
+        )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1184,21 +1239,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
-                        else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
-                            )
+                    for c128_width in c128_widths:
+                        _set_capture_c128_width(c128_width)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if dsa_variant is None and c128_width is None:
+                                # Draft/extend subclasses override capture_one_shape
+                                # with (size, forward, stream_idx, variant_label) and
+                                # always run here; call without the extra args.
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label
+                                )
+                            elif c128_width is None:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label, dsa_variant
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    dsa_variant,
+                                    c128_width,
+                                )
         _set_capture_dsa_variant(None)
+        _set_capture_c128_width(None)
 
     def capture_one_shape(
         self,
@@ -1207,6 +1277,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
+        c128_width: Optional[int] = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1296,6 +1367,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    c128_width,
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1366,9 +1438,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
+            c128_width = self._resolve_c128_width(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key, stream_idx, variant_label, dsa_variant, c128_width
             )
             return
 
@@ -1436,6 +1509,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
         attn_backend = self._replay_attn_backend()
+        # Resolve the c128 bucket width once, before metadata init, so the
+        # backend bakes/narrows the same width the graph was captured with.
+        c128_width = self._resolve_c128_width(forward_batch)
         fb_view = build_replay_fb_view(
             forward_batch=forward_batch,
             buffers=buffers,
@@ -1445,6 +1521,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
+            c128_width=c128_width,
         )
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
@@ -1488,7 +1565,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key, stream_idx, variant_label, dsa_variant, c128_width
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

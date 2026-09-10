@@ -210,6 +210,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -287,6 +288,14 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
 
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
+
+# SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
+# and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
+# RoPE (see deepseek_v4_wo_a_einsum.py). Lazy (not module-level): the probes
+# cache on the import-time current_device, which mis-dispatches ranks in
+# mixed-arch TP (SM86 + SM120).
+def _IS_SM8() -> bool:
+    return is_sm80_supported() and not is_sm120_supported()
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -454,7 +463,12 @@ if _is_hip:
 
 
 def _apply_wo_a_bf16_matmul(
-    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+    o: torch.Tensor,
+    wo_a: torch.Tensor,
+    is_decode: bool,
+    fuse_inv_rope: bool = False,
+    freqs_cis: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
@@ -462,6 +476,19 @@ def _apply_wo_a_bf16_matmul(
     ROCm decode can use aiter batched GEMM; its first runtime failure disables
     that path for the process. Other cases use torch.einsum.
     """
+    if fuse_inv_rope:
+        from sglang.srt.models.deepseek_v4_wo_a_einsum import (
+            wo_a_bf16_einsum_with_rope,
+        )
+
+        return wo_a_bf16_einsum_with_rope(
+            o,
+            wo_a,
+            is_decode=is_decode,
+            freqs_cis=freqs_cis,
+            positions=positions,
+        )
+
     global _wo_a_aiter_batched_gemm_disabled
     if (
         is_decode
@@ -1974,6 +2001,10 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        # On SM8 decode, the inverse RoPE is fused into the wo_a bf16 einsum
+        # below (skip the standalone pass; keep `o` roped). Prefill and non-SM8
+        # still apply it here as usual.
+        fuse_wo_a_rope = _IS_SM8() and forward_batch.forward_mode.is_decode()
         if (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
@@ -2006,7 +2037,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            else:
+            elif not fuse_wo_a_rope:
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,
@@ -2065,7 +2096,12 @@ class MQALayer(MqaAttentionBase):
                 if wo_a_weight is not None:
                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                     o = _apply_wo_a_bf16_matmul(
-                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                        o,
+                        wo_a,
+                        is_decode=forward_batch.forward_mode.is_decode(),
+                        fuse_inv_rope=fuse_wo_a_rope,
+                        freqs_cis=self.freqs_cis if fuse_wo_a_rope else None,
+                        positions=positions if fuse_wo_a_rope else None,
                     )
                 else:
                     o = _apply_gguf_grouped_wo_a(

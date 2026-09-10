@@ -259,63 +259,65 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
+# Per-device capability lookup so the arch probes below can key on the
+# *current* device rather than a single import-time global. In a heterogeneous
+# TP group (e.g. mixed SM86 + SM120, CUDA_VISIBLE_DEVICES=0,1,2,3) the current
+# device at module import is whatever cuda:0 happens to be, so a global
+# lru_cache would cache one rank's arch for every rank and mis-dispatch the
+# DSV4 decode kernel on the others. Keying on current_device() lets each rank
+# resolve correctly once it has set_device(gpu_id).
+@lru_cache(maxsize=16)
+def _cuda_device_capability_major(device_id: int) -> int:
+    return torch.cuda.get_device_capability(device_id)[0]
+
+
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
 ):
     if not is_cuda():
         return False
+    device_id = torch.cuda.current_device()
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        _cuda_device_capability_major(device_id) in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
-    )
-)
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
-    )
-)
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-    )
-)
+def is_ampere_with_cuda_12_3():
+    return _check_cuda_device_version([8], (12, 3))
+
+
+def is_hopper_with_cuda_12_3():
+    return _check_cuda_device_version([9], (12, 3))
+
+
+def is_blackwell_supported():
+    return _check_cuda_device_version([10, 11, 12], (12, 8))
+
+
+is_blackwell = is_blackwell_supported
+
+
+def is_sm120_supported():
+    return _check_cuda_device_version([12], (12, 8))
+
+
+def is_sm100_supported():
+    return _check_cuda_device_version([10], (12, 8))
+
+
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
-    )
-)
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
-    )
-)
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
+def is_sm100_or_sm110_supported():
+    return _check_cuda_device_version([10, 11], (12, 8))
+
+
+def is_sm80_supported():
+    return _check_cuda_device_version([8], (11, 0))
+
+
+def is_sm90_supported():
+    return _check_cuda_device_version([9], (12, 3))
 
 
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
