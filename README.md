@@ -137,26 +137,32 @@ awq 4bit symmetric (`w4a16`). AWQ models: https://hf-mirror.com/cyankiwi
 ### Quick start (DeepSeek V4 Flash [RTX 3090 *2 OR 5060Ti *2])
 
 ```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=1,2 \
 LVLLM_MOE_NUMA_ENABLED=1 \
 LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 \
-OMP_NUM_THREADS=44 \
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
-LVLLM_GPU_PREFETCH_WINDOW=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_ENABLE_MOE_LAYERWISE_LOAD=1 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+LK_POWER_SAVING=1 \
 python -m sglang.launch_server \
     --model /home/guqiong/Downloads/DeepSeek-V4-Flash-0731 \
-    --served-model-name DeepSeek-V4-Flash \
+    --served-model-name DeepSeek-V4-Flash-0731 \
     --host 0.0.0.0 --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
-    --chunked-prefill-size 32000 \
-    --max-total-tokens 66000 \
-    --mem-fraction-static 0.90 \
-    --disable-shared-experts-fusion
+    --chunked-prefill-size 4096 \
+    --max-total-tokens 36000 \
+    --mem-fraction-static 0.95 \
+    --tool-call-parser deepseekv4 \
+    --cuda-graph-backend-prefill disabled \
+    --disable-shared-experts-fusion \
+    --speculative-algo DSPARK \
+    --speculative-dspark-block-size 5
 ```
 
 ### Configuration parameters
