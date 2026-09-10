@@ -38,6 +38,45 @@ At TP=4 the FlashInfer **CUTLASS** MXFP4 MoE path needs `intermediate % 128 == 0
 If it trips, use `--moe-runner-backend flashinfer_trtllm` (auto-pads) or `marlin`,
 or keep MoE off pure-TP (EP / TP=2). Upstream constraint, not a regression.
 
+## Launch — DeepSeek-V4.1-Flash (SM86, reference)
+
+**~30 t/s decode** — Test environment: Dual EPYC 7642, 16-channel DDR4 3200, Dual RTX 3090 (SM86, TP=2).
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,3 \
+SGLANG_SKIP_P2P_CHECK=1 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=48 \
+LK_POWER_SAVING=1 \
+OMP_NUM_THREADS=1 \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+sglang serve \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --served-model-name DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 \
+  --port 8070 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --max-running-requests 2 \
+  --max-total-tokens 80000 \
+  --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.95 \
+  --cuda-graph-backend-prefill disabled \
+  --disable-shared-experts-fusion \
+  --speculative-algo DSPARK \
+  --speculative-dspark-block-size 5 \
+  --speculative-attention-mode decode
+```
+
+Adjust `--model` path, `CUDA_VISIBLE_DEVICES` and `LK_THREADS` to your host.
+
 ## Additional support branches (v0.5.19 series)
 
 ### DeepSeek V4 (SM80+)
