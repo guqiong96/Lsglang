@@ -9,7 +9,7 @@ index ac73d329f..4d7713d00 100755
 -name = "sglang"
 -dynamic = ["version"]
 +name = "lsglang"
-+version = "1.5.0"
++version = "1.5.1"
  description = "SGLang is a fast serving framework for large language models and vision language models."
  readme = "README.md"
  requires-python = ">=3.10"
