@@ -48,7 +48,6 @@ CUDA_VISIBLE_DEVICES=0,3 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
 LVLLM_MOE_NUMA_ENABLED=1 \
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
@@ -58,7 +57,7 @@ LK_POWER_SAVING=1 \
 OMP_NUM_THREADS=1 \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 sglang serve \
-  --model /path/to/DeepSeek-V4.1-Flash \
+  --model ~/Models/DeepSeek-V4.1-Flash \
   --served-model-name DeepSeek-V4.1-Flash \
   --host 0.0.0.0 \
   --port 8070 \
@@ -69,13 +68,16 @@ sglang serve \
   --chunked-prefill-size 8192 \
   --mem-fraction-static 0.95 \
   --cuda-graph-backend-prefill disabled \
-  --disable-shared-experts-fusion \
-  --speculative-algo DSPARK \
-  --speculative-dspark-block-size 5 \
-  --speculative-attention-mode decode
+  --disable-shared-experts-fusion
 ```
 
 Adjust `--model` path, `CUDA_VISIBLE_DEVICES` and `LK_THREADS` to your host.
+
+One caveat: `LVLLM_GPU_RESIDENT_MOE_LAYERS` is left unset above, i.e. every expert layer
+stays CPU-resident — that is the ~30 t/s config measured. It is a **layer-index list, not a
+count**, so `=0` would make *layer 0* GPU-resident, and on SM80/86 that needs
+`--moe-runner-backend marlin` (the default `flashinfer_mxfp4` resolves to the TRT-LLM path,
+whose FP4 kernels are SM90+ only, so weight loading dies with `ValueError: Invalid backend: 86`).
 
 ## Additional support branches (v0.5.19 series)
 
