@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index ac73d329f..0903b11a6 100755
+index ac73d329f..4d7713d00 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -9,8 +9,8 @@ requires = [
@@ -17,7 +17,7 @@ index ac73d329f..0903b11a6 100755
    "sgl-deep-ep==0.1.2",
    "sgl-deep-gemm==0.1.7",
    "sglang-kernel==0.4.6.post1",
-+  "lk_moe==2.4.1",
++  "lk_moe==2.4.3",
    "smg-grpc-servicer>=0.5.0",
    "soundfile==0.13.1",
    "tiktoken",

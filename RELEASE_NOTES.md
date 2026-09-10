@@ -1,6 +1,6 @@
 # Release Notes — Lsglang-v1.6.0 (dsv4.1)
 
-**Base Version:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) + lk_moe v2.4.2
+**Base Version:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) + lk_moe v2.4.3
 **Branch:** `dsv4.1-lkmoe`
 **Release Type:** Feature integration release
 
