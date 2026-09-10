@@ -34,7 +34,7 @@ lk_moe 让 MOE 模型的占用横跨**显存 + 内存**，并在NUMA 感知下�
 ## 如何集成 lk_moe
 
 lk_moe 通过 `pip install lk_moe` 安装，它对外暴露少量 C++ 内核类（`MOE_WNA16`、
-`MOE_FP8`、`MOE_MXFP4`、`LKEmbedding` 等），由 `MOEConfigV2` 配置驱动。引擎内部处理专家权重放置
+`MOE_FP8`、`MOE_MXFP4` 等），由 `MOEConfigV2` 配置驱动。引擎内部处理专家权重放置
 （显存 / 钉住的 NUMA 主机内存）、NUMA 感知调度和量化内核执行。
 
 sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪些层留在 GPU、哪些走混合、
@@ -59,7 +59,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
    的 `MOE_*` 类并在 `forward` 中调用。
 4. **注册各量化内核** —— 每种量化方法暴露对应的 LK MoE 内核类。
 5. **处理权重加载/放置** —— 常驻 CPU 的权重不要放到 GPU 设备上。
-6. **（可选）扩展** —— CPU 常驻 embedding（`LKEmbedding`）与 NUMA 线程绑定。
+6. **（可选）扩展** —— NUMA 线程绑定。
 
 ### 集成案例 — Lsglang（sglang）逐文件
 
@@ -74,9 +74,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 | `srt/layers/moe/fused_moe_triton/layer.py` | **核心**：解析层角色、构造 `MOEConfigV2`、按量化实例化 `MOE_WNA16` / `MOE_FP8` / `MOE_MXFP4`，并在 `run_moe_core` 分发（GPU 常驻 → `quant_method.apply`；混合 → `_cpu_decode` / `_cpu_prefill` / `_gpu_prefill`） |
 | `srt/layers/quantization/{fp8,unquant,modelopt_quant,mxfp4_*}.py` | 每种量化方法注册其 LK MoE 内核（如 `MOE_FP8`、`MOE_MXFP4`） |
 | `srt/layers/quantization/compressed_tensors/schemes/*` | compressed-tensors 的 W8A8-FP8 / W4A4-NVFP4 / WNA16 MoE 各自注册 LK 内核 |
-| `srt/model_loader/loader.py` | 让 CPU 常驻层 / lk-embedding 不上 GPU 设备；为 lk_moe 层执行 `process_weights_after_loading` / `clean_weights_after_loading` |
-| `srt/layers/vocab_parallel_embedding.py` | `is_lk_embedding` 路径：通过 lk_moe 汇总到预分配的固定 GPU 缓冲（可 CUDA graph 捕获） |
-| `srt/layers/n_gram_embedding.py` | 把（巨大的）CPU 常驻 oe_embeder 表交给 `lk_moe.LKEmbedding`，随后释放 torch 引用 |
+| `srt/model_loader/loader.py` | 让 CPU 常驻 MoE 层不上 GPU 设备；为 lk_moe 层执行 `process_weights_after_loading` / `clean_weights_after_loading` |
 | `srt/utils/numa_utils.py` | 当 `LVLLM_ENABLE_NUMA_INTERLEAVE=1` 时，用 `numactl --interleave=all` 启动 worker |
 
 ### LvLLM（vllm）

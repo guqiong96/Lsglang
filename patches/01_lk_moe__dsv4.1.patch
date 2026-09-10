@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index ac73d329f..4d7713d00 100755
+index ac73d329f..852979c3a 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -9,8 +9,8 @@ requires = [
@@ -763,111 +763,6 @@ index a1f0e7f0f..6d59cf4be 100644
  
  @register_custom_op(out_shape="hidden_states")
  def moe_forward_piecewise_cuda_graph_impl(
-diff --git a/python/sglang/srt/layers/n_gram_embedding.py b/python/sglang/srt/layers/n_gram_embedding.py
-index 8d6fe33ef..66e55f21b 100644
---- a/python/sglang/srt/layers/n_gram_embedding.py
-+++ b/python/sglang/srt/layers/n_gram_embedding.py
-@@ -6,6 +6,7 @@ from sglang.kernels.ops.speculative.ngram_embedding import compute_n_gram_ids
- from sglang.srt.layers.dp_attention import is_dp_attention_enabled
- from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
- from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-+from sglang.srt.utils.common import is_lk_embedding_cpu_enabled
- 
- 
- class NgramEmbedding(torch.nn.Module):
-@@ -29,6 +30,15 @@ class NgramEmbedding(torch.nn.Module):
-         self.over_embedding_n = over_embedding_n
-         self.eos_token_id = eos_token_id
- 
-+        # Keep the (huge) oe_embeder table CPU/NUMA resident and gather via
-+        # lk_moe instead of VRAM. Defaults off -> original GPU behavior.
-+        self.use_lk_embedding = is_lk_embedding_cpu_enabled()
-+        self.lk_embeder = None
-+        self.lk_output_gpu = None
-+        self.oe_hidden_dim = embedding_dim // (
-+            (over_embedding_n - 1) * over_embedding_k
-+        )
-+
-         use_attn_tp_group = is_dp_attention_enabled()
-         self.word_embeder = VocabParallelEmbedding(
-             num_embeddings,
-@@ -51,6 +61,7 @@ class NgramEmbedding(torch.nn.Module):
-             num_embeddings=int(self.exclusive_oe_embedder_size_sums[-1]),
-             embedding_dim=oe_hidden_dim,
-             use_attn_tp_group=use_attn_tp_group,
-+            is_lk_embedding=self.use_lk_embedding,
-         )
- 
-         self.oe_projection = nn.Parameter(
-@@ -90,6 +101,18 @@ class NgramEmbedding(torch.nn.Module):
-         self.exclusive_req_len_sums = torch.zeros(
-             max_running_requests + 1, dtype=torch.int32, device=device
-         )
-+        if self.use_lk_embedding:
-+            # Fixed-address GPU output buffer for lk gather (graph-capturable).
-+            self.lk_output_gpu = torch.empty(
-+                [max_tokens * self.n_grams, self.oe_hidden_dim],
-+                dtype=torch.bfloat16,
-+                device=device,
-+            )
-+            # Hand the CPU-resident oe_embeder table to lk_moe and drop the
-+            # torch reference; runs here because max_tokens (hence the lk
-+            # decode buffer size) is only known after buffers are sized.
-+            self.process_weights_after_loading()
-+            self.clean_weights_after_loading()
- 
-     def load_weight(
-         self, param: Parameter, weight_name: str, loaded_weight: torch.Tensor
-@@ -131,6 +154,49 @@ class NgramEmbedding(torch.nn.Module):
-         else:
-             assert False, f"Unknown ngram embedding weight name: {weight_name}"
- 
-+    def process_weights_after_loading(self):
-+        """Hand the CPU-resident oe_embeder table to lk_moe's LKEmbedding and
-+        pin it for GPU access. Called after all weights are loaded."""
-+        if not self.use_lk_embedding or self.lk_embeder is not None:
-+            return
-+        import lk_moe
-+
-+        from sglang.srt.runtime_context import get_parallel
-+        parallel = get_parallel() 
-+ 
-+        if self.oe_embeder.use_attn_tp_group:
-+            num_processes = parallel.attn_tp_size
-+            process_id = parallel.attn_tp_rank
-+        else:
-+            num_processes = parallel.tp_size
-+            process_id = parallel.tp_rank
-+
-+        cfg = lk_moe.EmbeddingConfigV2()
-+        cfg.num_processes = num_processes
-+        cfg.process_id = process_id
-+        cfg.gpu_id = torch.cuda.current_device()
-+        cfg.num_embeddings = self.oe_embeder.num_embeddings_per_partition
-+        cfg.embedding_dim = self.oe_hidden_dim
-+        cfg.max_batch_size = self.lk_output_gpu.shape[0]
-+
-+        weight = self.oe_embeder.weight
-+        self.lk_embeder = lk_moe.LKEmbedding(
-+            cfg, weight.detach().cpu().contiguous().data_ptr()
-+        )
-+        self.lk_embeder.register_numa_weights()
-+        # Expose the lk object on the VocabParallelEmbedding so its
-+        # quant_method.embedding() can route the gather to lk_moe.
-+        self.oe_embeder.lk_embeder = self.lk_embeder
-+        self.oe_embeder.lk_output_gpu = self.lk_output_gpu
-+
-+    def clean_weights_after_loading(self):
-+        """Drop the torch reference to the oe_embeder table; the data now lives
-+        only in lk_moe's pinned NUMA host memory."""
-+        if not self.use_lk_embedding or self.lk_embeder is None:
-+            return
-+        if hasattr(self.oe_embeder, "weight"):
-+            del self.oe_embeder.weight
-+
-     def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
-         if (
-             forward_batch.forward_mode.is_extend()
 diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4_moe.py b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4_moe.py
 index c72443183..3fe0ce38f 100644
 --- a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4_moe.py
@@ -1570,62 +1465,10 @@ index 52503455e..68e56a7ae 100644
              check_moe_marlin_supports_layer,
          )
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 6c46caff7..557a458c9 100644
+index 6c46caff7..8651bcf65 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
-@@ -307,11 +307,20 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-         **extra_weight_attrs,
-     ):
-         """Create weights for embedding layer."""
-+        # lk embedding tables (e.g. the huge n-gram oe_embeder) are kept
-+        # resident on CPU / NUMA host memory and gathered via lk_moe, so
-+        # allocate them on CPU instead of the (GPU) target_device context.
-+        if getattr(layer, "is_lk_embedding", False):
-+            device = "cpu"
-+            layer.is_gpu_resident_layer = False
-+        else:
-+            device = None
-         weight = Parameter(
-             torch.empty(
-                 sum(output_partition_sizes),
-                 input_size_per_partition,
-                 dtype=params_dtype,
-+                device=device,
-             ),
-             requires_grad=False,
-         )
-@@ -327,7 +336,30 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-     ) -> torch.Tensor:
-         return F.linear(x, layer.weight, bias)
- 
-+    def _embedding_lk(
-+        self, layer: torch.nn.Module, input_: torch.Tensor
-+    ) -> torch.Tensor:
-+        """Gather via lk_moe LKEmbedding (CPU-resident table, graph-capturable).
-+        ``input_`` holds GPU token ids masked to the local shard. Output goes to
-+        a pre-allocated fixed GPU buffer so the decode CUDA graph can capture
-+        the D2H / host-function / H2D sequence.
-+        """
-+        input_c = input_.contiguous()
-+        qlen = input_c.numel()
-+        layer.lk_embeder.decode(
-+            torch.cuda.current_stream().cuda_stream,
-+            qlen,
-+            input_c.data_ptr(),
-+            layer.lk_output_gpu.data_ptr(),
-+        )
-+        # input_ is [n_grams, seq_len] (2D); restore the same leading shape.
-+        return layer.lk_output_gpu[:qlen].view(*input_.shape, -1)
-+
-     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-+        if getattr(layer, "is_lk_embedding", False) and getattr(
-+            layer, "lk_embeder", None
-+        ) is not None:
-+            return self._embedding_lk(layer, input_)
-         return F.embedding(input_, layer.weight)
- 
- 
-@@ -523,6 +555,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
+@@ -523,6 +523,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
          with_bias: bool = False,
          **extra_weight_attrs,
      ):
@@ -1636,7 +1479,7 @@ index 6c46caff7..557a458c9 100644
          self.with_bias = with_bias
  
          # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
-@@ -545,7 +581,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
+@@ -545,7 +549,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
              )
          else:
              w13_weight_data = torch.empty(
@@ -1645,7 +1488,7 @@ index 6c46caff7..557a458c9 100644
              )
          w13_weight = torch.nn.Parameter(w13_weight_data, requires_grad=False)
          layer.register_parameter("w13_weight", w13_weight)
-@@ -553,7 +589,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
+@@ -553,7 +557,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
  
          if self.with_bias:
              w13_weight_bias = torch.nn.Parameter(
@@ -1654,7 +1497,7 @@ index 6c46caff7..557a458c9 100644
                  requires_grad=False,
              )
              layer.register_parameter("w13_weight_bias", w13_weight_bias)
-@@ -572,7 +608,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
+@@ -572,7 +576,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
              )
          else:
              w2_weight_data = torch.empty(
@@ -1663,7 +1506,7 @@ index 6c46caff7..557a458c9 100644
              )
          w2_weight = torch.nn.Parameter(w2_weight_data, requires_grad=False)
          layer.register_parameter("w2_weight", w2_weight)
-@@ -580,13 +616,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
+@@ -580,13 +584,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
  
          if self.with_bias:
              w2_weight_bias = torch.nn.Parameter(
@@ -1704,57 +1547,11 @@ index 70c6d05a3..84fdac078 100644
      # prefix: model.layers.0.self_attn.q_proj
      # proj_name: q_proj
      proj_name = prefix.split(".")[-1]
-diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
-index 74dd32e82..eb8d4eefc 100644
---- a/python/sglang/srt/layers/vocab_parallel_embedding.py
-+++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
-@@ -241,12 +241,14 @@ class VocabParallelEmbedding(torch.nn.Module):
-         enable_tp: bool = True,
-         use_attn_tp_group: bool = False,
-         use_presharded_weights: bool = False,
-+        is_lk_embedding: bool = False,
-     ):
-         super().__init__()
-         self.quant_config = quant_config
- 
-         self.enable_tp = enable_tp
-         self.use_attn_tp_group = use_attn_tp_group
-+        self.is_lk_embedding = is_lk_embedding
-         if self.enable_tp:
-             if use_attn_tp_group:
-                 tp_rank = get_parallel().attn_tp_rank
-@@ -534,6 +536,26 @@ class VocabParallelEmbedding(torch.nn.Module):
-         the caller's all-reduce can use it; the mask temporaries and the
-         in-place fill deliberately stay outside the pool.
-         """
-+        if self.is_lk_embedding:
-+            # lk path: gather via lk_moe into a pre-allocated fixed GPU buffer
-+            # (not symmetric memory), so decode CUDA graph capture works.
-+            if self.tp_size > 1:
-+                masked_input, input_mask = get_masked_input_and_mask(
-+                    input_,
-+                    self.shard_indices.org_vocab_start_index,
-+                    self.shard_indices.org_vocab_end_index,
-+                    self.shard_indices.num_org_vocab_padding,
-+                    self.shard_indices.added_vocab_start_index,
-+                    self.shard_indices.added_vocab_end_index,
-+                )
-+                output_parallel = self.quant_method.embedding(
-+                    self, masked_input.long()
-+                )
-+                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-+            else:
-+                output_parallel = self.quant_method.embedding(self, input_.long())
-+            return output_parallel
-+
-         symm_alloc = use_symmetric_memory(
-             get_tp_group(), disabled=not is_allocation_symmetric()
-         )
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 59f5ea01a..5cc2ee9df 100644
+index 59f5ea01a..8667c6b3d 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -148,6 +148,18 @@ logger = logging.getLogger(__name__)
+@@ -148,6 +148,10 @@ logger = logging.getLogger(__name__)
  
  @contextmanager
  def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -1762,18 +1559,10 @@ index 59f5ea01a..5cc2ee9df 100644
 +    if isinstance(module, FusedMoE) and not module.is_gpu_resident_layer:
 +        yield module
 +        return
-+    # lk embedding tables (e.g. n-gram oe_embeder) stay CPU/NUMA resident;
-+    # never move them to the GPU target device.
-+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-+    if isinstance(module, VocabParallelEmbedding) and getattr(
-+        module, "is_lk_embedding", False
-+    ):
-+        yield module
-+        return
      if target_device.type == "cpu":
          yield module
          return
-@@ -1017,6 +1029,9 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1017,6 +1021,9 @@ class DefaultModelLoader(BaseModelLoader):
              )
  
          for _, module in model.named_modules():
@@ -1783,7 +1572,7 @@ index 59f5ea01a..5cc2ee9df 100644
              quant_method = getattr(module, "quant_method", None)
              if quant_method is not None:
                  # When quant methods need to process weights after loading
-@@ -1026,6 +1041,9 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1026,6 +1033,9 @@ class DefaultModelLoader(BaseModelLoader):
                  # parameters onto device for processing and back off after.
                  with device_loading_context(module, target_device):
                      quant_method.process_weights_after_loading(module)
@@ -1794,7 +1583,7 @@ index 59f5ea01a..5cc2ee9df 100644
  
  class LayeredModelLoader(DefaultModelLoader):
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index 069efac07..264799af7 100644
+index 069efac07..18589fc75 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
 @@ -1269,6 +1269,20 @@ def get_int_env_var(name: str, default: int = 0) -> int:
@@ -1818,7 +1607,7 @@ index 069efac07..264799af7 100644
  
  
  @contextmanager
-@@ -4809,3 +4823,115 @@ def init_cublas():
+@@ -4809,3 +4823,109 @@ def init_cublas():
      b = torch.ones((16, 16), dtype=dtype, device=device)
      c = a @ b
      return c
@@ -1834,12 +1623,6 @@ index 069efac07..264799af7 100644
 +def is_numa_interleave_enabled() -> bool:
 +    return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
 + 
-+# Whether to keep the (very large) n-gram embedding table resident on CPU /
-+# NUMA host memory and gather it via lk_moe, instead of VRAM. Defaults to the
-+# original GPU-resident behavior.
-+def is_lk_embedding_cpu_enabled() -> bool:
-+    return get_bool_env_var("LVLLM_EMBEDDING_NUMA_ENABLED")
-+
 +def is_lk_moe_use_gpu_prefill() -> bool:
 +    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
 +

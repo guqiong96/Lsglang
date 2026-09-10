@@ -38,7 +38,7 @@ Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architec
 ## How to integrate lk_moe
 
 lk_moe is a pip-installable package (`pip install lk_moe`). It exposes a small set of C++ kernel
-classes (`MOE_WNA16`, `MOE_FP8`, `MOE_MXFP4`, `LKEmbedding`, ...) driven by a `MOEConfigV2` config.
+classes (`MOE_WNA16`, `MOE_FP8`, `MOE_MXFP4`, ...) driven by a `MOEConfigV2` config.
 The engine handles expert weight placement (VRAM / pinned NUMA host memory), NUMA-aware scheduling,
 and quantized kernel execution internally.
 
@@ -66,7 +66,7 @@ optional** so the branch stays 100% compatible with stock behavior when disabled
    `lk_moe.MOEConfigV2`, instantiate the quant-appropriate `MOE_*` class, and call it in `forward`.
 4. **Register per-quantization kernels** — each quant method exposes its own LK MoE kernel class.
 5. **Handle weight loading / placement** — keep CPU-resident weights off the GPU device.
-6. **(Optional) extras** — CPU-resident embedding (`LKEmbedding`) and NUMA thread binding.
+6. **(Optional) extras** — NUMA thread binding.
 
 ### Case study — Lsglang (sglang) file-by-file
 
@@ -82,9 +82,7 @@ clean `dsv4.1` checkout with `git apply patches/01_lk_moe__dsv4.1.patch`.
 | `srt/layers/moe/fused_moe_triton/layer.py` | **the core**: resolve layer role, build `MOEConfigV2`, instantiate `MOE_WNA16` / `MOE_FP8` / `MOE_MXFP4` per quant, and dispatch in `run_moe_core` (GPU resident → `quant_method.apply`; hybrid → `_cpu_decode` / `_cpu_prefill` / `_gpu_prefill`) |
 | `srt/layers/quantization/{fp8,unquant,modelopt_quant,mxfp4_*}.py` | each quant method registers its LK MoE kernel (e.g. `MOE_FP8`, `MOE_MXFP4`) |
 | `srt/layers/quantization/compressed_tensors/schemes/*` | compressed-tensors W8A8-FP8 / W4A4-NVFP4 / WNA16 MoE each register their LK kernel |
-| `srt/model_loader/loader.py` | keep CPU-resident layers / lk-embedding off the GPU device; run `process_weights_after_loading` / `clean_weights_after_loading` for lk_moe layers |
-| `srt/layers/vocab_parallel_embedding.py` | `is_lk_embedding` path: gather via lk_moe into a pre-allocated fixed GPU buffer (CUDA-graph capturable) |
-| `srt/layers/n_gram_embedding.py` | hand the (huge) CPU-resident oe_embeder table to `lk_moe.LKEmbedding`, then drop the torch reference |
+| `srt/model_loader/loader.py` | keep CPU-resident MoE layers off the GPU device; run `process_weights_after_loading` / `clean_weights_after_loading` for lk_moe layers |
 | `srt/utils/numa_utils.py` | when `LVLLM_ENABLE_NUMA_INTERLEAVE=1`, launch workers under `numactl --interleave=all` |
 
 ### LvLLM (vllm)
