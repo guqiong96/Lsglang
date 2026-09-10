@@ -63,9 +63,14 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 
 ### 集成案例 — Lsglang（sglang）逐文件
 
-整个 lk_moe 集成被整理为**一个可移植补丁**：[`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch)
-—— 即上游 `dsv4.1` 分支（提交 `1aa0e962b`）与本分支（`dsv4.1-lkmoe`）的全部差异。在干净的
-`dsv4.1` checkout 上执行 `git apply patches/01_lk_moe__dsv4.1.patch` 即可。
+lk_moe 集成被整理为 [`patches/`](./patches) 下的可移植补丁：
+
+- [`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) —— **纯 lk_moe** MOE 混合推理：
+  上游 `dsv4.1` 分支（提交 `1aa0e962b`）与 `dsv4.1-lkmoe` 分支的全部差异。干净 `dsv4.1` checkout 上
+  单独应用即可（SM89+/SM120+ 用它一个就够）。
+- [`patches/02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) —— **可选**，
+  在 01 之上为 SM80/SM86（Ampere / RTX 30）加 DeepSeek-V4.1 支持（分支 `dsv4.1-lkmoe-sm80plus`）。
+  在 01 之后应用：`git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_support__dsv4.1.patch`。
 
 | 文件 | 作用 |
 |---|---|
@@ -101,7 +106,7 @@ sglang/vllm 侧的集成工作**只是把每个 MOE 层路由到 lk_moe**（哪�
 ### 版本变更
 
 ```bash
-2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3（分支: dsv4.1-lkmoe）
+2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3；+ DeepSeek-V4.1 SM80/86（RTX 30x）支持（补丁 02）。分支: dsv4.1-lkmoe / dsv4.1-lkmoe-sm80plus
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+支持
 2026-07-08: Lsglang-v1.4.1 - 新增 ModelOpt W4A16 NVFP4 量化类型支持，例如：nvidia/GLM-5.2-NVFP4
 2026-07-05: Lsglang-v1.4.0 - 优化GPU预填充速度，CPU AVX512优化，取消LVLLM_GPU_RESIDENT_MOE_EXPERTS, 更新sglang v0.5.14

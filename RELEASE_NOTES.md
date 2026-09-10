@@ -1,11 +1,19 @@
 # Release Notes — Lsglang-v1.5.1 (dsv4.1)
 
 **Base Version:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) + lk_moe v2.4.3
-**Branch:** `dsv4.1-lkmoe`
+**Branch:** `dsv4.1-lkmoe` (pure lk_moe) / `dsv4.1-lkmoe-sm80plus` (+ SM80/86)
 **Release Type:** Feature integration release
 
-The lk_moe integration is captured as a single portable patch:
-[`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch)
+The integration is captured as portable patches under [`patches/`](./patches):
+
+- [`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) — pure lk_moe MOE hybrid inference.
+- [`patches/02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) — optional, DeepSeek-V4.1 on SM80/SM86 (Ampere / RTX 30); apply after 01.
+
+## DeepSeek-V4.1 SM80/SM86 (this release)
+
+SM80+ DeepSeek-V4.1 support now lives directly on the `dsv4.1` line as patch **02**
+(branch `dsv4.1-lkmoe-sm80plus`), superseding the v0.5.19 `...-deepseekv4-sm80plus`
+branch for the dsv4.1 base. All SM89+/SM120+ paths are byte-identical to patch 01 alone.
 
 ## Additional support branches (v0.5.19 series)
 

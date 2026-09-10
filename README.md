@@ -70,10 +70,14 @@ optional** so the branch stays 100% compatible with stock behavior when disabled
 
 ### Case study — Lsglang (sglang) file-by-file
 
-The whole lk_moe integration is captured as a single portable patch at
-[`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) — the full diff between
-upstream `dsv4.1` branch (commit `1aa0e962b`) and this branch (`dsv4.1-lkmoe`). Apply it to a
-clean `dsv4.1` checkout with `git apply patches/01_lk_moe__dsv4.1.patch`.
+The lk_moe integration is captured as portable patches under [`patches/`](./patches):
+
+- [`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) — **pure lk_moe** MOE
+  hybrid inference: the full diff between upstream `dsv4.1` branch (commit `1aa0e962b`) and
+  branch `dsv4.1-lkmoe`. Apply it alone to a clean `dsv4.1` checkout for SM89+/SM120+ GPUs.
+- [`patches/02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) — **optional**,
+  DeepSeek-V4.1 support on SM80/SM86 (Ampere / RTX 30) on top of patch 01 (branch
+  `dsv4.1-lkmoe-sm80plus`). Apply after 01: `git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_support__dsv4.1.patch`.
 
 | File | What it does |
 |---|---|
@@ -109,7 +113,7 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 ### Version history
 
 ```bash
-2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3 (branch: dsv4.1-lkmoe)
+2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3; + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patch 02). branch: dsv4.1-lkmoe / dsv4.1-lkmoe-sm80plus
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+ support
 2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types, e.g. nvidia/GLM-5.2-NVFP4
 2026-07-05: Lsglang-v1.4.0 - GPU prefill speed, CPU AVX512 opt, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, sglang v0.5.14
