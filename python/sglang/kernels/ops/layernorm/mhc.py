@@ -977,6 +977,26 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             T.pdl_trigger()
 
 
+def _pick_splitk_hidden_block(hc_hidden_size: int, split_k: int) -> int | None:
+    """Largest power-of-two hidden block (<=256) the split-k kernel accepts.
+
+    The kernel maker asserts ``hc_hidden_size % hidden_block == 0`` and
+    ``split_size % hidden_block == 0`` with ``split_size = hc_hidden_size //
+    split_k``; the second implies the first, so scanning against the per-split
+    size is sufficient. The two shipped V4 widths resolve to their previous
+    hardcoded values (16384 -> 256, 28672 -> 128) and V4.1 (20480) resolves to
+    128. Returns None when no block divides the per-split size, i.e. the
+    split-k shape is unusable and the caller must take the generic path.
+    """
+    if split_k <= 0 or hc_hidden_size % split_k:
+        return None
+    per_split = hc_hidden_size // split_k
+    for block in (256, 128, 64):
+        if per_split % block == 0:
+            return block
+    return None
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1053,17 +1073,13 @@ def mhc_pre(
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
-        if num_tokens <= 2048:
+        hidden_block = (
+            _pick_splitk_hidden_block(hc_hidden_size, n_splits_pre)
+            if num_tokens <= 2048
+            else None
+        )
+        if hidden_block is not None:
             assert n_splits == 1
-            if hc_hidden_size == 16384:
-                hidden_block = 256
-            elif hc_hidden_size == 28672:
-                hidden_block = 128
-            else:
-                raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
-                )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,
                 hc_hidden_size,

@@ -478,6 +478,16 @@ class Fp8LinearMethod(LinearMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+        # Marlin's grouped fp8 kernels are only instantiated for group sizes
+        # -1 (per-tensor) and 128 (group_blocks == 8). A block-fp8 checkpoint
+        # with a 32-wide K block (MXFP8 semantics, ue8m0 scales) has no marlin
+        # kernel for any thread config and marlin raises instead of falling
+        # back, so leave those to the arch-agnostic Triton block-fp8 GEMM that
+        # dispatch_w8a8_block_fp8_linear already selects for them.
+        if self.use_marlin:
+            _wbs = self.quant_config.weight_block_size
+            if _wbs is not None and len(_wbs) == 2 and _wbs[1] not in (-1, 128):
+                self.use_marlin = False
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (

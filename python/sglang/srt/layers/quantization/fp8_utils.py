@@ -22,6 +22,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
+    w8a8_block_fp8_matmul_w8a16,
+    fp8_dot_supported,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -570,6 +572,10 @@ def dispatch_w8a8_block_fp8_linear(
         # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
         # blocks with ue8m0 scales to the MXFP8 dense kernels instead
         # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
+        # Before Ada, Triton cannot compile an fp8 operand at all, so use the
+        # bf16-activation w8a16 kernel instead of the fp8-dot one.
+        if not fp8_dot_supported():
+            return sm8_w8a16_block_fp8_linear
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()
@@ -1333,6 +1339,41 @@ def aiter_w8a8_block_fp8_linear(
     return output.to(
         dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
     ).view(*output_shape)
+
+
+def sm8_w8a16_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
+) -> torch.Tensor:
+    """Block-fp8 linear for CUDA GPUs before Ada, where Triton cannot compile
+    ``fp8e4nv`` at all and Marlin has no grouped kernel for 32-wide K groups.
+
+    Activations stay bf16 (the w8a16 contract Marlin implements on these GPUs,
+    so no extra accuracy loss versus the route this replaces) and the e4m3
+    weight bytes are decoded inside the kernel, so no fp8-typed tensor ever
+    reaches the Triton compiler.
+    """
+    assert input_scale is None, (
+        "pre-quantized fp8 activations are not supported before SM89 "
+        "(Triton cannot read fp8e4nv there)"
+    )
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    output = w8a8_block_fp8_matmul_w8a16(
+        input_2d,
+        weight.view(torch.uint8),
+        weight_scale,
+        block_size,
+        output_dtype=input_2d.dtype,
+    )
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(

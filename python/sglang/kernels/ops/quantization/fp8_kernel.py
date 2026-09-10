@@ -51,6 +51,19 @@ _is_gfx1250 = is_gfx1250_supported()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+
+@lru_cache(maxsize=1)
+def fp8_dot_supported() -> bool:
+    """Whether Triton can lower an ``fp8e4nv`` ``tl.dot`` on this device.
+
+    Triton has no fp8 MMA path before Ada (SM89): compiling one raises
+    ``type fp8e4nv not supported in this architecture``. SM80/SM86 therefore
+    have to run block-fp8 GEMMs through the in-register bf16-upcast kernel.
+    """
+    if not _is_cuda or not torch.cuda.is_available():
+        return True
+    return torch.cuda.get_device_capability() >= (8, 9)
+
 if _is_cuda:
     from sglang.kernels.ops.quantization import (
         per_token_group_quant,
@@ -1661,6 +1674,220 @@ def w8a8_mxfp8_matmul_deepgemm(
     return C
 
 
+@triton.jit
+def _e4m3_u8_to_f32(u):
+    """Decode an ``e4m3fn`` byte (1-4-3, exp bias 7) to f32 without ever
+    materializing Triton's ``fp8e4nv`` type, which SM80/SM86 cannot represent.
+    Same decoding as ``kernels/ops/attention/dsv4/dequant_k_cache.py``; kept
+    local so the quant kernels do not depend on the attention module.
+    """
+    ui = u.to(tl.int32)
+    sign = (ui >> 7) & 1
+    exp = (ui >> 3) & 0xF
+    man = ui & 0x7
+    mant = man.to(tl.float32) * 0.125
+    val = tl.where(
+        exp != 0,
+        tl.exp2((exp - 7).to(tl.float32)) * (1.0 + mant),
+        0.015625 * mant,
+    )
+    return tl.where(sign != 0, -val, val)
+
+
+@triton.jit
+def _w8a8_block_fp8_matmul_w8a16(
+    A,
+    B,
+    C,
+    Parts,
+    Bs,
+    M,
+    N,
+    K,
+    stride_Bs_n,
+    stride_Bs_k,
+    GROUP_N: tl.constexpr,
+    GROUP_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """bf16 activations x block-fp8 weights, for GPUs whose Triton cannot
+    express ``fp8e4nv`` (CUDA before Ada). A stays bf16 (the w8a16 contract that
+    Marlin also implements on these GPUs, so the numerics match the other
+    pre-SM89 route) and the weight bytes are decoded in-register.
+
+    A is [M, K] bf16, B is [N, K] raw e4m3 bytes as uint8, Bs is [cdiv(N,
+    GROUP_N), K // GROUP_K] fp32, C is [M, N]. BLOCK_SIZE_K == GROUP_K, so each
+    K tile covers exactly one scale group and the scale pointer advances one
+    group per step; the scale row for a column is ``column // GROUP_N`` (GROUP_N
+    == 1 for the MXFP8 [1, 32] layout, 128 for the [128, 32] one).
+
+    Weight-bound decode shapes (small M, wide K) produce too few output tiles to
+    fill the SMs, so the K loop is split ``SPLIT_K`` ways across the grid's
+    second axis; each split writes an fp32 partial into ``Parts``
+    ([SPLIT_K, M, N]) and a follow-up ``_reduce_block_fp8_split_k`` sums them.
+    With ``SPLIT_K == 1`` the kernel stays a single fused pass that writes C
+    directly (no partial traffic), so the large-M path is unchanged.
+    """
+    pid = tl.program_id(axis=0)
+    split = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    m_mask = offs_am < M
+    n_mask = offs_bn < N
+    offs_am_c = tl.where(m_mask, offs_am, 0)
+    offs_bn_c = tl.where(n_mask, offs_bn, 0)
+
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    tiles_per_split = tl.cdiv(k_tiles, SPLIT_K)
+    first_tile = split * tiles_per_split
+    last_tile = tl.minimum(first_tile + tiles_per_split, k_tiles)
+
+    a_ptrs = A + offs_am_c[:, None] * K + first_tile * BLOCK_SIZE_K + offs_k[None, :]
+    b_ptrs = B + offs_bn_c[None, :] * K + first_tile * BLOCK_SIZE_K + offs_k[:, None]
+    Bs_ptrs = (
+        Bs
+        + (offs_bn_c // GROUP_N) * stride_Bs_n
+        + first_tile * stride_Bs_k
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(first_tile, last_tile):
+        k_mask = offs_k < K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        b_u8 = tl.load(b_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0)
+        b_s = tl.load(Bs_ptrs, mask=n_mask, other=0.0)
+        b = _e4m3_u8_to_f32(b_u8).to(tl.bfloat16)
+        accumulator += tl.dot(a, b) * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+        Bs_ptrs += stride_Bs_k
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if SPLIT_K == 1:
+        c_ptrs = C + offs_cm[:, None] * N + offs_cn[None, :]
+        tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=c_mask)
+    else:
+        p_ptrs = Parts + split.to(tl.int64) * M * N + offs_cm[:, None] * N + offs_cn[
+            None, :
+        ]
+        tl.store(p_ptrs, accumulator, mask=c_mask)
+
+
+@lru_cache(maxsize=None)
+def _device_multi_processor_count(device) -> int:
+    idx = torch.cuda.current_device() if device is None else torch.device(device).index
+    return torch.cuda.get_device_properties(idx).multi_processor_count
+
+
+def w8a8_block_fp8_matmul_w8a16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Launcher for :func:`_w8a8_block_fp8_matmul_w8a16`.
+
+    Args:
+        A: bf16/fp16 activations, [M, K] (last dim contiguous).
+        B: block-fp8 weights as raw e4m3 bytes, [N, K] uint8.
+        Bs: [cdiv(N, block_size[0]), K // block_size[1]] fp32 weight scales.
+        block_size: [block_n, block_k]; block_k is the quantization group along K.
+    """
+    K = A.shape[-1]
+    M = A.numel() // K
+    N = B.shape[0]
+    group_n, group_k = block_size[0], block_size[1]
+    assert A.stride(-1) == 1 and B.stride(-1) == 1, "A/B must be K-contiguous"
+    assert B.dtype == torch.uint8, f"expected raw e4m3 bytes, got {B.dtype}"
+    assert Bs.dtype == torch.float32, f"expected fp32 scales, got {Bs.dtype}"
+    assert K % group_k == 0, f"K={K} must be a multiple of group_k={group_k}"
+    assert Bs.shape == (triton.cdiv(N, group_n), K // group_k), (
+        f"unexpected scale shape {tuple(Bs.shape)} for N={N}, K={K}, block={block_size}"
+    )
+
+    C = torch.empty((M, N), device=A.device, dtype=output_dtype)
+    BLOCK_SIZE_M = 16 if M <= 16 else 64
+    BLOCK_SIZE_N = 64
+    tiles_m = triton.cdiv(M, BLOCK_SIZE_M)
+    tiles_n = triton.cdiv(N, BLOCK_SIZE_N)
+    base_ctas = tiles_m * tiles_n
+    k_tiles = triton.cdiv(K, group_k)
+
+    # Weight-bound decode shapes yield far fewer output tiles than the device has
+    # SMs, leaving most of the streaming bandwidth unused. Split the K loop so
+    # several CTAs stream disjoint K slices of the same tile, then reduce the
+    # fp32 partials. Benchmarked on RTX 3090 (SM86): split 4 is the sweet spot
+    # across decode M and N (e.g. N=7168 K=5120: 222 -> 266 GB/s; N=1792:
+    # 99 -> 126), while larger M already fills the device and must stay fused.
+    split_k = 1
+    sms = _device_multi_processor_count(A.device)
+    if base_ctas < 2 * sms:
+        split_k = 4
+        while split_k > 1 and (
+            base_ctas * split_k > 8 * sms or (k_tiles + split_k - 1) // split_k < 4
+        ):
+            split_k //= 2
+        split_k = min(split_k, k_tiles)
+    env_split = os.environ.get("SGLANG_W8A16_SPLIT_K")
+    if env_split is not None:
+        split_k = max(1, min(int(env_split), k_tiles))
+
+    Parts = C if split_k == 1 else torch.empty(
+        (split_k, M, N), device=A.device, dtype=torch.float32
+    )
+    grid = (base_ctas, split_k)
+    _w8a8_block_fp8_matmul_w8a16[grid](
+        A,
+        B,
+        C,
+        Parts,
+        Bs,
+        M,
+        N,
+        K,
+        Bs.stride(0),
+        Bs.stride(1),
+        GROUP_N=group_n,
+        GROUP_K=group_k,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=group_k,
+        GROUP_SIZE_M=32,
+        SPLIT_K=split_k,
+        num_warps=4,
+        num_stages=3,
+    )
+    if split_k > 1:
+        elements = M * N
+        BLOCK = 1024
+        _reduce_block_fp8_split_k[(triton.cdiv(elements, BLOCK),)](
+            Parts,
+            C,
+            ELEMENTS=elements,
+            SPLITS=split_k,
+            BLOCK=BLOCK,
+            num_warps=4,
+        )
+    return C
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1707,8 +1934,17 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
-    if _is_gfx1250:
-        config = {**config, "num_stages": 1}
+    if _is_gfx1250 or not fp8_dot_supported():
+        # No fp8 tl.dot on this arch (gfx1250, or CUDA before Ada): upcast the
+        # fp8 tiles to bf16 in-register. That kernel also needs num_stages=1.
+        # With per-row weight scales (block_size[0] == 1) the default config
+        # would ask for BLOCK_SIZE_N == 1, which tl.dot cannot express, so
+        # clamp it to the dot minimum; the scales stay indexed per column.
+        config = {
+            **config,
+            "num_stages": 1,
+            "BLOCK_SIZE_N": max(config["BLOCK_SIZE_N"], 16),
+        }
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)

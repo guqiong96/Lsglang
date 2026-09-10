@@ -11,6 +11,11 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.quantization.fp8_emulate import (
+    fp8_native_supported,
+    round_to_e4m3fn_f32,
+)
+
 FP4_MAX = 6.0
 FP4_AMAX_FLOOR = 6 * (2.0**-126)
 
@@ -30,6 +35,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     AMAX_FLOOR: tl.constexpr,
     INVERSE: tl.constexpr,
     COMPRESSED_KV: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r // rows_per_token
@@ -65,7 +71,11 @@ def _rope_tail_fake_quant_fp4_kernel(
     amax = tl.max(tl.abs(vb), axis=1)
     if COMPRESSED_KV:
         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
-        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        if NATIVE_FP8:
+            scale = scale.to(tl.float8e4nv).to(tl.float32)
+        else:
+            # SM80/86 Triton cannot form fp8e4nv; round to the e4m3 grid in-register.
+            scale = round_to_e4m3fn_f32(scale)
         s = tl.div_rn(vb, scale[:, None])
     else:
         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
@@ -125,6 +135,7 @@ def rope_tail_fake_quant_fp4(
         AMAX_FLOOR=FP4_AMAX_FLOOR,
         INVERSE=inverse,
         COMPRESSED_KV=compressed_kv,
+        NATIVE_FP8=fp8_native_supported(),
         num_warps=4,
     )
     return out

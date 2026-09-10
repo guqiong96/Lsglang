@@ -10,6 +10,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_emulate import (
+    e4m3fn_u8_to_f32,
+    fp8_native_supported,
+)
+
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
 
@@ -25,6 +30,7 @@ def _engram_gather_kernel(
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    FP8_PTR: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -32,10 +38,17 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    if FP8_PTR:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    else:
+        # Same table bytes, read as uint8 and decoded in-register so the kernel
+        # compiles where fp8e4nv has no representation (SM80/SM86).
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        b = tl.load(w + local * DIM + offs, mask=owned, other=0)
+        vals = e4m3fn_u8_to_f32(b)
     exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
         tl.int32
     )
@@ -76,5 +89,6 @@ def engram_gather(
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            FP8_PTR=fp8_native_supported(),
         )
     return out

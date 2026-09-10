@@ -366,22 +366,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
         # c128 multi-bucket decode graphs: the DSV4 backend declares a list of
-        # candidate widths. When >1 and this is a pure decode runner (not a
-        # draft/verify/dllm runner, which keep c128_width=None everywhere),
-        # capture one decode graph per width and dispatch at replay on the
-        # current max seq_len so short contexts don't pay the (large) full-width
-        # c128 candidate cost.
+        # candidate widths. When >1, capture one decode graph per width and
+        # dispatch at replay on the current max seq_len so short contexts don't
+        # pay the (large) full-width c128 candidate cost. Enabled for plain
+        # DECODE and the DSPARK *target* verify runner (the draft runner has no
+        # c128 pool and keeps c128_width=None). Without this the verify graph
+        # bakes _c128_decode_max_topk (full pool width) and every SM8x
+        # speculative step pays the full-width c128 combine.
         _attn = self.attn_backend
+        _is_target_verify = (
+            self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not self.model_runner.is_draft_worker
+        )
         if (
             _attn is not None
             and getattr(_attn, "_c128_topk_buckets", None)
-            and self.capture_forward_mode == ForwardMode.DECODE
+            and (
+                self.capture_forward_mode == ForwardMode.DECODE or _is_target_verify
+            )
         ):
             self.c128_bucket_widths = list(_attn._c128_topk_buckets)
             self.enable_c128_buckets = len(self.c128_bucket_widths) > 1
             if self.enable_c128_buckets:
                 logger.info(
-                    "[c128-bucket] enabling multi-bucket decode graphs: %s",
+                    "[c128-bucket] enabling multi-bucket decode graphs (%s): %s",
+                    self.capture_forward_mode,
                     self.c128_bucket_widths,
                 )
 
