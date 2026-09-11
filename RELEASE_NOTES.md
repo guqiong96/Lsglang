@@ -117,13 +117,6 @@ count**, so `=0` would make *layer 0* GPU-resident, and on SM80/86 that needs
 `--moe-runner-backend marlin` (the default `flashinfer_mxfp4` resolves to the TRT-LLM path,
 whose FP4 kernels are SM90+ only, so weight loading dies with `ValueError: Invalid backend: 86`).
 
-## Known issue (open)
-
-- **4-GPU mixed TP=4 DSPARK throughput** currently trails the dual-3090 reference
-  (~20 vs ~30–35 t/s, same prompt; non-speculative decode unaffected). GPU-side
-  traces show no kernel regression; under investigation (step serialization /
-  4-way NCCL sync on PCIe-only links). Single-arch TP=2 paths unaffected.
-
 ## Additional support branches (v0.5.19 series)
 
 ### DeepSeek V4 (SM80+)
