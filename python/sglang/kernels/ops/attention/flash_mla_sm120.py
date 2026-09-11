@@ -246,6 +246,23 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    # The SM120 sparse-MLA prefill specialization requires page_block_size=64
+    # for BOTH sources (the decode path accepts native page sizes).  V4.1
+    # ratio-1/2/c128 extra pools use 128/256-token pages, so split them the
+    # same way as the main source.  Token indices are invariant under the
+    # split; the persistent scratch is keyed per role so converting the extra
+    # source can never clobber the main source's buffer (or vice versa).
+    if (
+        extra_kv_u8 is not None
+        and extra_kv_u8.ndim >= 3
+        and extra_kv_u8.shape[1] != _PBS_DST
+    ):
+        extra_kv_u8 = _split_kv_pages_to_64(
+            extra_kv_u8,
+            extra_kv_u8.shape[1],
+            touched_indices=extra_idx,
+            buffer_tag="extra",
+        )
     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
     _sparse_mla_sm120_paged_attention(
@@ -449,6 +466,7 @@ def _split_kv_pages_to_64(
     kv_u8: torch.Tensor,
     src_pbs: int,
     touched_indices: Optional[torch.Tensor] = None,
+    buffer_tag: str = "primary",
 ) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
@@ -472,7 +490,7 @@ def _split_kv_pages_to_64(
     # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
+    key = f"flash_mla_sm120_split:{dev}:{buffer_tag}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         # The first allocation can happen under inference mode (autotune), but
@@ -501,7 +519,7 @@ def _split_kv_pages_to_64(
     if use_mask:
         # Persistent per-device int8 mask, zeroed each call (cheap memset,
         # captured cleanly by CUDA graph). 1 = page is referenced this step.
-        mkey = f"flash_mla_sm120_mask:{dev}"
+        mkey = f"flash_mla_sm120_mask:{dev}:{buffer_tag}"
         mbuf = buffers.get(mkey)
         if mbuf is None or mbuf.shape[0] < N:
             # The first allocation can happen under inference mode (autotune),
