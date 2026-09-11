@@ -262,6 +262,17 @@ def _fp4_paged_mqa_logits(
     reference does not apply one."""
     from deep_gemm import fp8_fp4_paged_mqa_logits as fn
 
+    if deep_gemm_metadata is None:
+        # Without this the binding dies with a cryptic tvm-ffi "Mismatched type
+        # on argument #6 ... Expected DLTensor* but got None".
+        raise RuntimeError(
+            "fp8_fp4_paged_mqa_logits requires schedule metadata, but the "
+            "indexer planner produced none for this step. To unblock, set "
+            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 (torch indexer path); the "
+            "dispatcher also falls back to the Triton decode indexer when the "
+            "metadata is absent."
+        )
+
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
@@ -1129,6 +1140,26 @@ class DeepseekV4AttnBackend(
             _bucket_candidates = [64, 128, 256, 512, 1024, 2048, 4096]
         else:
             _bucket_candidates = [512, 1024, 2048, 4096]
+        # A heterogeneous TP group must capture the SAME number of c128-width
+        # graphs: decode_cuda_graph_runner.capture() loops one collective-bearing
+        # forward_once per c128 width, so the per-arch grids -- which differ in
+        # LENGTH (SM8x 7-wide vs SM120 4-wide) -- make ranks issue different
+        # collective counts and NCCL deadlocks the capture warmup. Uniform group
+        # keeps each arch's native grid (unchanged); a mixed group makes every
+        # rank fall back to one 128-aligned grid both the SM120 CUTLASS kernels
+        # and the SM8x bmm accept.
+        _tg = getattr(model_runner, "tp_group", None)
+        if (
+            getattr(_tg, "world_size", 1) > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            _grid: List[object] = [None] * _tg.world_size
+            torch.distributed.all_gather_object(
+                _grid, tuple(_bucket_candidates), group=_tg.cpu_group
+            )
+            if any(list(_g) != _bucket_candidates for _g in _grid):
+                _bucket_candidates = [128, 512, 1024, 2048, 4096]
         self._c128_topk_buckets: List[int] = []
         for _bucket in _bucket_candidates:
             if _bucket < self._c128_decode_max_topk:
@@ -3134,16 +3165,38 @@ class DeepseekV4AttnBackend(
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
-        if is_decode_or_verify and _is_sm100_or_newer():
+        if (
+            is_decode_or_verify
+            and _is_sm100_or_newer()
+            and self._fp4_paged_indexer_ready(layer.compress_ratio)
+        ):
             self._low_ratio_index_topk_decode(layer, x, q_lora, pos)
         elif (
-            self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
+            self._use_dense_fp4_prefill_indexer(forward_batch)
+            and _is_sm100_or_newer()
+            and self._fp4_paged_indexer_ready(layer.compress_ratio)
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         elif is_decode_or_verify:
             self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         else:
             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+
+    def _fp4_paged_indexer_ready(self, ratio: int) -> bool:
+        """Can the paged DeepGEMM FP4 logits kernel actually run this step?
+
+        An arch test is not enough: the kernel also needs the schedule metadata
+        the indexer metadata planner builds.  Where that is absent (torch
+        fallback requested, a platform the planner skips, or a build whose
+        DeepGEMM ABI does not carry it), fall through to the Triton decode
+        indexer instead of dying inside the kernel binding.
+        """
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        return metadata is not None and metadata.deep_gemm_metadata is not None
 
     @staticmethod
     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:

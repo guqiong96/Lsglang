@@ -10,6 +10,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -493,7 +494,7 @@ def _apply_wo_a_bf16_matmul(
     if (
         is_decode
         and _is_cuda
-        and (get_platform().is_blackwell or get_platform().is_sm90)
+        and _tp_all("hopper_or_blackwell")
         and o.shape == (1, 2, 4096)
         and wo_a.shape == (2, 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
@@ -543,6 +544,50 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
             view_aiter_fused_rms_transposed_fp8_scale(x_quant[1]),
         )
     return x_quant, x_bf16
+
+
+_TP_ARCH_CACHE: Dict[str, bool] = {}
+
+
+def _tp_all(pred: str) -> bool:
+    """Whether EVERY rank in the TP group satisfies an arch predicate.
+
+    Arch capability decides which kernel / stream structure each rank's forward
+    uses (hc_mix split-K, mhc_post split-h, alt_streams overlap, ...). A
+    heterogeneous TP group (e.g. SM86 + SM120) must make that decision on a
+    group-wide AND so every rank emits the same graph; the per-rank
+    ``get_platform()`` value would otherwise diverge the captures and deadlock
+    warmup on the first Blackwell-only Triton load. Homogeneous hosts get back
+    their own local value, so nothing changes there.
+
+    Resolved on first call by a single int32 all-reduce (sum); prewarm
+    ``_tp_all`` for every predicate once at model init so the collective never
+    lands inside a CUDA graph.
+    """
+    cached = _TP_ARCH_CACHE.get(pred)
+    if cached is not None:
+        return cached
+    plat = get_platform()
+    local = {
+        "blackwell": bool(plat.is_blackwell),
+        "sm90": bool(plat.is_sm90),
+        "hopper_or_blackwell": bool(plat.is_sm90 or plat.is_blackwell),
+        # Ampere/Ada-only forward shape (e.g. fusing inverse-RoPE into the wo_a
+        # einsum on SM8 decode). Group AND keeps it off on a mixed host so the
+        # SM86 ranks don't skip the standalone rope the SM120 ranks still run.
+        "sm8": bool(_IS_SM8()),
+    }[pred]
+    group = get_tp_group()
+    world = getattr(group, "world_size", 1)
+    if world > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+        flag = torch.tensor([1 if local else 0], dtype=torch.int32,
+                            device=torch.cuda.current_device())
+        torch.distributed.all_reduce(flag, group=group.device_group)
+        result = int(flag.item()) == world
+    else:
+        result = local
+    _TP_ARCH_CACHE[pred] = result
+    return result
 
 
 def make_hc_mixing_params(
@@ -1038,7 +1083,7 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams = None
             self.alt_streams_indexer = None
 
-        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        self._multi_stream_bs_limit = 128 if _tp_all("blackwell") else 64
 
         self.compressor = None
         self.indexer = None
@@ -1521,7 +1566,7 @@ class MQALayer(MqaAttentionBase):
         x_linear = x_quant if x_quant is not None else x
         early_sources = (
             _is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (self.compressor is not None or self.indexer is not None)
@@ -2004,7 +2049,7 @@ class MQALayer(MqaAttentionBase):
         # On SM8 decode, the inverse RoPE is fused into the wo_a bf16 einsum
         # below (skip the standalone pass; keep `o` roped). Prefill and non-SM8
         # still apply it here as usual.
-        fuse_wo_a_rope = _IS_SM8() and forward_batch.forward_mode.is_decode()
+        fuse_wo_a_rope = _tp_all("sm8") and forward_batch.forward_mode.is_decode()
         if (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
@@ -2444,7 +2489,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if (
             _is_cuda
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and self.hc_pre_from_prev_sublayer
             and self.hc_mult == 4
             and x.shape[1] == 5120
@@ -2462,7 +2507,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             if (
-                get_platform().is_sm90
+                _tp_all("sm90")
                 and x.is_cuda
                 and 1 <= x.shape[0] <= 64
                 and x.shape[1] == 5120
@@ -2707,8 +2752,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             x.is_cuda
             and torch.version.cuda is not None
             and (
-                get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
+                _tp_all("blackwell")
+                or (_tp_all("sm90") and x.shape[0] == 1)
             )
             and x.dtype == torch.bfloat16
         ):
@@ -2781,7 +2826,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         stats_stream = (
             self.hc_stats_stream
             if forward_batch.forward_mode.is_decode()
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            and (not _tp_all("sm90") or hidden_states.shape[0] == 1)
             else None
         )
         residual = hidden_states
@@ -3335,6 +3380,12 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_pp_group()
+        # Resolve arch capability across the TP group once, here (never inside a
+        # forward/capture), so every branch below and in the decoder layers reads
+        # a rank-uniform decision. On a homogeneous host this equals the local
+        # get_platform() value; on a mixed-arch host it keeps the graphs aligned.
+        for _pred in ("blackwell", "sm90", "hopper_or_blackwell", "sm8"):
+            _tp_all(_pred)
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3375,7 +3426,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_stats_stream = (
             device_module.Stream()
             if _is_cuda
-            and (get_platform().is_blackwell or get_platform().is_sm90)
+            and _tp_all("hopper_or_blackwell")
             and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and config.hc_pre_from_prev_sublayer
             else None
@@ -4487,6 +4538,61 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
+    def _prewarm_hc_mix_kernels(self) -> None:
+        """Eagerly compile+load BOTH branches of ``_hc_mix_and_combine``.
+
+        ``_hc_mix_and_combine`` picks its branch from ``_tp_all(...)`` (a TP-group
+        AND), so a homogeneous host only ever exercises one of the two paths. On a
+        mixed SM86+SM120 host the group resolves to the non-Blackwell branch on
+        every rank, which means the Blackwell ranks suddenly run the split-K
+        ``hc_mix_stats`` path they never warm on a pure-Blackwell box - its first
+        ``cuModuleLoadData`` then lands inside CUDA-graph capture and deadlocks the
+        group while the SM86 ranks (whose native path is already warm) race into
+        the next collective. The mirror case holds for ``hc_mix_stats_sinkhorn`` on
+        the SM86 ranks. Warm both, unconditionally, so the first launch of either
+        branch never happens under capture, whatever the group decides.
+
+        Both kernels specialize on batch through ``BLOCK_M`` (8 vs 16) plus
+        Triton's ``m == 1`` / divisible-by-16 hints, so sweep the widths to load
+        every specialization the decode/verify graphs reach; cubins are on-disk
+        cached, so this is only paid on a cold cache.
+        """
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
+            None,
+        )
+        if layer is None:
+            return
+        from sglang.kernels.ops.layernorm.mhc import (
+            _HC_MIX_BLOCK_K,
+            hc_mix_stats,
+            hc_mix_stats_sinkhorn,
+        )
+
+        k = layer.hc_attn_fn.shape[1]
+        if k % _HC_MIX_BLOCK_K != 0:  # _num_slices_for requires BLOCK_K to divide K
+            return
+        dev = layer.hc_attn_fn.device
+        # {1, 2} -> BLOCK_M=8 (the m==1 and generic specs); {12, 16} -> BLOCK_M=16
+        # (the non-div-16 and div-16 specs). Together they cover every bs/token
+        # count the decode and target-verify graphs capture.
+        for m in (1, 2, 12, 16):
+            x_flat = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
+            # Non-Blackwell branch: split-K stats + aten hc_split_sinkhorn.
+            hc_mix_stats(x_flat, layer.hc_attn_fn, layer.rms_norm_eps)
+            # Blackwell branch: split-K fused stats + sinkhorn.
+            hc_mix_stats_sinkhorn(
+                x_flat,
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                layer.hc_mult,
+                layer.hc_sinkhorn_iters,
+                layer.rms_norm_eps,
+                layer.hc_eps,
+            )
+        torch.cuda.synchronize()
+
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.
 
@@ -4497,6 +4603,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
+        # Warm BOTH branches of _hc_mix_and_combine at a rank-uniform point
+        # *before* capture: the group decision (_tp_all) can send either arch onto
+        # the branch it does not natively run, and that branch's first
+        # cuModuleLoadData must not be the capture warmup. Kept off the tilelang
+        # gate so it runs even when the tilelang prewarm below is disabled.
+        if not (_is_npu or _is_xpu) and torch.version.cuda is not None:
+            try:
+                self._prewarm_hc_mix_kernels()
+            except Exception as e:  # never block startup on a warmup miss
+                logger.debug("hc-mix prewarm skipped: %s", e)
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(

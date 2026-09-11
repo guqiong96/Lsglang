@@ -72,7 +72,8 @@ class Mxfp4MarlinMoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         device = torch.cuda.current_device()
-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+        cpu_resident = isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer
+        if cpu_resident:
             device = "cpu"
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoeWeightScaleSupported,
@@ -80,8 +81,16 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
-        hidden_size = round_up(hidden_size, 256)
+        # Only the on-GPU path needs tile-aligned buffers, and Marlin repack pads
+        # to tiles by itself anyway.  A CPU-resident layer is handed to lk_moe as
+        # raw pointers plus the exact per-partition strides, so padding the
+        # allocation here would desync the loader (garbage past column 576 at
+        # TP=4) -- keep those buffers unpadded.
+        if not cpu_resident:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
+            hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 
         w13_weight = torch.nn.Parameter(

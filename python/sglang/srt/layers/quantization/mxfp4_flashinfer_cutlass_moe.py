@@ -22,6 +22,9 @@ os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
 logger = logging.getLogger(__name__)
 
+# One-shot guard for the intermediate-widening notice (see create_weights).
+_pad_intermediate_logged = False
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
@@ -63,13 +66,25 @@ class Mxfp4FlashinferCutlassMoEMethod:
         params_dtype,
         **extra_weight_attrs,
     ):
-        # Both CUTLASS paths require dimensions aligned to 128.
-        if hidden_size % 128 != 0 or intermediate_size_per_partition % 128 != 0:
+        global _pad_intermediate_logged
+        # Both CUTLASS paths require a 128-aligned hidden dim.  The intermediate
+        # does not: a per-rank width that is merely not a multiple of 128 (e.g.
+        # 2304 / TP=4 = 576) gets zero/unit-scale padded to tiles after loading,
+        # exactly like the TRT-LLM method does.
+        if hidden_size % 128 != 0:
             raise ValueError(
-                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size and "
-                "intermediate_size_per_partition to be multiples of 128 "
-                f"(got hidden={hidden_size}, "
-                f"intermediate={intermediate_size_per_partition})."
+                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size to be a "
+                f"multiple of 128 (got hidden={hidden_size})."
+            )
+        self._pad_intermediate = intermediate_size_per_partition % 128 != 0
+        if self._pad_intermediate and not _pad_intermediate_logged:
+            # Per-process, not per-rank0: on a mixed-arch box the ranks that pad
+            # are rarely tp_rank 0, and this is the only trace of the widening.
+            _pad_intermediate_logged = True
+            logger.info(
+                f"Padding MXFP4 experts from intermediate={intermediate_size_per_partition} "
+                f"to {(intermediate_size_per_partition + 127) // 128 * 128} (not a "
+                f"multiple of 128) for FlashInfer CUTLASS (first layer: {self.prefix})."
             )
         # Keep checkpoint scales in native E8M0 instead of staging them as FP32.
         self._fp8.create_weights(
@@ -130,6 +145,16 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
+
+        # Widen the intermediate to a 128 multiple before any layout work, so the
+        # tile-interleaved scales below see the padded geometry.  Padding is
+        # weight=0 / scale=1, i.e. it contributes nothing to the output.
+        if getattr(self, "_pad_intermediate", False):
+            from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                _pad_intermediate_size,
+            )
+
+            _pad_intermediate_size(layer)
 
         arch = "SM120" if self._use_mxfp8_act_scaling else "SM90"
         precision = (

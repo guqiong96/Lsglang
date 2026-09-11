@@ -320,6 +320,32 @@ def is_sm90_supported():
     return _check_cuda_device_version([9], (12, 3))
 
 
+def align_cute_dsl_arch_to_current_device() -> None:
+    """Make the CuTe DSL compile for *this* rank's GPU.
+
+    The DSL resolves its target arch through ``detect_gpu_arch()`` ->
+    ``get_compute_capability_major_minor(device_id=0)``, i.e. it always asks CUDA
+    device 0.  On a mixed-arch host (SM86 + SM120 in one TP group) every rank
+    except the one holding device 0 then compiles for the wrong chip and libNVVM
+    dies on a perfectly valid kernel ("target architecture: sm_86" while running
+    on SM120).  Re-resolving from the current device gives the same string the
+    auto-detection would produce on a homogeneous host, so nothing changes there.
+    """
+    if not is_cuda():
+        return
+    try:
+        from cutlass.base_dsl import env_manager as _em
+    except ImportError:
+        return
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    # Same spelling the DSL's own detection uses (arch-specific suffix >= SM90).
+    arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+    _em.detect_gpu_arch = lambda _prefix, _arch=arch: _arch
+
+
 # GB10 (DGX Spark and OEM equivalents). Not expressible via
 # _check_cuda_device_version, which only matches on the major.
 @lru_cache(maxsize=1)
