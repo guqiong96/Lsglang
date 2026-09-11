@@ -1,42 +1,77 @@
-# Lsglang-v1.5.2
+# Lsglang-v1.5.3
 
 **Base:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) · **lk_moe v2.4.3**
-**Type:** Feature integration release — adds **DeepSeek-V4.1 SM80/SM86** support
-**Wheel:** `lsglang-1.5.2` — use this single wheel for all GPUs (SM80 → SM120)
+**Type:** Multi-GPU support release — **mixed-arch TP groups (SM86 + SM120)** and native
+**SM120 sparse-MLA prefill** fast path
+**Wheel:** `lsglang-1.5.3` — use this single wheel for all GPUs (SM80 → SM120)
 
-SM89+/SM120+ behaviour is byte-identical to the pure-lk_moe `v1.5.1`; SM80/SM86
-(Ampere / RTX 30) DeepSeek-V4.1 support is added on top.
+Same code paths as `v1.5.2` for single-arch hosts; this release adds TP=4 /
+mixed-GPU correctness and removes the SM120 prefill fallback requirement.
 
-## What's new (SM80/SM86, patch 02)
-- DeepSeek-V4.1 runs end-to-end on RTX 30 (SM86):
-  - c128 multi-bucket **target-verify** CUDA graphs (DSPARK spec-decode speed)
-  - `mhc` split-k generalized to `hc_hidden_size = 20480`
-  - block-fp8 **w8a16** GEMM (with split-K) where Triton can't emit `fp8e4nv`,
-    supporting the real `[128, 32]` scale layout
-  - bit-exact fp8 decode/round in a shared `fp8_emulate` module (engram gather,
-    RoPE FP4 fake-quant)
-- All SM89+/SM120+ code paths untouched.
+## What's new
+
+### Mixed-arch TP group (e.g. 2× RTX 3090 + 2× RTX 5060Ti, TP=4) — works end to end
+- **Forward structure is now TP-group uniform.** Every arch predicate that changes the
+  graph shape (Blackwell split-K sinkhorn, `wo_a` rope fusion, `is_sm90`, `_IS_SM8`) is
+  resolved via a one-time TP-group `all_reduce` and cached, so ranks with different
+  chips capture identical graphs (common-denominator path on mixed hosts; single-arch
+  hosts byte-identical).
+- **Cold-cubin prewarm**: both HC-mix paths (fused sinkhorn and split aten sinkhorn)
+  are eagerly warmed at load, so a first `cuModuleLoadData` can never land inside a
+  capture collective.
+- **c128 multi-bucket decode graphs are group-consistent**: on a heterogeneous group
+  all ranks fall back to one shared 128-aligned bucket table
+  (`[128, 512, 1024, 2048, 4096]` ∩ pool width), so capture issues the same number of
+  collectives on every rank. Same-arch hosts keep their arch-native tables.
+- **CuTe DSL device-0 probe fixed** (capture-time `NVVM_ERROR_COMPILATION` on SM120
+  ranks of a mixed host): the model runner re-points the DSL compile target at each
+  rank's own device. Manual fallback `FLASHINFER_USE_CUDA_NORM=1` remains available.
+- **SM120 TP=4 MXFP4 CUTLASS MoE** auto-pads per-rank intermediate 576 → 640 (weight
+  `0`, e8m0 scale `1`); CPU-resident layers keep exact strides for lk_moe pointer use.
+- **SM8x + `flashinfer_mxfp4`** resolves to **Marlin** automatically (FlashInfer FP4
+  kernels are 90/100/103/107/110/120-only).
+
+### SM120 sparse-MLA prefill — native fast path, no fallback env needed
+DeepSeek-V4.1 ratio-1/2/c128 layers use a second ("extra") KV pool with 128/256-token
+pages. The SM120 sparse-MLA **prefill** kernel only accepts 64-token pages on *both*
+sources, so long prompts (>64 tokens) used to die with
+`Unsupported sparse-MLA prefill configuration: ... extra_page_block_size=128`, and
+`SGLANG_SM120_FLASHMLA_BACKEND=triton` was the (slower) workaround.
+The extra source now goes through the same 64-token page-split as the main source
+(per-role scratch buffers so the two can never alias), verified **bit-exact** against
+the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
+`SGLANG_SM120_FLASHMLA_BACKEND` env is no longer needed (decode/verify untouched).
+
+## GPU support matrix (DeepSeek-V4 / V4.1 with lk_moe)
+
+| SM | Representative GPUs | Patches | Notes |
+|----|--------------------|---------|-------|
+| **80** | A100, A30 | 01 + 02 | SM8 path shared with SM86 (`w8a16` Triton GEMMs, native-precision fp8 emulation) |
+| **86** | RTX 3090/3080, A6000 | 01 + 02 | ✅ verified: V4.1-Flash on 2×3090 (TP=2) and mixed 4-GPU TP=4 |
+| **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | native Triton fp8-dot; patch 02 adds FP4-MoE→Marlin auto-select |
+| **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
+| **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
+| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; prefill fast path native since this release |
+
+✅ = measured on reference hardware (dual-EPYC host). Other rows: enabled-by-construction
+on the shared code paths, not individually bench-tested here — please report issues.
+SM8x ranks mixed with SM12x ranks run on the common-denominator path (see What's new).
 
 ## Install / build
 ```bash
-pip install lsglang==1.5.2          # or build the wheel from tag lsglang-v1.5.2
+pip install lsglang==1.5.3          # or build the wheel from tag lsglang-v1.5.3
 ```
 
 ## Patches (`patches/`)
 | Patch | Applies to | Contents |
 |-------|-----------|----------|
 | [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe MOE hybrid inference |
-| [`02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) | after 01 | DeepSeek-V4.1 on SM80/SM86 (optional) |
+| [`02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill extra-split |
 
 ```bash
-git apply patches/01_lk_moe__dsv4.1.patch            # SM89+/SM120+ stop here
-git apply patches/02_sm80_support__dsv4.1.patch      # + SM80/SM86 support
+git apply patches/01_lk_moe__dsv4.1.patch            # SM90+/SM120+ stop here
+git apply patches/02_sm80_support__dsv4.1.patch      # + SM80/86 & mixed-arch support
 ```
-
-## Hardware note (SM120, TP=4)
-At TP=4 the FlashInfer **CUTLASS** MXFP4 MoE path needs `intermediate % 128 == 0`.
-If it trips, use `--moe-runner-backend flashinfer_trtllm` (auto-pads) or `marlin`,
-or keep MoE off pure-TP (EP / TP=2). Upstream constraint, not a regression.
 
 ## Launch — DeepSeek-V4.1-Flash (SM86, reference)
 
@@ -72,12 +107,22 @@ sglang serve \
 ```
 
 Adjust `--model` path, `CUDA_VISIBLE_DEVICES` and `LK_THREADS` to your host.
+For a mixed SM86+SM120 host use the same command with `--tensor-parallel-size 4` and
+all four GPUs in `CUDA_VISIBLE_DEVICES` (`CUDA_DEVICE_ORDER=PCI_BUS_ID` is required so
+each rank's arch probe sees its own chip).
 
 One caveat: `LVLLM_GPU_RESIDENT_MOE_LAYERS` is left unset above, i.e. every expert layer
 stays CPU-resident — that is the ~30 t/s config measured. It is a **layer-index list, not a
 count**, so `=0` would make *layer 0* GPU-resident, and on SM80/86 that needs
 `--moe-runner-backend marlin` (the default `flashinfer_mxfp4` resolves to the TRT-LLM path,
 whose FP4 kernels are SM90+ only, so weight loading dies with `ValueError: Invalid backend: 86`).
+
+## Known issue (open)
+
+- **4-GPU mixed TP=4 DSPARK throughput** currently trails the dual-3090 reference
+  (~15–20 vs ~30–35 t/s, same prompt; non-speculative decode unaffected). GPU-side
+  traces show no kernel regression; under investigation (step serialization /
+  4-way NCCL sync on PCIe-only links). Single-arch TP=2 paths unaffected.
 
 ## Additional support branches (v0.5.19 series)
 

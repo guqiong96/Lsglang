@@ -177,6 +177,20 @@ python -m sglang.launch_server \
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 1 | `1`：避免 NUMA 节点 OOM |
 | `LK_POWER_SAVING` | CPU节能 | 0 | `1`：启用 CPU 节能模式 |
 
+### 硬件说明（DeepSeek-V4.x）
+
+- **SM8x + `flashinfer_mxfp4`**：FlashInfer 未为 major 8 提供 FP4 内核，因此 SM80/86/89 上
+  MoE runner 自动落 **Marlin**（无需加 flag）。CPU 常驻层（混合推理默认）不受影响。
+- **SM120、TP=4**：MXFP4 CUTLASS MoE 路径在加载时把每卡 intermediate 自动补齐
+  （2304/4 = 576 → **640**），`intermediate % 128` 不再是硬约束。
+- **混合 arch 主机**（SM86 + SM120 同一 TP 组）：CuTe DSL 过去按物理 GPU 0
+  （`cuDeviceGet(0)`）给所有 rank 编内核，SM120 rank 在 capture 时因 `sm_86` NVVM 报错崩溃。
+  现在 model runner 会把 DSL 重指到本 rank 的 device。若个别 CuTe 内核仍出问题，
+  在 `import flashinfer` **之前**导出 `FLASHINFER_USE_CUDA_NORM=1`。
+- **SM120 sparse-MLA prefill**：V4.1 的 extra KV 源（128/256-token 页）现在会自动拆成
+  prefill 内核要求的 64-token 页，长 prompt 直接走 FlashInfer 原生快路；
+  不再需要 `SGLANG_SM120_FLASHMLA_BACKEND=triton`。
+
 ### 安装
 
 ```bash

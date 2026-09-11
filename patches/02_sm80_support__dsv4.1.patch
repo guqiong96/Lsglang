@@ -1042,6 +1042,60 @@ index 000000000..31b7f51a1
 +        value_block_size=value_block_size,
 +        candidate_block_size=candidate_block_size,
 +    )
+diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+index 906d4aa22..16dfec123 100644
+--- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+@@ -246,6 +246,23 @@ def _flash_mla_sm120_prefill(
+         if extra_indices is not None and extra_indices.dim() == 3
+         else extra_indices
+     )
++    # The SM120 sparse-MLA prefill specialization requires page_block_size=64
++    # for BOTH sources (the decode path accepts native page sizes).  V4.1
++    # ratio-1/2/c128 extra pools use 128/256-token pages, so split them the
++    # same way as the main source.  Token indices are invariant under the
++    # split; the persistent scratch is keyed per role so converting the extra
++    # source can never clobber the main source's buffer (or vice versa).
++    if (
++        extra_kv_u8 is not None
++        and extra_kv_u8.ndim >= 3
++        and extra_kv_u8.shape[1] != _PBS_DST
++    ):
++        extra_kv_u8 = _split_kv_pages_to_64(
++            extra_kv_u8,
++            extra_kv_u8.shape[1],
++            touched_indices=extra_idx,
++            buffer_tag="extra",
++        )
+     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
+     _sparse_mla_sm120_paged_attention(
+@@ -449,6 +466,7 @@ def _split_kv_pages_to_64(
+     kv_u8: torch.Tensor,
+     src_pbs: int,
+     touched_indices: Optional[torch.Tensor] = None,
++    buffer_tag: str = "primary",
+ ) -> torch.Tensor:
+     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
+ 
+@@ -472,7 +490,7 @@ def _split_kv_pages_to_64(
+     # Pre-allocated grow-only buffer for page-split output per device.
+     dev = kv_u8.device
+     buffers = get_resources().buffers
+-    key = f"flash_mla_sm120_split:{dev}"
++    key = f"flash_mla_sm120_split:{dev}:{buffer_tag}"
+     buf = buffers.get(key)
+     if buf is None or buf.shape[0] < num_dst_pages:
+         # The first allocation can happen under inference mode (autotune), but
+@@ -501,7 +519,7 @@ def _split_kv_pages_to_64(
+     if use_mask:
+         # Persistent per-device int8 mask, zeroed each call (cheap memset,
+         # captured cleanly by CUDA graph). 1 = page is referenced this step.
+-        mkey = f"flash_mla_sm120_mask:{dev}"
++        mkey = f"flash_mla_sm120_mask:{dev}:{buffer_tag}"
+         mbuf = buffers.get(mkey)
+         if mbuf is None or mbuf.shape[0] < N:
+             # The first allocation can happen under inference mode (autotune),
 diff --git a/python/sglang/kernels/ops/embeddings/engram_gather.py b/python/sglang/kernels/ops/embeddings/engram_gather.py
 index d6e5599f1..7e2feec61 100644
 --- a/python/sglang/kernels/ops/embeddings/engram_gather.py
@@ -1564,7 +1618,7 @@ index d5dd93396..d4ab7b080 100644
      SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
      # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 6e66a8e0c..5d1c49c72 100644
+index 6e66a8e0c..78468c732 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -25,12 +25,18 @@ from sglang.kernels.ops.attention.dsv4 import (
@@ -1637,7 +1691,25 @@ index 6e66a8e0c..5d1c49c72 100644
  def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
      # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
      # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
-@@ -1010,11 +1039,13 @@ class DSV4RawDecodeMetadata:
+@@ -233,6 +262,17 @@ def _fp4_paged_mqa_logits(
+     reference does not apply one."""
+     from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+ 
++    if deep_gemm_metadata is None:
++        # Without this the binding dies with a cryptic tvm-ffi "Mismatched type
++        # on argument #6 ... Expected DLTensor* but got None".
++        raise RuntimeError(
++            "fp8_fp4_paged_mqa_logits requires schedule metadata, but the "
++            "indexer planner produced none for this step. To unblock, set "
++            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 (torch indexer path); the "
++            "dispatcher also falls back to the Triton decode indexer when the "
++            "metadata is absent."
++        )
++
+     sl = seq_lens.to(torch.int32)
+     if sl.dim() == 1:
+         sl = sl.unsqueeze(-1)
+@@ -1010,11 +1050,13 @@ class DSV4RawDecodeMetadata:
      req_pool_indices: torch.Tensor
      seq_lens: torch.Tensor
      out_cache_loc: torch.Tensor
@@ -1651,7 +1723,7 @@ index 6e66a8e0c..5d1c49c72 100644
  
  
  class _GraphBucket(enum.Enum):
-@@ -1070,6 +1101,44 @@ class DeepseekV4AttnBackend(
+@@ -1070,6 +1112,64 @@ class DeepseekV4AttnBackend(
          self.encoder_replay = False
          self.device = torch.device(model_runner.device)
          self.max_context_len = model_runner.model_config.context_len
@@ -1683,6 +1755,26 @@ index 6e66a8e0c..5d1c49c72 100644
 +            _bucket_candidates = [64, 128, 256, 512, 1024, 2048, 4096]
 +        else:
 +            _bucket_candidates = [512, 1024, 2048, 4096]
++        # A heterogeneous TP group must capture the SAME number of c128-width
++        # graphs: decode_cuda_graph_runner.capture() loops one collective-bearing
++        # forward_once per c128 width, so the per-arch grids -- which differ in
++        # LENGTH (SM8x 7-wide vs SM120 4-wide) -- make ranks issue different
++        # collective counts and NCCL deadlocks the capture warmup. Uniform group
++        # keeps each arch's native grid (unchanged); a mixed group makes every
++        # rank fall back to one 128-aligned grid both the SM120 CUTLASS kernels
++        # and the SM8x bmm accept.
++        _tg = getattr(model_runner, "tp_group", None)
++        if (
++            getattr(_tg, "world_size", 1) > 1
++            and torch.distributed.is_available()
++            and torch.distributed.is_initialized()
++        ):
++            _grid: List[object] = [None] * _tg.world_size
++            torch.distributed.all_gather_object(
++                _grid, tuple(_bucket_candidates), group=_tg.cpu_group
++            )
++            if any(list(_g) != _bucket_candidates for _g in _grid):
++                _bucket_candidates = [128, 512, 1024, 2048, 4096]
 +        self._c128_topk_buckets: List[int] = []
 +        for _bucket in _bucket_candidates:
 +            if _bucket < self._c128_decode_max_topk:
@@ -1696,7 +1788,7 @@ index 6e66a8e0c..5d1c49c72 100644
          head_dim = model_runner.model_config.head_dim
          assert head_dim == 512, (
              "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-@@ -1294,6 +1363,7 @@ class DeepseekV4AttnBackend(
+@@ -1294,6 +1394,7 @@ class DeepseekV4AttnBackend(
          req_pool_indices: torch.Tensor,
          seq_lens: torch.Tensor,
          out_cache_loc: torch.Tensor,
@@ -1704,7 +1796,7 @@ index 6e66a8e0c..5d1c49c72 100644
      ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
          assert (
              req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
-@@ -1303,6 +1373,7 @@ class DeepseekV4AttnBackend(
+@@ -1303,6 +1404,7 @@ class DeepseekV4AttnBackend(
              req_pool_indices=req_pool_indices,
              seq_lens=seq_lens,
              out_cache_loc=out_cache_loc,
@@ -1712,7 +1804,7 @@ index 6e66a8e0c..5d1c49c72 100644
          )
  
      def init_forward_metadata_prefill(
-@@ -1900,6 +1971,33 @@ class DeepseekV4AttnBackend(
+@@ -1900,6 +2002,33 @@ class DeepseekV4AttnBackend(
              out_loc=out_cache_loc,
              need_compress=True,
          )
@@ -1746,7 +1838,7 @@ index 6e66a8e0c..5d1c49c72 100644
          indexer_metadata = (
              self.init_forward_metadata_indexer(core_attn_metadata)
              if self.has_c4
-@@ -2151,7 +2249,7 @@ class DeepseekV4AttnBackend(
+@@ -2151,7 +2280,7 @@ class DeepseekV4AttnBackend(
              logger.debug(
                  f"[IDLE replay] bs={bs}, "
                  f"local_seq_lens_len={len(seq_lens)}, "
@@ -1755,7 +1847,7 @@ index 6e66a8e0c..5d1c49c72 100644
              )
              device = seq_lens.device
              seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-@@ -2172,6 +2270,12 @@ class DeepseekV4AttnBackend(
+@@ -2172,6 +2301,12 @@ class DeepseekV4AttnBackend(
              assert actual_max_seq_len <= chosen_max_seq_len
  
          graph_key = bs
@@ -1768,7 +1860,7 @@ index 6e66a8e0c..5d1c49c72 100644
          if bucket == _GraphBucket.DECODE_OR_IDLE:
              assert out_cache_loc is not None
              assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
-@@ -2191,6 +2295,7 @@ class DeepseekV4AttnBackend(
+@@ -2191,6 +2326,7 @@ class DeepseekV4AttnBackend(
                  req_pool_indices=req_pool_indices,
                  seq_lens=seq_lens,
                  out_cache_loc=out_cache_loc_padded,
@@ -1776,7 +1868,7 @@ index 6e66a8e0c..5d1c49c72 100644
              )
          elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
              block_size = self.speculative_num_draft_tokens - 1
-@@ -2235,7 +2340,7 @@ class DeepseekV4AttnBackend(
+@@ -2235,7 +2371,7 @@ class DeepseekV4AttnBackend(
                  self.online_c128_mtp.clear()
                  self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                      bucket
@@ -1785,7 +1877,7 @@ index 6e66a8e0c..5d1c49c72 100644
                  return
              assert out_cache_loc is not None
              assert num_tokens_v >= len(out_cache_loc), (
-@@ -2293,7 +2398,10 @@ class DeepseekV4AttnBackend(
+@@ -2293,7 +2429,10 @@ class DeepseekV4AttnBackend(
              raise NotImplementedError
  
          self.replay_cuda_graph_metadata_from(
@@ -1797,7 +1889,7 @@ index 6e66a8e0c..5d1c49c72 100644
          )
  
          if in_capture:
-@@ -2596,10 +2704,14 @@ class DeepseekV4AttnBackend(
+@@ -2596,10 +2735,14 @@ class DeepseekV4AttnBackend(
          self.forward_metadata = capture_metadata
  
      def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1813,7 +1905,7 @@ index 6e66a8e0c..5d1c49c72 100644
                  Union[
                      DSV4Metadata,
                      DSV4RawDecodeMetadata,
-@@ -2640,11 +2752,13 @@ class DeepseekV4AttnBackend(
+@@ -2640,11 +2783,13 @@ class DeepseekV4AttnBackend(
              DSV4RawDecodeMetadata,
          ],
          bucket: _GraphBucket,
@@ -1829,7 +1921,49 @@ index 6e66a8e0c..5d1c49c72 100644
              self.forward_metadata = temp_metadata
              return
          chosen_metadata.copy_(temp_metadata)
-@@ -3690,7 +3804,19 @@ class DeepseekV4AttnBackend(
+@@ -3020,10 +3165,16 @@ class DeepseekV4AttnBackend(
+             forward_batch.forward_mode.is_decode()
+             or forward_batch.forward_mode.is_target_verify()
+         )
+-        if is_decode_or_verify and _is_sm100_or_newer():
++        if (
++            is_decode_or_verify
++            and _is_sm100_or_newer()
++            and self._fp4_paged_indexer_ready(layer.compress_ratio)
++        ):
+             self._low_ratio_index_topk_decode(layer, x, q_lora, pos)
+         elif (
+-            self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
++            self._use_dense_fp4_prefill_indexer(forward_batch)
++            and _is_sm100_or_newer()
++            and self._fp4_paged_indexer_ready(layer.compress_ratio)
+         ):
+             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
+         elif is_decode_or_verify:
+@@ -3031,6 +3182,22 @@ class DeepseekV4AttnBackend(
+         else:
+             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+ 
++    def _fp4_paged_indexer_ready(self, ratio: int) -> bool:
++        """Can the paged DeepGEMM FP4 logits kernel actually run this step?
++
++        An arch test is not enough: the kernel also needs the schedule metadata
++        the indexer metadata planner builds.  Where that is absent (torch
++        fallback requested, a platform the planner skips, or a build whose
++        DeepGEMM ABI does not carry it), fall through to the Triton decode
++        indexer instead of dying inside the kernel binding.
++        """
++        metadata = (
++            self.forward_metadata.c1_indexer_metadata
++            if ratio == 1
++            else self.forward_metadata.c2_indexer_metadata
++        )
++        return metadata is not None and metadata.deep_gemm_metadata is not None
++
+     @staticmethod
+     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
+         return (
+@@ -3690,7 +3857,19 @@ class DeepseekV4AttnBackend(
                      attn_sink=attn_sink,
                  )
  
@@ -1850,7 +1984,7 @@ index 6e66a8e0c..5d1c49c72 100644
                  from sglang.kernels.ops.attention.flash_mla_sm120 import (
                      SM120_DECODE_MAX_TOKENS,
                      flash_mla_with_kvcache_sm120,
-@@ -3747,6 +3873,107 @@ class DeepseekV4AttnBackend(
+@@ -3747,6 +3926,107 @@ class DeepseekV4AttnBackend(
  
          raise NotImplementedError("ragged attention")
  
@@ -1958,7 +2092,7 @@ index 6e66a8e0c..5d1c49c72 100644
      def _forward_prefill_sparse(
          self,
          q: torch.Tensor,
-@@ -3836,6 +4063,44 @@ class DeepseekV4AttnBackend(
+@@ -3836,6 +4116,44 @@ class DeepseekV4AttnBackend(
          )
          kv = workspace
  
@@ -2342,10 +2476,39 @@ index 7dba72aef..b86402636 100644
                  fn = fp8_paged_mqa_logits_torch
          elif is_xpu():
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index c69d08e5f..62a6dc0f2 100644
+index c69d08e5f..117d9f37c 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
-@@ -478,6 +478,16 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -419,8 +419,28 @@ class Fp8Config(QuantizationConfig):
+                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
+ 
+             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
++                from sglang.srt.utils.common import is_sm80_supported
++
++                # SM80/86/89 have no FlashInfer FP4 kernels at all (the FP4
++                # module only ships 90/100/103/107/110/120 builds), so the
++                # TRT-LLM method would die in process_weights_after_loading
++                # with "Invalid backend: 86" as soon as a layer is GPU-resident.
++                # Marlin W4A16 is the only on-GPU MXFP4 kernel for major 8.
++                if is_sm80_supported():
++                    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
++                        Mxfp4MarlinMoEMethod,
++                    )
++
++                    log_info_on_rank0(
++                        logger,
++                        "FlashInfer has no MXFP4 kernels on SM8x; using Marlin "
++                        f"as the effective MoE runner for {prefix}.",
++                    )
++                    return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
++
+                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
+                 if get_platform().is_sm90 or get_platform().is_sm120:
++
+                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+                         Mxfp4FlashinferCutlassMoEMethod,
+                     )
+@@ -478,6 +498,16 @@ class Fp8LinearMethod(LinearMethodBase):
              force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
              auto_enable = can_auto_enable_marlin_fp8()
              self.use_marlin = force_marlin or auto_enable
@@ -2428,8 +2591,71 @@ index 6093a4f95..98d6f36fc 100755
  def triton_w8a8_block_fp8_linear(
      input: torch.Tensor,
      weight: torch.Tensor,
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+index b5fd98325..a8a99253b 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+@@ -22,6 +22,9 @@ os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+ 
+ logger = logging.getLogger(__name__)
+ 
++# One-shot guard for the intermediate-widening notice (see create_weights).
++_pad_intermediate_logged = False
++
+ if TYPE_CHECKING:
+     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+ 
+@@ -63,13 +66,25 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         params_dtype,
+         **extra_weight_attrs,
+     ):
+-        # Both CUTLASS paths require dimensions aligned to 128.
+-        if hidden_size % 128 != 0 or intermediate_size_per_partition % 128 != 0:
++        global _pad_intermediate_logged
++        # Both CUTLASS paths require a 128-aligned hidden dim.  The intermediate
++        # does not: a per-rank width that is merely not a multiple of 128 (e.g.
++        # 2304 / TP=4 = 576) gets zero/unit-scale padded to tiles after loading,
++        # exactly like the TRT-LLM method does.
++        if hidden_size % 128 != 0:
+             raise ValueError(
+-                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size and "
+-                "intermediate_size_per_partition to be multiples of 128 "
+-                f"(got hidden={hidden_size}, "
+-                f"intermediate={intermediate_size_per_partition})."
++                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size to be a "
++                f"multiple of 128 (got hidden={hidden_size})."
++            )
++        self._pad_intermediate = intermediate_size_per_partition % 128 != 0
++        if self._pad_intermediate and not _pad_intermediate_logged:
++            # Per-process, not per-rank0: on a mixed-arch box the ranks that pad
++            # are rarely tp_rank 0, and this is the only trace of the widening.
++            _pad_intermediate_logged = True
++            logger.info(
++                f"Padding MXFP4 experts from intermediate={intermediate_size_per_partition} "
++                f"to {(intermediate_size_per_partition + 127) // 128 * 128} (not a "
++                f"multiple of 128) for FlashInfer CUTLASS (first layer: {self.prefix})."
+             )
+         # Keep checkpoint scales in native E8M0 instead of staging them as FP32.
+         self._fp8.create_weights(
+@@ -131,6 +146,16 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         if getattr(layer, "_mega_moe_weights_built", False):
+             return
+ 
++        # Widen the intermediate to a 128 multiple before any layout work, so the
++        # tile-interleaved scales below see the padded geometry.  Padding is
++        # weight=0 / scale=1, i.e. it contributes nothing to the output.
++        if getattr(self, "_pad_intermediate", False):
++            from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
++                _pad_intermediate_size,
++            )
++
++            _pad_intermediate_size(layer)
++
+         arch = "SM120" if self._use_mxfp8_act_scaling else "SM90"
+         precision = (
+             "W4A8" if self._use_sm90_humming or self._use_mxfp8_act_scaling else "W4A16"
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
-index 68e56a7ae..765bbbd73 100644
+index 68e56a7ae..4147f2990 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 @@ -10,6 +10,11 @@ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
@@ -2444,7 +2670,36 @@ index 68e56a7ae..765bbbd73 100644
  
  if TYPE_CHECKING:
      from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-@@ -153,8 +158,8 @@ class Mxfp4MarlinMoEMethod:
+@@ -67,7 +72,8 @@ class Mxfp4MarlinMoEMethod:
+     ):
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+         device = torch.cuda.current_device()
+-        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
++        cpu_resident = isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer
++        if cpu_resident:
+             device = "cpu"
+         from sglang.srt.layers.moe.fused_moe_triton import (
+             FusedMoeWeightScaleSupported,
+@@ -75,8 +81,16 @@ class Mxfp4MarlinMoEMethod:
+ 
+         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
+         fp4_block_k = 32
+-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
+-        hidden_size = round_up(hidden_size, 256)
++        # Only the on-GPU path needs tile-aligned buffers, and Marlin repack pads
++        # to tiles by itself anyway.  A CPU-resident layer is handed to lk_moe as
++        # raw pointers plus the exact per-partition strides, so padding the
++        # allocation here would desync the loader (garbage past column 576 at
++        # TP=4) -- keep those buffers unpadded.
++        if not cpu_resident:
++            intermediate_size_per_partition = round_up(
++                intermediate_size_per_partition, 128
++            )
++            hidden_size = round_up(hidden_size, 256)
+         self.hidden_pad = hidden_size - layer.hidden_size
+ 
+         w13_weight = torch.nn.Parameter(
+@@ -153,8 +167,8 @@ class Mxfp4MarlinMoEMethod:
          if getattr(layer, "_mega_moe_weights_built", False):
              return
  
@@ -2484,6 +2739,30 @@ index 84fdac078..113f6b6a7 100644
  
  
  def prepare_static_weights_for_trtllm_fp4_moe(
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index cd539390b..03ab9a40e 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -215,6 +215,7 @@ from sglang.srt.state_capturer.routed_experts import (
+     set_global_experts_capturer,
+ )
+ from sglang.srt.utils import (
++    align_cute_dsl_arch_to_current_device,
+     cpu_has_amx_support,
+     enable_show_time_cost,
+     get_available_gpu_memory,
+@@ -426,6 +427,11 @@ class ModelRunner:
+             )
+             raise
+ 
++        # Device is now this rank's GPU: re-point the CuTe DSL at it, because it
++        # otherwise probes CUDA device 0 and compiles for the wrong chip on a
++        # mixed-arch host (e.g. SM86 + SM120 in one TP group).
++        align_cute_dsl_arch_to_current_device()
++
+         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
+         # that the shared TE can be passed to the Mooncake PG backend (avoids
+         # creating duplicate TransferEngines).
 diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 index 1a9ebbde3..e63c78a42 100644
 --- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
@@ -2801,10 +3080,18 @@ index ee7e9afd5..9da610e4d 100644
  def model_capture_mode():
      global is_capture_mode
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af8586..0733553a3 100644
+index 228af8586..7d20d55ab 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -210,6 +210,7 @@ from sglang.srt.utils import (
+@@ -10,6 +10,7 @@ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Callable,
++    Dict,
+     Iterable,
+     List,
+     NamedTuple,
+@@ -210,6 +211,7 @@ from sglang.srt.utils import (
  )
  from sglang.srt.utils.custom_op import register_custom_op
  from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -2812,7 +3099,7 @@ index 228af8586..0733553a3 100644
  
  # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
  # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
-@@ -288,6 +289,14 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+@@ -288,6 +290,14 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
  _MHC_POST_MULT_VALUE = 2.0
  _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
  
@@ -2827,7 +3114,7 @@ index 228af8586..0733553a3 100644
  DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
      ("gate_up_proj", "gate_proj", 0),
      ("gate_up_proj", "up_proj", 1),
-@@ -454,7 +463,12 @@ if _is_hip:
+@@ -454,7 +464,12 @@ if _is_hip:
  
  
  def _apply_wo_a_bf16_matmul(
@@ -2841,7 +3128,7 @@ index 228af8586..0733553a3 100644
  ) -> torch.Tensor:
      """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
  
-@@ -462,6 +476,19 @@ def _apply_wo_a_bf16_matmul(
+@@ -462,11 +477,24 @@ def _apply_wo_a_bf16_matmul(
      ROCm decode can use aiter batched GEMM; its first runtime failure disables
      that path for the process. Other cases use torch.einsum.
      """
@@ -2861,18 +3148,93 @@ index 228af8586..0733553a3 100644
      global _wo_a_aiter_batched_gemm_disabled
      if (
          is_decode
-@@ -1974,6 +2001,10 @@ class MQALayer(MqaAttentionBase):
+         and _is_cuda
+-        and (get_platform().is_blackwell or get_platform().is_sm90)
++        and _tp_all("hopper_or_blackwell")
+         and o.shape == (1, 2, 4096)
+         and wo_a.shape == (2, 1024, 4096)
+         and o.dtype == wo_a.dtype == torch.bfloat16
+@@ -518,6 +546,50 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
+     return x_quant, x_bf16
+ 
+ 
++_TP_ARCH_CACHE: Dict[str, bool] = {}
++
++
++def _tp_all(pred: str) -> bool:
++    """Whether EVERY rank in the TP group satisfies an arch predicate.
++
++    Arch capability decides which kernel / stream structure each rank's forward
++    uses (hc_mix split-K, mhc_post split-h, alt_streams overlap, ...). A
++    heterogeneous TP group (e.g. SM86 + SM120) must make that decision on a
++    group-wide AND so every rank emits the same graph; the per-rank
++    ``get_platform()`` value would otherwise diverge the captures and deadlock
++    warmup on the first Blackwell-only Triton load. Homogeneous hosts get back
++    their own local value, so nothing changes there.
++
++    Resolved on first call by a single int32 all-reduce (sum); prewarm
++    ``_tp_all`` for every predicate once at model init so the collective never
++    lands inside a CUDA graph.
++    """
++    cached = _TP_ARCH_CACHE.get(pred)
++    if cached is not None:
++        return cached
++    plat = get_platform()
++    local = {
++        "blackwell": bool(plat.is_blackwell),
++        "sm90": bool(plat.is_sm90),
++        "hopper_or_blackwell": bool(plat.is_sm90 or plat.is_blackwell),
++        # Ampere/Ada-only forward shape (e.g. fusing inverse-RoPE into the wo_a
++        # einsum on SM8 decode). Group AND keeps it off on a mixed host so the
++        # SM86 ranks don't skip the standalone rope the SM120 ranks still run.
++        "sm8": bool(_IS_SM8()),
++    }[pred]
++    group = get_tp_group()
++    world = getattr(group, "world_size", 1)
++    if world > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
++        flag = torch.tensor([1 if local else 0], dtype=torch.int32,
++                            device=torch.cuda.current_device())
++        torch.distributed.all_reduce(flag, group=group.device_group)
++        result = int(flag.item()) == world
++    else:
++        result = local
++    _TP_ARCH_CACHE[pred] = result
++    return result
++
++
+ def make_hc_mixing_params(
+     hc_mult: int, hidden_size: int
+ ) -> Tuple[
+@@ -1011,7 +1083,7 @@ class MQALayer(MqaAttentionBase):
+             self.alt_streams = None
+             self.alt_streams_indexer = None
+ 
+-        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
++        self._multi_stream_bs_limit = 128 if _tp_all("blackwell") else 64
+ 
+         self.compressor = None
+         self.indexer = None
+@@ -1494,7 +1566,7 @@ class MQALayer(MqaAttentionBase):
+         x_linear = x_quant if x_quant is not None else x
+         early_sources = (
+             _is_cuda
+-            and get_platform().is_blackwell
++            and _tp_all("blackwell")
+             and self.compress_ratio in (1, 2)
+             and self.alt_streams is not None
+             and (self.compressor is not None or self.indexer is not None)
+@@ -1974,6 +2046,10 @@ class MQALayer(MqaAttentionBase):
                      save_kv_cache=save_kv_cache,
                  )
              o = o[:, tp_slice, :]
 +        # On SM8 decode, the inverse RoPE is fused into the wo_a bf16 einsum
 +        # below (skip the standalone pass; keep `o` roped). Prefill and non-SM8
 +        # still apply it here as usual.
-+        fuse_wo_a_rope = _IS_SM8() and forward_batch.forward_mode.is_decode()
++        fuse_wo_a_rope = _tp_all("sm8") and forward_batch.forward_mode.is_decode()
          if (
              self.wo_a_fp8
              and _wo_a_fp8_mxscale_fused_invrope is not None
-@@ -2006,7 +2037,7 @@ class MQALayer(MqaAttentionBase):
+@@ -2006,7 +2082,7 @@ class MQALayer(MqaAttentionBase):
                      sin4,
                      qk_nope_dim=self.qk_nope_head_dim,
                  )
@@ -2881,7 +3243,7 @@ index 228af8586..0733553a3 100644
                  fused_rope_inplace(
                      o[..., -self.qk_rope_head_dim :],
                      None,
-@@ -2065,7 +2096,12 @@ class MQALayer(MqaAttentionBase):
+@@ -2065,7 +2141,12 @@ class MQALayer(MqaAttentionBase):
                  if wo_a_weight is not None:
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
@@ -2895,6 +3257,145 @@ index 228af8586..0733553a3 100644
                      )
                  else:
                      o = _apply_gguf_grouped_wo_a(
+@@ -2408,7 +2489,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+         if (
+             _is_cuda
+-            and get_platform().is_blackwell
++            and _tp_all("blackwell")
+             and self.hc_pre_from_prev_sublayer
+             and self.hc_mult == 4
+             and x.shape[1] == 5120
+@@ -2426,7 +2507,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+             if (
+-                get_platform().is_sm90
++                _tp_all("sm90")
+                 and x.is_cuda
+                 and 1 <= x.shape[0] <= 64
+                 and x.shape[1] == 5120
+@@ -2671,8 +2752,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+             x.is_cuda
+             and torch.version.cuda is not None
+             and (
+-                get_platform().is_blackwell
+-                or (get_platform().is_sm90 and x.shape[0] == 1)
++                _tp_all("blackwell")
++                or (_tp_all("sm90") and x.shape[0] == 1)
+             )
+             and x.dtype == torch.bfloat16
+         ):
+@@ -2745,7 +2826,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         stats_stream = (
+             self.hc_stats_stream
+             if forward_batch.forward_mode.is_decode()
+-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
++            and (not _tp_all("sm90") or hidden_states.shape[0] == 1)
+             else None
+         )
+         residual = hidden_states
+@@ -3299,6 +3380,12 @@ class DeepseekV4Model(nn.Module):
+         super().__init__()
+         self.config = config
+         self.pp_group = get_pp_group()
++        # Resolve arch capability across the TP group once, here (never inside a
++        # forward/capture), so every branch below and in the decoder layers reads
++        # a rank-uniform decision. On a homogeneous host this equals the local
++        # get_platform() value; on a mixed-arch host it keeps the graphs aligned.
++        for _pred in ("blackwell", "sm90", "hopper_or_blackwell", "sm8"):
++            _tp_all(_pred)
+         self.hidden_size = config.hidden_size
+         if self.pp_group.is_first_rank:
+             embedding_quant_config = (
+@@ -3339,7 +3426,7 @@ class DeepseekV4Model(nn.Module):
+         self.hc_stats_stream = (
+             device_module.Stream()
+             if _is_cuda
+-            and (get_platform().is_blackwell or get_platform().is_sm90)
++            and _tp_all("hopper_or_blackwell")
+             and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+             and config.hc_pre_from_prev_sublayer
+             else None
+@@ -4451,6 +4538,61 @@ class DeepseekV4ForCausalLM(nn.Module):
+ 
+         return name
+ 
++    def _prewarm_hc_mix_kernels(self) -> None:
++        """Eagerly compile+load BOTH branches of ``_hc_mix_and_combine``.
++
++        ``_hc_mix_and_combine`` picks its branch from ``_tp_all(...)`` (a TP-group
++        AND), so a homogeneous host only ever exercises one of the two paths. On a
++        mixed SM86+SM120 host the group resolves to the non-Blackwell branch on
++        every rank, which means the Blackwell ranks suddenly run the split-K
++        ``hc_mix_stats`` path they never warm on a pure-Blackwell box - its first
++        ``cuModuleLoadData`` then lands inside CUDA-graph capture and deadlocks the
++        group while the SM86 ranks (whose native path is already warm) race into
++        the next collective. The mirror case holds for ``hc_mix_stats_sinkhorn`` on
++        the SM86 ranks. Warm both, unconditionally, so the first launch of either
++        branch never happens under capture, whatever the group decides.
++
++        Both kernels specialize on batch through ``BLOCK_M`` (8 vs 16) plus
++        Triton's ``m == 1`` / divisible-by-16 hints, so sweep the widths to load
++        every specialization the decode/verify graphs reach; cubins are on-disk
++        cached, so this is only paid on a cold cache.
++        """
++        layer = next(
++            (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
++            None,
++        )
++        if layer is None:
++            return
++        from sglang.kernels.ops.layernorm.mhc import (
++            _HC_MIX_BLOCK_K,
++            hc_mix_stats,
++            hc_mix_stats_sinkhorn,
++        )
++
++        k = layer.hc_attn_fn.shape[1]
++        if k % _HC_MIX_BLOCK_K != 0:  # _num_slices_for requires BLOCK_K to divide K
++            return
++        dev = layer.hc_attn_fn.device
++        # {1, 2} -> BLOCK_M=8 (the m==1 and generic specs); {12, 16} -> BLOCK_M=16
++        # (the non-div-16 and div-16 specs). Together they cover every bs/token
++        # count the decode and target-verify graphs capture.
++        for m in (1, 2, 12, 16):
++            x_flat = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
++            # Non-Blackwell branch: split-K stats + aten hc_split_sinkhorn.
++            hc_mix_stats(x_flat, layer.hc_attn_fn, layer.rms_norm_eps)
++            # Blackwell branch: split-K fused stats + sinkhorn.
++            hc_mix_stats_sinkhorn(
++                x_flat,
++                layer.hc_attn_fn,
++                layer.hc_attn_scale,
++                layer.hc_attn_base,
++                layer.hc_mult,
++                layer.hc_sinkhorn_iters,
++                layer.rms_norm_eps,
++                layer.hc_eps,
++            )
++        torch.cuda.synchronize()
++
+     def _prewarm_mhc_kernels(self) -> None:
+         """One-shot MHC JIT prewarm at load time, synced across ranks.
+ 
+@@ -4461,6 +4603,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+         if self._mhc_prewarmed_at_load:
+             return
+         self._mhc_prewarmed_at_load = True
++        # Warm BOTH branches of _hc_mix_and_combine at a rank-uniform point
++        # *before* capture: the group decision (_tp_all) can send either arch onto
++        # the branch it does not natively run, and that branch's first
++        # cuModuleLoadData must not be the capture warmup. Kept off the tilelang
++        # gate so it runs even when the tilelang prewarm below is disabled.
++        if not (_is_npu or _is_xpu) and torch.version.cuda is not None:
++            try:
++                self._prewarm_hc_mix_kernels()
++            except Exception as e:  # never block startup on a warmup miss
++                logger.debug("hc-mix prewarm skipped: %s", e)
+         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+             return
+         layer = next(
 diff --git a/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py b/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py
 new file mode 100644
 index 000000000..7b5d6cc6b
@@ -3207,10 +3708,10 @@ index 000000000..7b5d6cc6b
 +    )
 +    return out
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index 18589fc75..e851aead8 100644
+index 18589fc75..06bce545e 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
-@@ -259,63 +259,65 @@ def device_context(device: torch.device):
+@@ -259,63 +259,91 @@ def device_context(device: torch.device):
              raise ValueError(f"Unknown device module: {device}")
  
  
@@ -3318,6 +3819,32 @@ index 18589fc75..e851aead8 100644
 +
 +def is_sm90_supported():
 +    return _check_cuda_device_version([9], (12, 3))
++
++
++def align_cute_dsl_arch_to_current_device() -> None:
++    """Make the CuTe DSL compile for *this* rank's GPU.
++
++    The DSL resolves its target arch through ``detect_gpu_arch()`` ->
++    ``get_compute_capability_major_minor(device_id=0)``, i.e. it always asks CUDA
++    device 0.  On a mixed-arch host (SM86 + SM120 in one TP group) every rank
++    except the one holding device 0 then compiles for the wrong chip and libNVVM
++    dies on a perfectly valid kernel ("target architecture: sm_86" while running
++    on SM120).  Re-resolving from the current device gives the same string the
++    auto-detection would produce on a homogeneous host, so nothing changes there.
++    """
++    if not is_cuda():
++        return
++    try:
++        from cutlass.base_dsl import env_manager as _em
++    except ImportError:
++        return
++    try:
++        major, minor = torch.cuda.get_device_capability()
++    except Exception:
++        return
++    # Same spelling the DSL's own detection uses (arch-specific suffix >= SM90).
++    arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
++    _em.detect_gpu_arch = lambda _prefix, _arch=arch: _arch
  
  
  # GB10 (DGX Spark and OEM equivalents). Not expressible via
