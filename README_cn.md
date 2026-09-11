@@ -102,10 +102,12 @@ lk_moe 集成被整理为 [`patches/`](./patches) 下的可移植补丁：
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 | EPYC 7642 *2 | 16ch ddr4 3200 | 5060Ti * 2 | 780 t/s [输入 32768] | 29 t/s [输入 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 [ 分支: 0.5.19-lkmoe-deepseekv4-sm80plus]| EPYC 7642 *2 | 16ch ddr4 3200 | 3090 * 2 | 1060 t/s [输入 32768] | 31 t/s [输入 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [输入 131072] | 75 t/s [输入 131072] | 100~132 t/s |
+| deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
 ### 版本变更
 
 ```bash
+2026-09-11: Lsglang-v1.5.3 - 混合架构 TP=4（SM86+SM120）图捕获修复，SM120 sparse-MLA prefill 原生快路（extra 源 64-token 页拆分）。分支: dsv4.1-lkmoe-sm80plus
 2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86（RTX 30x）支持（补丁 01+02）。分支: dsv4.1-lkmoe-sm80plus
 2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3，纯 lk_moe（补丁 01）。分支: dsv4.1-lkmoe
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+支持
@@ -126,7 +128,7 @@ Lsglang 已验证的大部分原版 MOE 模型（Qwen3/GLM/MiniMax 等系列）�
 gemma-4-26B-A4B-it、NVIDIA-Nemotron-3-Super-120B-A12B-BF16、Qwen3.6/3.5-35B-A3B、
 Qwen3.5-122B-A10B、Qwen3.5-397B-A17B、Qwen3-Coder-Next / 30B-A3B、Qwen3-VL-30B、
 MiniMax-M2.7/2.5/2.1、GLM-5.2-NVFP4、GLM-5.1/5.0-FP8、GLM-4.7(-Flash)/4.6V、Kimi k2.6/k2.5、
-**deepseek-ai/DeepSeek-V4-Flash-0731 [sm80+]**。
+**deepseek-ai/DeepSeek-V4-Flash-0731 [sm80+]**、**deepseek-ai/DeepSeek-V4.1-Flash [sm80+]**。
 
 运行时支持的量化格式：bfloat16 / float16、fp8、nvfp4、mxfp4、awq 4bit 对称量化（`w4a16`）。
 AWQ 模型：https://hf-mirror.com/cyankiwi

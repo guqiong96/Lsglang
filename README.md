@@ -109,10 +109,12 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0 | EPYC 7642 *2 | 16ch ddr4 3200 | 5060Ti * 2 | 780 t/s [in 32768] | 29 t/s [in 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0[ branch: 0.5.19-lkmoe-deepseekv4-sm80plus] | EPYC 7642 *2 | 16ch ddr4 3200 | 3090 * 2 | 1060 t/s [in 32768] | 31 t/s [in 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [in 131072] | 75 t/s [in 131072] | 100~132 t/s |
+| deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
 ### Version history
 
 ```bash
+2026-09-11: Lsglang-v1.5.3 - mixed-arch TP=4 (SM86+SM120) capture-safe, SM120 sparse-MLA prefill fast path (extra-source 64-page split). branch: dsv4.1-lkmoe-sm80plus
 2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patches 01+02). branch: dsv4.1-lkmoe-sm80plus
 2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3, pure lk_moe (patch 01). branch: dsv4.1-lkmoe
 2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+ support
@@ -132,7 +134,8 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 Most original MOE models verified on Lsglang (Qwen3/GLM/MiniMax series etc.):
 gemma-4-26B-A4B-it, NVIDIA-Nemotron-3-Super-120B-A12B-BF16, Qwen3.6/3.5-35B-A3B, Qwen3.5-122B-A10B,
 Qwen3.5-397B-A17B, Qwen3-Coder-Next / 30B-A3B, Qwen3-VL-30B, MiniMax-M2.7/2.5/2.1, GLM-5.2-NVFP4,
-GLM-5.1/5.0-FP8, GLM-4.7(-Flash)/4.6V, Kimi k2.6/k2.5, **deepseek-ai/DeepSeek-V4-Flash-0731 [sm80+]**.
+GLM-5.1/5.0-FP8, GLM-4.7(-Flash)/4.6V, Kimi k2.6/k2.5, **deepseek-ai/DeepSeek-V4-Flash-0731 [sm80+]**,
+**deepseek-ai/DeepSeek-V4.1-Flash [sm80+]**.
 
 Quantization formats supported at runtime: bfloat16 / float16, fp8, nvfp4, mxfp4,
 awq 4bit symmetric (`w4a16`). AWQ models: https://hf-mirror.com/cyankiwi

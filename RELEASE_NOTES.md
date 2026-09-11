@@ -48,7 +48,7 @@ the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
 |----|--------------------|---------|-------|
 | **80** | A100, A30 | 01 + 02 | SM8 path shared with SM86 (`w8a16` Triton GEMMs, native-precision fp8 emulation) |
 | **86** | RTX 3090/3080, A6000 | 01 + 02 | ✅ verified: V4.1-Flash on 2×3090 (TP=2) and mixed 4-GPU TP=4 |
-| **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | native Triton fp8-dot; patch 02 adds FP4-MoE→Marlin auto-select |
+| **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK) |
 | **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
 | **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
 | **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; prefill fast path native since this release |
