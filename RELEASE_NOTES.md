@@ -120,7 +120,7 @@ whose FP4 kernels are SM90+ only, so weight loading dies with `ValueError: Inval
 ## Known issue (open)
 
 - **4-GPU mixed TP=4 DSPARK throughput** currently trails the dual-3090 reference
-  (~15–20 vs ~30–35 t/s, same prompt; non-speculative decode unaffected). GPU-side
+  (~20 vs ~30–35 t/s, same prompt; non-speculative decode unaffected). GPU-side
   traces show no kernel regression; under investigation (step serialization /
   4-way NCCL sync on PCIe-only links). Single-arch TP=2 paths unaffected.
 
