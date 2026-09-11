@@ -51,7 +51,7 @@ the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
 | **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK) |
 | **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
 | **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
-| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; prefill fast path native since this release |
+| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; prefill fast path native since this release |
 
 ✅ = measured on reference hardware (dual-EPYC host). Other rows: enabled-by-construction
 on the shared code paths, not individually bench-tested here — please report issues.
@@ -66,11 +66,11 @@ pip install lsglang==1.5.3          # or build the wheel from tag lsglang-v1.5.3
 | Patch | Applies to | Contents |
 |-------|-----------|----------|
 | [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe MOE hybrid inference |
-| [`02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill extra-split |
+| [`02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill extra-split |
 
 ```bash
-git apply patches/01_lk_moe__dsv4.1.patch            # SM90+/SM120+ stop here
-git apply patches/02_sm80_support__dsv4.1.patch      # + SM80/86 & mixed-arch support
+git apply patches/01_lk_moe__dsv4.1.patch            # SM90/SM100 (and SM120 basic) stop here
+git apply patches/02_sm80_sm120_support__dsv4.1.patch # + SM80/86 ports + SM120 mixed-arch & prefill fast path
 ```
 
 ## Launch — DeepSeek-V4.1-Flash (SM86, reference)

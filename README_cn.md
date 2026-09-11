@@ -68,9 +68,10 @@ lk_moe 集成被整理为 [`patches/`](./patches) 下的可移植补丁：
 - [`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) —— **纯 lk_moe** MOE 混合推理：
   上游 `dsv4.1` 分支（提交 `1aa0e962b`）与 `dsv4.1-lkmoe` 分支的全部差异。干净 `dsv4.1` checkout 上
   单独应用即可（SM89+/SM120+ 用它一个就够）。
-- [`patches/02_sm80_support__dsv4.1.patch`](./patches/02_sm80_support__dsv4.1.patch) —— **可选**，
-  在 01 之上为 SM80/SM86（Ampere / RTX 30）加 DeepSeek-V4.1 支持（分支 `dsv4.1-lkmoe-sm80plus`）。
-  在 01 之后应用：`git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_support__dsv4.1.patch`。
+- [`patches/02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) —— **可选**，
+  在 01 之上加 DeepSeek-V4.1 的 **SM80/SM86（Ampere / RTX 30）** attention 与 GEMM 移植，
+  **以及 SM120 的混合 arch TP + sparse-MLA prefill** 修复（分支 `dsv4.1-lkmoe-sm80plus`）。
+  在 01 之后应用：`git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_sm120_support__dsv4.1.patch`。
 
 | 文件 | 作用 |
 |---|---|
