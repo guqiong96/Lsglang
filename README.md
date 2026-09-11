@@ -186,22 +186,6 @@ python -m sglang.launch_server \
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | perf | 1 | `1`: avoid NUMA node OOM |
 | `LK_POWER_SAVING` | power | 0 | `1`: enable CPU power saving |
 
-### Hardware notes (DeepSeek-V4.x)
-
-- **SM8x + `flashinfer_mxfp4`**: FlashInfer has no FP4 kernels for major 8, so on
-  SM80/86/89 the MoE runner resolves to **Marlin** automatically (no flag). CPU-resident
-  layers (the hybrid default) are unaffected.
-- **SM120, TP=4**: the MXFP4 CUTLASS MoE path auto-pads the per-rank intermediate
-  (2304/4 = 576 → **640**) on load, so `intermediate % 128` is no longer a wall.
-- **Mixed-arch host** (SM86 + SM120 in one TP group): the CuTe DSL used to compile every
-  rank for physical GPU 0 (`cuDeviceGet(0)`), crashing SM120 capture with `sm_86` NVVM
-  errors. The model runner now re-points the DSL at each rank's device. Fallback if a
-  CuTe kernel still trips: `FLASHINFER_USE_CUDA_NORM=1` (set before `import flashinfer`).
-- **SM120 sparse-MLA prefill**: the V4.1 extra KV source (128/256-token pages) is now
-  auto-split to the 64-token pages the prefill kernel requires, so long prompts run on
-  the native FlashInfer fast path; `SGLANG_SM120_FLASHMLA_BACKEND=triton` is no longer
-  needed.
-
 ### Installation
 
 ```bash
