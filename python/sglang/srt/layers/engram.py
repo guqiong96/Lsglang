@@ -686,7 +686,36 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self.nvme_table = None
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get():
+            from sglang.srt.layers.engram_nvme import (
+                NvmeEngramStore,
+                validate_configuration,
+            )
+            from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+
+            validate_configuration(
+                get_parallel(),
+                get_schedule(),
+                get_spec(),
+                get_exec().graph,
+                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),
+            )
+            self.nvme_table = NvmeEngramStore(
+                get_model().model_path,
+                layer_id,
+                num_embeddings,
+                dim,
+                envs.SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES.get(),
+                envs.SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES.get(),
+            )
+            self.weight = nn.Parameter(
+                torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            self.scale = nn.Parameter(
+                torch.empty(0, dtype=torch.float8_e8m0fnu), requires_grad=False
+            )
+        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -727,6 +756,11 @@ class EngramEmbedding(nn.Module):
         return self.host_table is not None and self.host_table.layout == "shared"
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.nvme_table is not None:
+            self.nvme_table.validate_weight(
+                "weight" if param is self.weight else "scale", loaded_weight
+            )
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
@@ -738,6 +772,8 @@ class EngramEmbedding(nn.Module):
     def finish_load(self, label: str = ""):
         """Barrier (shared layout) once every rank has written its rows; log how
         the table ended up backed."""
+        if self.nvme_table is not None:
+            self.nvme_table.finish_load()
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
@@ -793,6 +829,8 @@ class EngramEmbedding(nn.Module):
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
+        if self.nvme_table is not None:
+            return self.nvme_table.lookup(indices)
         if self.rows == 0:
             return self._empty(indices).zero_()
         if self.host_table is None and (

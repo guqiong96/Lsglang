@@ -1406,6 +1406,11 @@ class Envs:
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Exact, bounded-memory lookup from an immutable local safetensors shard.
+    # Cache and staging limits are per Engram layer, in bytes.
+    SGLANG_ENABLE_DSV41_ENGRAM_NVME = EnvBool(False)
+    SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES = EnvInt(1 << 30)
+    SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES = EnvInt(128 << 20)
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
     # Diagnostic: disable the decode-only side streams (early compress/indexer
