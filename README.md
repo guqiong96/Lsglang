@@ -77,7 +77,10 @@ The lk_moe integration is captured as portable patches under [`patches/`](./patc
   branch `dsv4.1-lkmoe`. Apply it alone to a clean `dsv4.1` checkout for SM89+/SM120+ GPUs.
 - [`patches/02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) — **optional**,
   DeepSeek-V4.1 support for **SM80/SM86 (Ampere / RTX 30)** attention & GEMM ports **and
-  SM120 heterogeneous-TP + sparse-MLA prefill** fixes, on top of patch 01 (branch
+  SM120 heterogeneous-TP + sparse-MLA prefill** fixes — including mixed-arch CUDA-graph
+  capture hardening (arch predicates resolved per TP group, cold cubins such as the
+  engram-hash kernels prewarmed at load so first launches never land inside a capture),
+  on top of patch 01 (branch
   `dsv4.1-lkmoe-sm80plus`). Apply after 01: `git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_sm120_support__dsv4.1.patch`.
 
 | File | What it does |

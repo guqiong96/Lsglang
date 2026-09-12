@@ -39,8 +39,12 @@ prefill hid it behind accept-amortization.
   chips capture identical graphs (common-denominator path on mixed hosts; single-arch
   hosts byte-identical).
 - **Cold-cubin prewarm**: both HC-mix paths (fused sinkhorn and split aten sinkhorn)
-  are eagerly warmed at load, so a first `cuModuleLoadData` can never land inside a
-  capture collective.
+  *and every engram-hash specialization* (decode/verify/extend modes, the verify
+  `BLOCK` constexpr, `HIST_VIA_SLOTS`, and the `num_real` buckets, plus the verify
+  commit kernel) are eagerly warmed at load, so a first `cuModuleLoadData` can never
+  land inside a capture collective. This closes the cold-cache first-run capture
+  deadlock where one arch hit its warm triton disk cache while its mixed-arch peer
+  cold-loaded inside the capture warmup.
 - **c128 multi-bucket decode graphs are group-consistent**: on a heterogeneous group
   all ranks fall back to one shared 128-aligned bucket table
   (`[128, 512, 1024, 2048, 4096]` ∩ pool width), so capture issues the same number of
