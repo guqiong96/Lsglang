@@ -1,5 +1,18 @@
+diff --git a/python/pyproject.toml b/python/pyproject.toml
+index 852979c3ab..cc42a36ebc 100755
+--- a/python/pyproject.toml
++++ b/python/pyproject.toml
+@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "lsglang"
+-version = "1.5.1"
++version = "1.5.4"
+ description = "SGLang is a fast serving framework for large language models and vision language models."
+ readme = "README.md"
+ requires-python = ">=3.10"
 diff --git a/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py b/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
-index 23d5e3025..8b2992e37 100644
+index 23d5e30258..8b2992e377 100644
 --- a/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
 +++ b/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
 @@ -271,20 +271,28 @@ def sparse_attention_fwd_kernel_v1(
@@ -234,7 +247,7 @@ index 23d5e3025..8b2992e37 100644
  
  
 diff --git a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
-index c689de8f7..3bc83877b 100644
+index c689de8f7e..3bc83877b4 100644
 --- a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
 +++ b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
 @@ -21,6 +21,26 @@ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
@@ -526,7 +539,7 @@ index c689de8f7..3bc83877b 100644
          scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
          scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
 diff --git a/python/sglang/kernels/ops/attention/dsv4/rope_fake_quant_fp4.py b/python/sglang/kernels/ops/attention/dsv4/rope_fake_quant_fp4.py
-index 3f67f1f37..60e77d89a 100644
+index 3f67f1f37f..60e77d89a4 100644
 --- a/python/sglang/kernels/ops/attention/dsv4/rope_fake_quant_fp4.py
 +++ b/python/sglang/kernels/ops/attention/dsv4/rope_fake_quant_fp4.py
 @@ -11,6 +11,11 @@ import triton
@@ -572,7 +585,7 @@ index 3f67f1f37..60e77d89a 100644
      return out
 diff --git a/python/sglang/kernels/ops/attention/dsv4/sparse_mla_kernels.py b/python/sglang/kernels/ops/attention/dsv4/sparse_mla_kernels.py
 new file mode 100644
-index 000000000..31b7f51a1
+index 0000000000..31b7f51a19
 --- /dev/null
 +++ b/python/sglang/kernels/ops/attention/dsv4/sparse_mla_kernels.py
 @@ -0,0 +1,466 @@
@@ -1043,10 +1056,20 @@ index 000000000..31b7f51a1
 +        candidate_block_size=candidate_block_size,
 +    )
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index 906d4aa22..16dfec123 100644
+index 906d4aa22d..102a2b29d4 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-@@ -246,6 +246,23 @@ def _flash_mla_sm120_prefill(
+@@ -13,7 +13,8 @@ separate region at the end of each page.
+ 
+ import logging
+ import math
+-from typing import Optional
++from functools import lru_cache
++from typing import FrozenSet, Optional, Tuple
+ 
+ import torch
+ import triton
+@@ -246,6 +247,23 @@ def _flash_mla_sm120_prefill(
          if extra_indices is not None and extra_indices.dim() == 3
          else extra_indices
      )
@@ -1070,7 +1093,42 @@ index 906d4aa22..16dfec123 100644
      output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
      out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
      _sparse_mla_sm120_paged_attention(
-@@ -449,6 +466,7 @@ def _split_kv_pages_to_64(
+@@ -266,6 +284,34 @@ def _flash_mla_sm120_prefill(
+     return (output.unsqueeze(1), None)
+ 
+ 
++@lru_cache(maxsize=1)
++def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
++    """Read the installed FlashInfer DSV4 decode capabilities once."""
++    try:
++        from flashinfer.mla._sparse_mla_sm120 import (
++            _DECODE_DSV4_DISPATCH,
++            _DECODE_MAX_TOKENS,
++        )
++    except (AttributeError, ImportError):
++        return 0, frozenset()
++
++    return int(_DECODE_MAX_TOKENS), frozenset(
++        heads for heads, _ in _DECODE_DSV4_DISPATCH
++    )
++
++
++def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
++    """Return whether FlashInfer supports this DSV4 decode head count.
++
++    Keep this capability check fail-closed because SGLang can be used with a
++    locally installed FlashInfer even though the release dependency is pinned.
++    The padded 64-head decode path remains the safe fallback for older builds.
++    Prefill head selection is handled separately by the caller.
++    """
++    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
++    return num_tokens <= decode_max_tokens and num_heads in supported_heads
++
++
+ def flash_mla_with_kvcache_sm120(**kwargs):
+     """SM120 FlashMLA sparse decode entry point.
+ 
+@@ -449,6 +495,7 @@ def _split_kv_pages_to_64(
      kv_u8: torch.Tensor,
      src_pbs: int,
      touched_indices: Optional[torch.Tensor] = None,
@@ -1078,7 +1136,7 @@ index 906d4aa22..16dfec123 100644
  ) -> torch.Tensor:
      """Split pbs=N footer-format pages into pbs=64 footer-format pages.
  
-@@ -472,7 +490,7 @@ def _split_kv_pages_to_64(
+@@ -472,7 +519,7 @@ def _split_kv_pages_to_64(
      # Pre-allocated grow-only buffer for page-split output per device.
      dev = kv_u8.device
      buffers = get_resources().buffers
@@ -1087,7 +1145,7 @@ index 906d4aa22..16dfec123 100644
      buf = buffers.get(key)
      if buf is None or buf.shape[0] < num_dst_pages:
          # The first allocation can happen under inference mode (autotune), but
-@@ -501,7 +519,7 @@ def _split_kv_pages_to_64(
+@@ -501,7 +548,7 @@ def _split_kv_pages_to_64(
      if use_mask:
          # Persistent per-device int8 mask, zeroed each call (cheap memset,
          # captured cleanly by CUDA graph). 1 = page is referenced this step.
@@ -1097,7 +1155,7 @@ index 906d4aa22..16dfec123 100644
          if mbuf is None or mbuf.shape[0] < N:
              # The first allocation can happen under inference mode (autotune),
 diff --git a/python/sglang/kernels/ops/embeddings/engram_gather.py b/python/sglang/kernels/ops/embeddings/engram_gather.py
-index d6e5599f1..7e2feec61 100644
+index d6e5599f13..7e2feec61d 100644
 --- a/python/sglang/kernels/ops/embeddings/engram_gather.py
 +++ b/python/sglang/kernels/ops/embeddings/engram_gather.py
 @@ -10,6 +10,11 @@ import torch
@@ -1148,7 +1206,7 @@ index d6e5599f1..7e2feec61 100644
          )
      return out
 diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
-index 01b102fee..c62827b47 100644
+index 01b102feed..c62827b471 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
 +++ b/python/sglang/kernels/ops/layernorm/mhc.py
 @@ -977,6 +977,26 @@ def mhc_pre_big_fuse_with_norm_tilelang(
@@ -1310,7 +1368,7 @@ index 01b102fee..c62827b47 100644
  
 diff --git a/python/sglang/kernels/ops/quantization/fp8_emulate.py b/python/sglang/kernels/ops/quantization/fp8_emulate.py
 new file mode 100644
-index 000000000..cd9daa297
+index 0000000000..cd9daa297b
 --- /dev/null
 +++ b/python/sglang/kernels/ops/quantization/fp8_emulate.py
 @@ -0,0 +1,67 @@
@@ -1382,7 +1440,7 @@ index 000000000..cd9daa297
 +    mag = q * step
 +    return tl.where(x < 0, -mag, mag)
 diff --git a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py
-index da92c781b..289e59767 100644
+index da92c781bc..289e597676 100644
 --- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
 +++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
 @@ -51,6 +51,19 @@ _is_gfx1250 = is_gfx1250_supported()
@@ -1647,7 +1705,7 @@ index da92c781b..289e59767 100644
      else:
          kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 diff --git a/python/sglang/srt/arg_groups/model_hook.py b/python/sglang/srt/arg_groups/model_hook.py
-index cbb896b63..6fd6bd505 100644
+index cbb896b639..6fd6bd5053 100644
 --- a/python/sglang/srt/arg_groups/model_hook.py
 +++ b/python/sglang/srt/arg_groups/model_hook.py
 @@ -38,6 +38,7 @@ from sglang.srt.runtime_context import get_platform
@@ -1690,7 +1748,7 @@ index cbb896b63..6fd6bd505 100644
              envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
              # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
 diff --git a/python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py b/python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py
-index 039bc931c..584ad9664 100644
+index 039bc931ca..584ad96642 100644
 --- a/python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py
 +++ b/python/sglang/srt/arg_groups/model_overrides/deepseek_v4.py
 @@ -14,6 +14,7 @@ from sglang.srt.arg_groups.model_override_base import (
@@ -1712,10 +1770,21 @@ index 039bc931c..584ad9664 100644
                  or get_platform().is_sm120
              )
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index d5dd93396..d4ab7b080 100644
+index d5dd933966..96ffeeb53e 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1424,7 +1424,6 @@ class Envs:
+@@ -1408,6 +1408,10 @@ class Envs:
+     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
+     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
++    # Diagnostic: disable the decode-only side streams (early compress/indexer
++    # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
++    # decode step matches the SM80/86 single-stream structure for A/B.
++    SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS = EnvBool(False)
+     # Pin and map the host table with cudaHostRegister. False leaves the plain
+     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
+     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
+@@ -1424,7 +1428,6 @@ class Envs:
      SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
      SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
@@ -1724,7 +1793,7 @@ index d5dd93396..d4ab7b080 100644
      SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
      # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 6e66a8e0c..78468c732 100644
+index 6e66a8e0c9..78468c7320 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -25,12 +25,18 @@ from sglang.kernels.ops.attention.dsv4 import (
@@ -2244,7 +2313,7 @@ index 6e66a8e0c..78468c732 100644
              q=q_flat,
              kv=kv,
 diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
-index 7dba72aef..b86402636 100644
+index 7dba72aefc..b864026366 100644
 --- a/python/sglang/srt/layers/attention/dsv4/indexer.py
 +++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
 @@ -15,6 +15,8 @@ from typing import (
@@ -2582,7 +2651,7 @@ index 7dba72aef..b86402636 100644
                  fn = fp8_paged_mqa_logits_torch
          elif is_xpu():
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index c69d08e5f..117d9f37c 100644
+index c69d08e5f2..117d9f37c7 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -419,8 +419,28 @@ class Fp8Config(QuantizationConfig):
@@ -2632,7 +2701,7 @@ index c69d08e5f..117d9f37c 100644
          self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
          self.block_quant = (
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6093a4f95..98d6f36fc 100755
+index 6093a4f95d..0a498015f2 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -22,6 +22,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -2644,18 +2713,63 @@ index 6093a4f95..98d6f36fc 100755
  )
  from sglang.srt.environ import envs
  from sglang.srt.layers import deep_gemm_wrapper
-@@ -570,6 +572,10 @@ def dispatch_w8a8_block_fp8_linear(
+@@ -553,6 +555,14 @@ if get_platform().is_sm90 and is_flashinfer_available():
+     from flashinfer.gemm import fp8_blockscale_gemm_sm90
+ 
+ 
++@lru_cache(maxsize=1)
++def _is_ada_sm89() -> bool:
++    """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
++    return _is_cuda and torch.cuda.is_available() and (
++        torch.cuda.get_device_capability() == (8, 9)
++    )
++
++
+ def dispatch_w8a8_block_fp8_linear(
+     weight_block_size: Optional[List[int]] = None,
+     act_scale_ue8m0: bool = False,
+@@ -570,6 +580,15 @@ def dispatch_w8a8_block_fp8_linear(
          # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
          # blocks with ue8m0 scales to the MXFP8 dense kernels instead
          # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
 +        # Before Ada, Triton cannot compile an fp8 operand at all, so use the
 +        # bf16-activation w8a16 kernel instead of the fp8-dot one.
-+        if not fp8_dot_supported():
++        # Ada (SM89) is routed the same way: the fp8-dot kernel only receives
++        # split-K through the SM90 tuned configs, so on decode-M shapes it
++        # streams the weight tiles with too few pipelined CTAs, while the
++        # w8a16 kernel's automatic split-K is tuned exactly for these
++        # weight-bound shapes. This puts SM89 on the proven SM80/86 path.
++        if not fp8_dot_supported() or _is_ada_sm89():
 +            return sm8_w8a16_block_fp8_linear
          return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
  
      backend = get_fp8_gemm_runner_backend()
-@@ -1335,6 +1341,41 @@ def aiter_w8a8_block_fp8_linear(
+@@ -650,10 +669,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
+ 
+ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
+     """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
+-    Requires Blackwell; unresolved auto and Triton settings keep the block kernel.
++    Requires Blackwell. Consumer Blackwell (SM120) resolves on auto as well:
++    there the Triton block kernel falls back to its untuned default config
++    (no split-K outside SM90), while the FlashInfer MXFP8 GEMMs are natively
++    instantiated for sm120. Other settings keep the block kernel unchanged.
+     """
+     backend = get_fp8_gemm_runner_backend()
+-    if not (
++    # initialize_fp8_gemm_config() pre-resolves `auto` to the plain `cutlass`
++    # runner on SM120, but only for the 128x128 block path. This MXFP8 route is
++    # resolved separately, so on SM120 that pre-resolution must read as `auto`
++    # here; otherwise server processes (which call initialize) differ from
++    # bare imports and the 32-wide-K ue8m0 weights silently fall back to Triton.
++    auto_route = backend.is_auto() or (backend.is_cutlass() and get_platform().is_sm120)
++    if auto_route:
++        if not get_platform().is_sm120:
++            return Mxfp8DenseGemmBackend.UNSUPPORTED
++    elif not (
+         backend.is_flashinfer_cutedsl()
+         or backend.is_flashinfer_cutlass()
+         or backend.is_flashinfer_trtllm()
+@@ -1335,6 +1366,41 @@ def aiter_w8a8_block_fp8_linear(
      ).view(*output_shape)
  
  
@@ -2698,7 +2812,7 @@ index 6093a4f95..98d6f36fc 100755
      input: torch.Tensor,
      weight: torch.Tensor,
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index b5fd98325..a8a99253b 100644
+index b5fd98325f..a8a99253ba 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -22,6 +22,9 @@ os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
@@ -2761,7 +2875,7 @@ index b5fd98325..a8a99253b 100644
          precision = (
              "W4A8" if self._use_sm90_humming or self._use_mxfp8_act_scaling else "W4A16"
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
-index 68e56a7ae..4147f2990 100644
+index 68e56a7ae5..4147f2990e 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 @@ -10,6 +10,11 @@ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
@@ -2817,7 +2931,7 @@ index 68e56a7ae..4147f2990 100644
          if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
              raise RuntimeError(
 diff --git a/python/sglang/srt/layers/quantization/utils.py b/python/sglang/srt/layers/quantization/utils.py
-index 84fdac078..113f6b6a7 100644
+index 84fdac0780..113f6b6a75 100644
 --- a/python/sglang/srt/layers/quantization/utils.py
 +++ b/python/sglang/srt/layers/quantization/utils.py
 @@ -622,10 +622,20 @@ def reorder_w1w3_to_w3w1(
@@ -2846,7 +2960,7 @@ index 84fdac078..113f6b6a7 100644
  
  def prepare_static_weights_for_trtllm_fp4_moe(
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index cd539390b..03ab9a40e 100644
+index cd539390b6..03ab9a40e4 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -215,6 +215,7 @@ from sglang.srt.state_capturer.routed_experts import (
@@ -2870,7 +2984,7 @@ index cd539390b..03ab9a40e 100644
          # that the shared TE can be passed to the Mooncake PG backend (avoids
          # creating duplicate TransferEngines).
 diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
-index 1a9ebbde3..e63c78a42 100644
+index 1a9ebbde3e..e63c78a426 100644
 --- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 @@ -91,6 +91,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
@@ -3108,7 +3222,7 @@ index 1a9ebbde3..e63c78a42 100644
  
      def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
 diff --git a/python/sglang/srt/model_executor/runner/flashinfer_autotune.py b/python/sglang/srt/model_executor/runner/flashinfer_autotune.py
-index 51fa74ecd..48c4b6d53 100644
+index 51fa74ecd4..48c4b6d536 100644
 --- a/python/sglang/srt/model_executor/runner/flashinfer_autotune.py
 +++ b/python/sglang/srt/model_executor/runner/flashinfer_autotune.py
 @@ -52,6 +52,27 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
@@ -3149,7 +3263,7 @@ index 51fa74ecd..48c4b6d53 100644
  
      if mr.spec_algorithm.is_speculative():
 diff --git a/python/sglang/srt/model_executor/runner/shape_key.py b/python/sglang/srt/model_executor/runner/shape_key.py
-index 979b2f15c..92789e2b6 100644
+index 979b2f15c5..92789e2b6e 100644
 --- a/python/sglang/srt/model_executor/runner/shape_key.py
 +++ b/python/sglang/srt/model_executor/runner/shape_key.py
 @@ -40,3 +40,4 @@ class ShapeKey:
@@ -3158,7 +3272,7 @@ index 979b2f15c..92789e2b6 100644
      dsa_variant: Optional[str] = None
 +    c128_width: Optional[int] = None
 diff --git a/python/sglang/srt/model_executor/runner_utils/capture_mode.py b/python/sglang/srt/model_executor/runner_utils/capture_mode.py
-index ee7e9afd5..9da610e4d 100644
+index ee7e9afd53..9da610e4df 100644
 --- a/python/sglang/srt/model_executor/runner_utils/capture_mode.py
 +++ b/python/sglang/srt/model_executor/runner_utils/capture_mode.py
 @@ -86,6 +86,23 @@ def _set_capture_dsa_variant(variant: Optional[str]) -> None:
@@ -3186,7 +3300,7 @@ index ee7e9afd5..9da610e4d 100644
  def model_capture_mode():
      global is_capture_mode
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af8586..7d20d55ab 100644
+index 228af85866..0357589db1 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -10,6 +10,7 @@ from typing import (
@@ -3311,7 +3425,59 @@ index 228af8586..7d20d55ab 100644
  def make_hc_mixing_params(
      hc_mult: int, hidden_size: int
  ) -> Tuple[
-@@ -1011,7 +1083,7 @@ class MQALayer(MqaAttentionBase):
+@@ -907,17 +979,45 @@ class MqaAttentionBase(nn.Module):
+         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+         self.freqs_cis: torch.Tensor
+ 
+-    def _local_attn_sink(self) -> torch.Tensor:
++    def _kernel_num_heads(self, num_tokens: int) -> int:
++        if self.attn_tp_size == 1:
++            return self.n_local_heads
++
++        if get_platform().is_sm120:
++            # Prefill already accepts the native per-rank query width.
++            if num_tokens > SM120_DECODE_MAX_TOKENS:
++                return self.n_local_heads
++
++            if envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "flashinfer":
++                from sglang.kernels.ops.attention.flash_mla_sm120 import (
++                    flashinfer_dsv4_decode_supports_num_heads,
++                )
++
++                if flashinfer_dsv4_decode_supports_num_heads(
++                    self.n_local_heads, num_tokens
++                ):
++                    return self.n_local_heads
++
++        # Other FlashMLA implementations retain their existing padded shape.
++        return 64 if self.n_local_heads <= 64 else self.n_heads
++
++    def _local_attn_sink(self, kernel_num_heads: Optional[int] = None) -> torch.Tensor:
+         if self.attn_tp_size == 1:
+             return self.attn_sink
++        rank = self.attn_tp_rank
++        num_heads = self.n_local_heads
++        padded_num_heads = 64 if num_heads <= 64 else self.n_heads
++        if kernel_num_heads is None:
++            # Preserve the legacy contract for subclasses such as DSpark that
++            # always pad their attention query independently of this helper.
++            kernel_num_heads = padded_num_heads
++        assert kernel_num_heads >= num_heads
+         if self._attn_sink_local is None:
+-            rank = self.attn_tp_rank
+-            num_heads = self.n_local_heads
+-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+-            sink = self.attn_sink.new_zeros(padded_num_heads)
++            sink_num_heads = max(kernel_num_heads, padded_num_heads)
++            sink = self.attn_sink.new_zeros(sink_num_heads)
+             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+             self._attn_sink_local = sink
+-        return self._attn_sink_local
++        return self._attn_sink_local[:kernel_num_heads]
+ 
+     @contextmanager
+     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+@@ -1011,7 +1111,7 @@ class MQALayer(MqaAttentionBase):
              self.alt_streams = None
              self.alt_streams_indexer = None
  
@@ -3320,7 +3486,7 @@ index 228af8586..7d20d55ab 100644
  
          self.compressor = None
          self.indexer = None
-@@ -1494,7 +1566,7 @@ class MQALayer(MqaAttentionBase):
+@@ -1494,11 +1594,12 @@ class MQALayer(MqaAttentionBase):
          x_linear = x_quant if x_quant is not None else x
          early_sources = (
              _is_cuda
@@ -3329,7 +3495,46 @@ index 228af8586..7d20d55ab 100644
              and self.compress_ratio in (1, 2)
              and self.alt_streams is not None
              and (self.compressor is not None or self.indexer is not None)
-@@ -1974,6 +2046,10 @@ class MQALayer(MqaAttentionBase):
+             and forward_batch.forward_mode.is_decode()
++            and not envs.SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS.get()
+         )
+         src_stream = None
+         if early_sources:
+@@ -1843,19 +1944,11 @@ class MQALayer(MqaAttentionBase):
+         )
+ 
+         tp_slice, q_padded, q_out = slice(None), None, None
+-        # Above this the SM120 route is the prefill kernel, which takes
+-        # arbitrary h_q, so the decode pad below would just be sliced back off.
+-        skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
+-        if self.attn_tp_size > 1:
+-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+-            # this rank and padded to match.
+-            padded_num_heads = (
+-                self.n_local_heads
+-                if skip_decode_pad
+-                else (64 if self.n_local_heads <= 64 else self.n_heads)
+-            )
++        kernel_num_heads = self._kernel_num_heads(x.shape[0])
++        if kernel_num_heads != self.n_local_heads:
++            # Backends without an exact-head specialization retain the existing
++            # padded shape. attn_sink is sliced to this rank and padded to match.
++            padded_num_heads = kernel_num_heads
+             # The kernel reads all padded heads; uninitialized values can affect real-head
+             # outputs, so the padding must be zero even though only real heads are written.
+             if self.is_dsv41:
+@@ -1880,7 +1973,7 @@ class MQALayer(MqaAttentionBase):
+                 q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+             tp_slice = slice(0, self.n_local_heads)
+             q_out = q_padded[:, tp_slice, :]
+-        attn_sink = self._local_attn_sink()
++        attn_sink = self._local_attn_sink(kernel_num_heads)
+ 
+         if enable_multi_stream:
+             # Multi-stream path always fuses cache write into the K kernel,
+@@ -1974,6 +2067,10 @@ class MQALayer(MqaAttentionBase):
                      save_kv_cache=save_kv_cache,
                  )
              o = o[:, tp_slice, :]
@@ -3340,7 +3545,7 @@ index 228af8586..7d20d55ab 100644
          if (
              self.wo_a_fp8
              and _wo_a_fp8_mxscale_fused_invrope is not None
-@@ -2006,7 +2082,7 @@ class MQALayer(MqaAttentionBase):
+@@ -2006,7 +2103,7 @@ class MQALayer(MqaAttentionBase):
                      sin4,
                      qk_nope_dim=self.qk_nope_head_dim,
                  )
@@ -3349,7 +3554,7 @@ index 228af8586..7d20d55ab 100644
                  fused_rope_inplace(
                      o[..., -self.qk_rope_head_dim :],
                      None,
-@@ -2065,7 +2141,12 @@ class MQALayer(MqaAttentionBase):
+@@ -2065,7 +2162,12 @@ class MQALayer(MqaAttentionBase):
                  if wo_a_weight is not None:
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
@@ -3363,7 +3568,7 @@ index 228af8586..7d20d55ab 100644
                      )
                  else:
                      o = _apply_gguf_grouped_wo_a(
-@@ -2408,7 +2489,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2408,7 +2510,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          if (
              _is_cuda
@@ -3372,7 +3577,7 @@ index 228af8586..7d20d55ab 100644
              and self.hc_pre_from_prev_sublayer
              and self.hc_mult == 4
              and x.shape[1] == 5120
-@@ -2426,7 +2507,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2426,7 +2528,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
              if (
@@ -3381,7 +3586,7 @@ index 228af8586..7d20d55ab 100644
                  and x.is_cuda
                  and 1 <= x.shape[0] <= 64
                  and x.shape[1] == 5120
-@@ -2671,8 +2752,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2671,8 +2773,8 @@ class DeepseekV4DecoderLayer(nn.Module):
              x.is_cuda
              and torch.version.cuda is not None
              and (
@@ -3392,16 +3597,17 @@ index 228af8586..7d20d55ab 100644
              )
              and x.dtype == torch.bfloat16
          ):
-@@ -2745,7 +2826,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2745,7 +2847,8 @@ class DeepseekV4DecoderLayer(nn.Module):
          stats_stream = (
              self.hc_stats_stream
              if forward_batch.forward_mode.is_decode()
 -            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
 +            and (not _tp_all("sm90") or hidden_states.shape[0] == 1)
++            and not envs.SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS.get()
              else None
          )
          residual = hidden_states
-@@ -3299,6 +3380,12 @@ class DeepseekV4Model(nn.Module):
+@@ -3299,6 +3402,12 @@ class DeepseekV4Model(nn.Module):
          super().__init__()
          self.config = config
          self.pp_group = get_pp_group()
@@ -3414,7 +3620,7 @@ index 228af8586..7d20d55ab 100644
          self.hidden_size = config.hidden_size
          if self.pp_group.is_first_rank:
              embedding_quant_config = (
-@@ -3339,7 +3426,7 @@ class DeepseekV4Model(nn.Module):
+@@ -3339,7 +3448,7 @@ class DeepseekV4Model(nn.Module):
          self.hc_stats_stream = (
              device_module.Stream()
              if _is_cuda
@@ -3423,7 +3629,15 @@ index 228af8586..7d20d55ab 100644
              and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
              and config.hc_pre_from_prev_sublayer
              else None
-@@ -4451,6 +4538,61 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -3384,6 +3493,7 @@ class DeepseekV4Model(nn.Module):
+         if (
+             _is_cuda
+             and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
++            and not envs.SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS.get()
+             and self.pp_group.world_size == 1
+             and not is_dp_attention_enabled()
+             and config.vision_n_layers == 0
+@@ -4451,6 +4561,61 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          return name
  
@@ -3485,7 +3699,7 @@ index 228af8586..7d20d55ab 100644
      def _prewarm_mhc_kernels(self) -> None:
          """One-shot MHC JIT prewarm at load time, synced across ranks.
  
-@@ -4461,6 +4603,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4461,6 +4626,16 @@ class DeepseekV4ForCausalLM(nn.Module):
          if self._mhc_prewarmed_at_load:
              return
          self._mhc_prewarmed_at_load = True
@@ -3504,7 +3718,7 @@ index 228af8586..7d20d55ab 100644
          layer = next(
 diff --git a/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py b/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py
 new file mode 100644
-index 000000000..7b5d6cc6b
+index 0000000000..7b5d6cc6b8
 --- /dev/null
 +++ b/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py
 @@ -0,0 +1,305 @@
@@ -3814,7 +4028,7 @@ index 000000000..7b5d6cc6b
 +    )
 +    return out
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index 18589fc75..06bce545e 100644
+index 18589fc75e..06bce545ea 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
 @@ -259,63 +259,91 @@ def device_context(device: torch.device):

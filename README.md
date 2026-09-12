@@ -112,24 +112,6 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [in 131072] | 75 t/s [in 131072] | 100~132 t/s |
 | deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
-### Version history
-
-```bash
-2026-09-11: Lsglang-v1.5.3 - mixed-arch TP=4 (SM86+SM120) capture-safe, SM120 sparse-MLA prefill fast path (extra-source 64-page split). branch: dsv4.1-lkmoe-sm80plus
-2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patches 01+02). branch: dsv4.1-lkmoe-sm80plus
-2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3, pure lk_moe (patch 01). branch: dsv4.1-lkmoe
-2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+ support
-2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types, e.g. nvidia/GLM-5.2-NVFP4
-2026-07-05: Lsglang-v1.4.0 - GPU prefill speed, CPU AVX512 opt, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, sglang v0.5.14
-2026-06-05: Lsglang-v1.3.0 - upgraded lk_moe, supports nvfp4/mxfp4, added LVLLM_GPU_RESIDENT_MOE_EXPERTS
-2026-04-06: Lsglang-v1.2.0 - LK_POWER_SAVING=1, FP8+BF16+AWQ4bit mixed MOE layer inference
-2026-04-03: Lsglang-v1.1.4 - local sgl-kernel compilation to fix known issues
-2026-03-11: Lsglang-v1.1.3 - FP8/AWQ4bit no extra memory with GPU prefill
-2026-03-05: Lsglang-v1.1.0 - GPU prefill support
-2026-02-25: Lsglang-v1.0.6 - bug fixes, new models
-2026-02-10: Lsglang-v1.0.0 - ported from LvLLM; verified BF16/F16, FP8, AWQ 4bit
-```
-
 ### Supported models & quant formats
 
 Most original MOE models verified on Lsglang (Qwen3/GLM/MiniMax series etc.):

@@ -1,14 +1,36 @@
-# Lsglang-v1.5.3
+# Lsglang-v1.5.4
+
+https://github.com/guqiong96/Lsglang/tree/dsv4.1-lkmoe-sm80plus
 
 **Base:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) · **lk_moe v2.4.3**
-**Type:** Multi-GPU support release — **mixed-arch TP groups (SM86 + SM120)** and native
-**SM120 sparse-MLA prefill** fast path
-**Wheel:** `lsglang-1.5.3` — use this single wheel for all GPUs (SM80 → SM120)
+**Type:** Decode-throughput release — DeepSeek-V4.1 **plain-decode** fast path on SM89 / SM120
+**Wheel:** `lsglang-1.5.4` — use this single wheel for all GPUs (SM80 → SM120)
 
-Same code paths as `v1.5.2` for single-arch hosts; this release adds TP=4 /
-mixed-GPU correctness and removes the SM120 prefill fallback requirement.
+Same code paths as `v1.5.3` for single-arch hosts and for speculative (DSPARK) decode;
+this release fixes the **plain-decode** block-fp8 linear route on SM89 / SM120. It inherits
+`v1.5.3`'s mixed-arch TP=4 capture safety and the SM120 sparse-MLA prefill fast path.
 
 ## What's new
+
+### DeepSeek-V4.1 plain-decode throughput (SM89 + SM120) — fixed
+On non-SM80 archs the dense block-fp8 linears (block `[32, 32]` + `ue8m0` scales = MXFP8
+semantics: `wqkv_a`, `wq_b`, `wo_b`, `wkv`, the indexer `wq_b`, the shared-expert and
+engram projections) fell back to the Triton block kernel's **untuned default config**
+(`BLOCK_N=32`, no split-K outside SM90). At decode-M=1 the weight stream saturates on too
+few CTAs, so only **plain decode** looked slow (SM120 ~15 t/s, SM89 ~18 t/s); DSPARK and
+prefill hid it behind accept-amortization.
+- **SM120**: `auto` now resolves these weights to **FlashInfer MXFP8 (CUTLASS)**. The
+  server pre-resolves `auto → cutlass` for the 128×128 block path; that pre-resolution is
+  now treated as `auto` for this *separate* MXFP8 route, so a server process routes exactly
+  like a bare import. Verified 2× RTX 5060Ti TP=2: plain decode **15 → 21 t/s**.
+- **SM89**: routed to the tuned **`w8a16`** kernel (the proven SM80/86 path with automatic
+  split-K) instead of the fp8-dot Triton kernel (no split-K tuned config on Ada).
+  Verified on 2× RTX 4080 SUPER.
+- **#36655 backport**: SM120 sparse-MLA decode uses the exact per-rank head count instead
+  of padding to 64 heads when the installed FlashInfer advertises it (fail-closed; the
+  padded path stays the fallback for older builds).
+- New diagnostic `SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS=1` (default off) collapses the
+  three decode-only side streams to the SM80/86 single-stream structure for A/B.
 
 ### Mixed-arch TP group (e.g. 2× RTX 3090 + 2× RTX 5060Ti, TP=4) — works end to end
 - **Forward structure is now TP-group uniform.** Every arch predicate that changes the
@@ -48,10 +70,10 @@ the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
 |----|--------------------|---------|-------|
 | **80** | A100, A30 | 01 + 02 | SM8 path shared with SM86 (`w8a16` Triton GEMMs, native-precision fp8 emulation) |
 | **86** | RTX 3090/3080, A6000 | 01 + 02 | ✅ verified: V4.1-Flash on 2×3090 (TP=2) and mixed 4-GPU TP=4 |
-| **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK) |
+| **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK); plain decode via `w8a16` block-fp8 route since v1.5.4 |
 | **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
 | **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
-| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; prefill fast path native since this release |
+| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; sparse-MLA prefill native since v1.5.3, plain-decode block-fp8 → FlashInfer MXFP8 (CUTLASS) since v1.5.4 |
 
 ✅ = measured on reference hardware (dual-EPYC host). Other rows: enabled-by-construction
 on the shared code paths, not individually bench-tested here — please report issues.
@@ -59,10 +81,10 @@ SM8x ranks mixed with SM12x ranks run on the common-denominator path (see What's
 
 ## Install / build
 ```bash
-pip install lsglang==1.5.3          # or build the wheel from tag lsglang-v1.5.3
+pip install lsglang==1.5.4          # or build the wheel from tag lsglang-v1.5.4
 ```
 
-## Patches (`patches/`)
+## Patches (`patches/` Note: these patches are only meant to document the diff against upstream sglang. They are already included in the lsglang install and can be ignored.)
 | Patch | Applies to | Contents |
 |-------|-----------|----------|
 | [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe MOE hybrid inference |
@@ -103,7 +125,11 @@ sglang serve \
   --chunked-prefill-size 8192 \
   --mem-fraction-static 0.95 \
   --cuda-graph-backend-prefill disabled \
-  --disable-shared-experts-fusion
+  --disable-shared-experts-fusion \
+   --speculative-algo DSPARK \
+  --speculative-dspark-block-size 5 \
+  --speculative-attention-mode decode  \
+  --enable-decoder-swa-bounded-replay 
 ```
 
 Adjust `--model` path, `CUDA_VISIBLE_DEVICES` and `LK_THREADS` to your host.
@@ -119,18 +145,25 @@ whose FP4 kernels are SM90+ only, so weight loading dies with `ValueError: Inval
 
 ## Additional support branches (v0.5.19 series)
 
+### DeepSeek V4.1 Flash
+| Branch | Arch |
+|--------|------|
+| https://github.com/usrlocalben/Lsglang/tree/ds41 by usrlocalben | SM120 |
+
+Related issue: [guqiong96/Lsglang#25](https://github.com/guqiong96/Lsglang/issues/25)
+
 ### DeepSeek V4 (SM80+)
 
 | Branch | Arch |
 |--------|------|
-| [0.5.19-lkmoe-deepseekv4-sm80plus](https://github.com/guqiong96/Lsglang/tree/0.5.19-lkmoe-deepseekv4-sm80plus) | SM80+ |
+| https://github.com/guqiong96/Lsglang/tree/0.5.19-lkmoe-deepseekv4-sm80plus | SM80+ |
 
 ### GLM-5.3 Flash (SM80+ / SM120+)
 
 | Branch | Arch |
 |--------|------|
-| [pr-20-22-contd](https://github.com/usrlocalben/Lsglang/commits/pr-20-22-contd/) by usrlocalben | SM120+ |
-| [lkmoe-glm5.3-flash-sm80plus](https://github.com/guqiong96/Lsglang/tree/lkmoe-glm5.3-flash-sm80plus) by a775828b-dot and guqiong96 | SM80+ |
+| https://github.com/usrlocalben/Lsglang/commits/pr-20-22-contd/ by usrlocalben | SM120+ |
+| https://github.com/guqiong96/Lsglang/tree/lkmoe-glm5.3-flash-sm80plus by a775828b-dot and guqiong96 | SM80+ |
 
 Related issue: [guqiong96/Lsglang#21](https://github.com/guqiong96/Lsglang/issues/21)
 
@@ -141,4 +174,24 @@ SM89 requires the flash-attention PR #2751 patch (prebuilt `flash_attn-2.8.4+pr2
 
 | Branch | Arch | Author |
 |--------|------|--------|
-| [feat/qwen38-flash-next](https://github.com/lovedheart/sglang/tree/feat/qwen38-flash-next) | SM89+ / SM120+ | lovedheart |
+| [https://github.com/lovedheart/sglang/tree/feat/qwen38-flash-next | SM89+ / SM120+ | lovedheart |
+
+## Version history
+
+```bash
+2026-09-12: Lsglang-v1.5.4 - DeepSeek-V4.1 plain-decode block-fp8 route fixed on SM89/SM120 (SM120 -> FlashInfer MXFP8 CUTLASS, SM89 -> w8a16; #36655 exact-head SM120 decode). branch: dsv4.1-lkmoe-sm80plus
+2026-09-11: Lsglang-v1.5.3 - mixed-arch TP=4 (SM86+SM120) capture-safe, SM120 sparse-MLA prefill fast path (extra-source 64-page split). branch: dsv4.1-lkmoe-sm80plus
+2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patches 01+02). branch: dsv4.1-lkmoe-sm80plus
+2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3, pure lk_moe (patch 01). branch: dsv4.1-lkmoe
+2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+ support
+2026-07-08: Lsglang-v1.4.1 - add ModelOpt W4A16 NVFP4 quantization types, e.g. nvidia/GLM-5.2-NVFP4
+2026-07-05: Lsglang-v1.4.0 - GPU prefill speed, CPU AVX512 opt, removed LVLLM_GPU_RESIDENT_MOE_EXPERTS, sglang v0.5.14
+2026-06-05: Lsglang-v1.3.0 - upgraded lk_moe, supports nvfp4/mxfp4, added LVLLM_GPU_RESIDENT_MOE_EXPERTS
+2026-04-06: Lsglang-v1.2.0 - LK_POWER_SAVING=1, FP8+BF16+AWQ4bit mixed MOE layer inference
+2026-04-03: Lsglang-v1.1.4 - local sgl-kernel compilation to fix known issues
+2026-03-11: Lsglang-v1.1.3 - FP8/AWQ4bit no extra memory with GPU prefill
+2026-03-05: Lsglang-v1.1.0 - GPU prefill support
+2026-02-25: Lsglang-v1.0.6 - bug fixes, new models
+2026-02-10: Lsglang-v1.0.0 - ported from LvLLM; verified BF16/F16, FP8, AWQ 4bit
+```
+

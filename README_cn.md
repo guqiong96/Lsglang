@@ -105,24 +105,6 @@ lk_moe 集成被整理为 [`patches/`](./patches) 下的可移植补丁：
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [输入 131072] | 75 t/s [输入 131072] | 100~132 t/s |
 | deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
-### 版本变更
-
-```bash
-2026-09-11: Lsglang-v1.5.3 - 混合架构 TP=4（SM86+SM120）图捕获修复，SM120 sparse-MLA prefill 原生快路（extra 源 64-token 页拆分）。分支: dsv4.1-lkmoe-sm80plus
-2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86（RTX 30x）支持（补丁 01+02）。分支: dsv4.1-lkmoe-sm80plus
-2026-09-10: Lsglang-v1.5.1 - sglang dsv4.1 + lk_moe v2.4.3，纯 lk_moe（补丁 01）。分支: dsv4.1-lkmoe
-2026-09-07: Lsglang-v1.5.0 - sglang v0.5.19 + lk_moe v2.4.2 + DeepSeek V4 SM80+支持
-2026-07-08: Lsglang-v1.4.1 - 新增 ModelOpt W4A16 NVFP4 量化类型支持，例如：nvidia/GLM-5.2-NVFP4
-2026-07-05: Lsglang-v1.4.0 - 优化GPU预填充速度，CPU AVX512优化，取消LVLLM_GPU_RESIDENT_MOE_EXPERTS, 更新sglang v0.5.14
-2026-06-05: Lsglang-v1.3.0 - 升级lk_moe模块, 支持nvfp4, mxfp4量化类型，增加LVLLM_GPU_RESIDENT_MOE_EXPERTS
-2026-04-06: Lsglang-v1.2.0 - 增强LK_POWER_SAVING=1节能效果，支持FP8+BF16+AWQ4bit的混合MOE层推理
-2026-04-03: Lsglang-v1.1.4 - 支持本地编译sgl-kernel，以修复已知问题
-2026-03-11: Lsglang-v1.1.3 - FP8、AWQ4bit模型开启GPU Prefill加速不再占用额外内存
-2026-03-05: Lsglang-v1.1.0 - 支持GPU预填充
-2026-02-25: Lsglang-v1.0.6 - 修复已知问题，增加新模型支持
-2026-02-10: Lsglang-v1.0.0 - 来自LvLLM项目的移植，验证了BF16/F16、FP8、AWQ 4bit对称量化模型
-```
-
 ### 支持的模型与量化格式
 
 Lsglang 已验证的大部分原版 MOE 模型（Qwen3/GLM/MiniMax 等系列）：
