@@ -1412,6 +1412,11 @@ class Envs:
     # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
     # decode step matches the SM80/86 single-stream structure for A/B.
     SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS = EnvBool(False)
+    # Ada (SM89) dense block-fp8 linear crossover: use the split-K w8a16 kernel for
+    # GEMMs with at most this many rows (decode, weight-bound) and the fp8-dot Triton
+    # kernel above it (DSPARK verify / prefill, compute-bound, where Ada's fp8 tensor
+    # cores beat w8a16's bf16 math). Keep it below block_size * min_verify_batch.
+    SGLANG_SM89_W8A16_MAX_M = EnvInt(4)
     # Pin and map the host table with cudaHostRegister. False leaves the plain
     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)

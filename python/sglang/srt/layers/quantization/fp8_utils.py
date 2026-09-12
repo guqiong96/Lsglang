@@ -599,13 +599,41 @@ def dispatch_w8a8_block_fp8_linear(
         # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
         # Before Ada, Triton cannot compile an fp8 operand at all, so use the
         # bf16-activation w8a16 kernel instead of the fp8-dot one.
-        # Ada (SM89) is routed the same way: the fp8-dot kernel only receives
-        # split-K through the SM90 tuned configs, so on decode-M shapes it
-        # streams the weight tiles with too few pipelined CTAs, while the
-        # w8a16 kernel's automatic split-K is tuned exactly for these
-        # weight-bound shapes. This puts SM89 on the proven SM80/86 path.
-        if not fp8_dot_supported() or _is_ada_sm89():
+        if not fp8_dot_supported():
             return sm8_w8a16_block_fp8_linear
+        if _is_ada_sm89():
+            # Ada has fp8 tensor cores, so route by M instead of pinning w8a16: at
+            # decode-M(=1) the fp8-dot kernel only gets split-K from the SM90 tuned
+            # configs and under-parallelizes (weight-stream bound), where the split-K
+            # w8a16 kernel wins; above the crossover the step is compute-bound and
+            # Ada's fp8 tensor cores beat w8a16's bf16 math, so DSPARK verify /
+            # prefill go back to the fp8-dot kernel. Crossover = SGLANG_SM89_W8A16_MAX_M.
+            # Each CUDA graph bakes the kernel for its own M at capture time.
+            def ada_block_fp8_linear(
+                input,
+                weight,
+                block_size,
+                weight_scale,
+                input_scale=None,
+                bias=None,
+            ):
+                m = input.numel() // input.shape[-1]
+                gemm = (
+                    sm8_w8a16_block_fp8_linear
+                    if m <= envs.SGLANG_SM89_W8A16_MAX_M.get()
+                    else triton_w8a8_block_fp8_linear
+                )
+                return gemm(
+                    input=input,
+                    weight=weight,
+                    block_size=block_size,
+                    weight_scale=weight_scale,
+                    input_scale=input_scale,
+                    bias=bias,
+                    act_scale_ue8m0=act_scale_ue8m0,
+                )
+
+            return ada_block_fp8_linear
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()

@@ -1770,10 +1770,10 @@ index 039bc931ca..584ad96642 100644
                  or get_platform().is_sm120
              )
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index d5dd933966..96ffeeb53e 100644
+index d5dd933966..2f41df3d39 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1408,6 +1408,10 @@ class Envs:
+@@ -1408,6 +1408,15 @@ class Envs:
      SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
      # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
      SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
@@ -1781,10 +1781,15 @@ index d5dd933966..96ffeeb53e 100644
 +    # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
 +    # decode step matches the SM80/86 single-stream structure for A/B.
 +    SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS = EnvBool(False)
++    # Ada (SM89) dense block-fp8 linear crossover: use the split-K w8a16 kernel for
++    # GEMMs with at most this many rows (decode, weight-bound) and the fp8-dot Triton
++    # kernel above it (DSPARK verify / prefill, compute-bound, where Ada's fp8 tensor
++    # cores beat w8a16's bf16 math). Keep it below block_size * min_verify_batch.
++    SGLANG_SM89_W8A16_MAX_M = EnvInt(4)
      # Pin and map the host table with cudaHostRegister. False leaves the plain
      # mapping to the platform (Grace-Blackwell ATS reaches it directly).
      SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
-@@ -1424,7 +1428,6 @@ class Envs:
+@@ -1424,7 +1433,6 @@ class Envs:
      SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
      SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
@@ -2701,7 +2706,7 @@ index c69d08e5f2..117d9f37c7 100644
          self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
          self.block_quant = (
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6093a4f95d..8bfcd8be50 100755
+index 6093a4f95d..df30113773 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -22,6 +22,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -2754,23 +2759,51 @@ index 6093a4f95d..8bfcd8be50 100755
  def dispatch_w8a8_block_fp8_linear(
      weight_block_size: Optional[List[int]] = None,
      act_scale_ue8m0: bool = False,
-@@ -570,6 +597,15 @@ def dispatch_w8a8_block_fp8_linear(
+@@ -570,6 +597,43 @@ def dispatch_w8a8_block_fp8_linear(
          # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
          # blocks with ue8m0 scales to the MXFP8 dense kernels instead
          # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
 +        # Before Ada, Triton cannot compile an fp8 operand at all, so use the
 +        # bf16-activation w8a16 kernel instead of the fp8-dot one.
-+        # Ada (SM89) is routed the same way: the fp8-dot kernel only receives
-+        # split-K through the SM90 tuned configs, so on decode-M shapes it
-+        # streams the weight tiles with too few pipelined CTAs, while the
-+        # w8a16 kernel's automatic split-K is tuned exactly for these
-+        # weight-bound shapes. This puts SM89 on the proven SM80/86 path.
-+        if not fp8_dot_supported() or _is_ada_sm89():
++        if not fp8_dot_supported():
 +            return sm8_w8a16_block_fp8_linear
++        if _is_ada_sm89():
++            # Ada has fp8 tensor cores, so route by M instead of pinning w8a16: at
++            # decode-M(=1) the fp8-dot kernel only gets split-K from the SM90 tuned
++            # configs and under-parallelizes (weight-stream bound), where the split-K
++            # w8a16 kernel wins; above the crossover the step is compute-bound and
++            # Ada's fp8 tensor cores beat w8a16's bf16 math, so DSPARK verify /
++            # prefill go back to the fp8-dot kernel. Crossover = SGLANG_SM89_W8A16_MAX_M.
++            # Each CUDA graph bakes the kernel for its own M at capture time.
++            def ada_block_fp8_linear(
++                input,
++                weight,
++                block_size,
++                weight_scale,
++                input_scale=None,
++                bias=None,
++            ):
++                m = input.numel() // input.shape[-1]
++                gemm = (
++                    sm8_w8a16_block_fp8_linear
++                    if m <= envs.SGLANG_SM89_W8A16_MAX_M.get()
++                    else triton_w8a8_block_fp8_linear
++                )
++                return gemm(
++                    input=input,
++                    weight=weight,
++                    block_size=block_size,
++                    weight_scale=weight_scale,
++                    input_scale=input_scale,
++                    bias=bias,
++                    act_scale_ue8m0=act_scale_ue8m0,
++                )
++
++            return ada_block_fp8_linear
          return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
  
      backend = get_fp8_gemm_runner_backend()
-@@ -629,7 +665,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
+@@ -629,7 +693,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
      if _is_hip and _is_gfx95_supported:
          return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
  
@@ -2790,7 +2823,7 @@ index 6093a4f95d..8bfcd8be50 100755
          if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
              return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
          return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
-@@ -650,10 +697,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
+@@ -650,10 +725,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
  
  def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
      """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
@@ -2815,7 +2848,7 @@ index 6093a4f95d..8bfcd8be50 100755
          backend.is_flashinfer_cutedsl()
          or backend.is_flashinfer_cutlass()
          or backend.is_flashinfer_trtllm()
-@@ -1335,6 +1394,41 @@ def aiter_w8a8_block_fp8_linear(
+@@ -1335,6 +1422,41 @@ def aiter_w8a8_block_fp8_linear(
      ).view(*output_shape)
  
  
