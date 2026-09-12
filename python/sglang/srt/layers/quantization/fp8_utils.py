@@ -555,6 +555,14 @@ if get_platform().is_sm90 and is_flashinfer_available():
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
 
+@lru_cache(maxsize=1)
+def _is_ada_sm89() -> bool:
+    """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
+    return _is_cuda and torch.cuda.is_available() and (
+        torch.cuda.get_device_capability() == (8, 9)
+    )
+
+
 def dispatch_w8a8_block_fp8_linear(
     weight_block_size: Optional[List[int]] = None,
     act_scale_ue8m0: bool = False,
@@ -574,7 +582,12 @@ def dispatch_w8a8_block_fp8_linear(
         # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
         # Before Ada, Triton cannot compile an fp8 operand at all, so use the
         # bf16-activation w8a16 kernel instead of the fp8-dot one.
-        if not fp8_dot_supported():
+        # Ada (SM89) is routed the same way: the fp8-dot kernel only receives
+        # split-K through the SM90 tuned configs, so on decode-M shapes it
+        # streams the weight tiles with too few pipelined CTAs, while the
+        # w8a16 kernel's automatic split-K is tuned exactly for these
+        # weight-bound shapes. This puts SM89 on the proven SM80/86 path.
+        if not fp8_dot_supported() or _is_ada_sm89():
             return sm8_w8a16_block_fp8_linear
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
@@ -656,10 +669,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
-    Requires Blackwell; unresolved auto and Triton settings keep the block kernel.
+    Requires Blackwell. Consumer Blackwell (SM120) resolves on auto as well:
+    there the Triton block kernel falls back to its untuned default config
+    (no split-K outside SM90), while the FlashInfer MXFP8 GEMMs are natively
+    instantiated for sm120. Other settings keep the block kernel unchanged.
     """
     backend = get_fp8_gemm_runner_backend()
-    if not (
+    # initialize_fp8_gemm_config() pre-resolves `auto` to the plain `cutlass`
+    # runner on SM120, but only for the 128x128 block path. This MXFP8 route is
+    # resolved separately, so on SM120 that pre-resolution must read as `auto`
+    # here; otherwise server processes (which call initialize) differ from
+    # bare imports and the 32-wide-K ue8m0 weights silently fall back to Triton.
+    auto_route = backend.is_auto() or (backend.is_cutlass() and get_platform().is_sm120)
+    if auto_route:
+        if not get_platform().is_sm120:
+            return Mxfp8DenseGemmBackend.UNSUPPORTED
+    elif not (
         backend.is_flashinfer_cutedsl()
         or backend.is_flashinfer_cutlass()
         or backend.is_flashinfer_trtllm()

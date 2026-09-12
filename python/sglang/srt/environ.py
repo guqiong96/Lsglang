@@ -1408,6 +1408,10 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
     SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
+    # Diagnostic: disable the decode-only side streams (early compress/indexer
+    # sources on Blackwell, hc-mix stats stream, engram KV prefetch) so a plain
+    # decode step matches the SM80/86 single-stream structure for A/B.
+    SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS = EnvBool(False)
     # Pin and map the host table with cudaHostRegister. False leaves the plain
     # mapping to the platform (Grace-Blackwell ATS reaches it directly).
     SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
