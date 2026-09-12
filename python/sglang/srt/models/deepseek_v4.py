@@ -4616,6 +4616,108 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         torch.cuda.synchronize()
 
+    def _prewarm_engram_hash_kernels(self) -> None:
+        """Compile+load every engram-hash specialization the graphs launch.
+
+        ``EngramHasher.forward`` launches ``_engram_hash_kernel`` once per
+        forward, and Triton keys a cubin by (MODE, BLOCK, HIST_VIA_SLOTS,
+        HAS_IMAGE, N/L/H, num_real bucket) *and by architecture*. On a mixed
+        SM86+SM120 host one rank can hit its warm disk cache while the peer
+        cold-loads inside the capture warmup: the cold rank's
+        cuModuleLoadData stalls against the peer's NCCL spin kernel (which
+        itself waits on the cold rank) -> deadlock. Observed with the
+        MODE_DECODE cubin warm on SM120, cold on SM86. Sweep every
+        specialization the decode/verify/extend graphs can reach at this
+        rank-uniform load-time point so no first launch lands under capture.
+        The commit kernel goes too: its first launch is a real verify step,
+        outside any graph, but a cold driver load there can stall the same way.
+        """
+        hasher = getattr(self.model, "engram_hasher", None)
+        if hasher is None:
+            return
+        from sglang.kernels.ops.embeddings.engram_hash import (
+            MODE_DECODE,
+            MODE_EXTEND,
+            MODE_VERIFY,
+            engram_commit_history,
+            engram_hash_ids,
+        )
+        from sglang.srt.server_args import get_global_server_args
+
+        n = hasher.max_ngram_size
+        dev = hasher.token_map.device
+        if dev.type != "cuda":
+            return
+        hist = torch.zeros((2, n - 1), dtype=torch.int32, device=dev)
+        common = dict(
+            history=hist,
+            token_map=hasher.token_map,
+            multipliers=hasher.multipliers,
+            primes=hasher.primes,
+            offsets=hasher.offsets,
+            pad_id=hasher.pad_id,
+            image_token_id=hasher.image_token_id,
+            mm_pad_shift=MM_PAD_SHIFT_VALUE,
+        )
+        # Decode graphs: num_real buckets ==1 / generic / div-16.
+        for t in (1, 2, 16):
+            ids = torch.zeros((t,), dtype=torch.int64, device=dev)
+            pos = torch.zeros((t,), dtype=torch.int64, device=dev)
+            slots = torch.zeros((t,), dtype=torch.int64, device=dev)
+            engram_hash_ids(
+                ids, pos, mode=MODE_DECODE, num_real=t, req_slots=slots, **common
+            )
+        # Verify graphs: BLOCK is a constexpr equal to the configured draft
+        # token count (eagle: speculative_num_draft_tokens; dspark:
+        # gamma + 1 == the same value), so one prewarm per captured bs.
+        sa = get_global_server_args()
+        if sa.speculative_algorithm is not None and sa.speculative_num_draft_tokens:
+            block = int(sa.speculative_num_draft_tokens)
+            if block >= 2:
+                for bs in (1, 2):
+                    t = bs * block
+                    ids = torch.zeros((t,), dtype=torch.int64, device=dev)
+                    pos = torch.zeros((t,), dtype=torch.int64, device=dev)
+                    slots = torch.zeros((bs,), dtype=torch.int64, device=dev)
+                    engram_hash_ids(
+                        ids,
+                        pos,
+                        mode=MODE_VERIFY,
+                        block=block,
+                        num_real=t,
+                        req_slots=slots,
+                        **common,
+                    )
+        # Extend: scheduler-supplied history (HIST_VIA_SLOTS=False) and
+        # slot-indexed history, over the num_real buckets (also feeds the
+        # eager_on_graph hash of the breakable prefill graph).
+        for t, num_real, via_slots in ((1, 1, False), (20, 8, False), (16, 16, True)):
+            ids = torch.zeros((t,), dtype=torch.int64, device=dev)
+            pos = torch.zeros((t,), dtype=torch.int64, device=dev)
+            row = torch.zeros((num_real,), dtype=torch.int64, device=dev)
+            starts = torch.zeros((2,), dtype=torch.int64, device=dev)
+            engram_hash_ids(
+                ids,
+                pos,
+                mode=MODE_EXTEND,
+                num_real=num_real,
+                req_slots=(
+                    torch.zeros((2,), dtype=torch.int64, device=dev)
+                    if via_slots
+                    else None
+                ),
+                row=row,
+                starts=starts,
+                **common,
+            )
+        engram_commit_history(
+            hist,
+            torch.zeros((1, n - 1), dtype=torch.int32, device=dev),
+            torch.zeros((1,), dtype=torch.int64, device=dev),
+            torch.ones((1,), dtype=torch.int32, device=dev),
+        )
+        torch.cuda.synchronize()
+
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.
 
@@ -4636,6 +4738,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self._prewarm_hc_mix_kernels()
             except Exception as e:  # never block startup on a warmup miss
                 logger.debug("hc-mix prewarm skipped: %s", e)
+            try:
+                self._prewarm_engram_hash_kernels()
+            except Exception as e:
+                logger.debug("engram hash prewarm skipped: %s", e)
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
