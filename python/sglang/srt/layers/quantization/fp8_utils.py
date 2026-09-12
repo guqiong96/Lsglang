@@ -439,7 +439,24 @@ def _fake_flashinfer_mxfp8_quantize(
     return q_input, scale
 
 
-if get_platform().is_blackwell and is_flashinfer_available():
+@lru_cache(maxsize=1)
+def _any_blackwell_gpu_visible() -> bool:
+    # get_platform().is_blackwell reflects the *current* device, which on a
+    # mixed-arch host is still device 0 (a non-Blackwell chip) at import time, so
+    # an SM12x rank whose device is set later would never get the FlashInfer MXFP8
+    # ops below registered. Scan all CUDA_VISIBLE_DEVICES-visible GPUs instead so a
+    # rank that later lands on Blackwell finds them. Pure non-Blackwell hosts return
+    # False, so the guarded block stays skipped exactly as before (no new import).
+    try:
+        return torch.cuda.is_available() and any(
+            torch.cuda.get_device_capability(i)[0] in (10, 11, 12)
+            for i in range(torch.cuda.device_count())
+        )
+    except Exception:
+        return get_platform().is_blackwell
+
+
+if _any_blackwell_gpu_visible() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
@@ -648,7 +665,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
-    if get_platform().is_blackwell and is_flashinfer_available():
+    # The FlashInfer MXFP8 ops are registered at import time only under an
+    # import-time `is_blackwell` check. On a mixed-arch host a rank's device is
+    # set *after* this module is imported, so an SM12x rank that lands on
+    # Blackwell never registered those ops; referencing them here would raise
+    # NameError. Treat "ops not registered in this process" as no FlashInfer
+    # MXFP8 and fall through to the block-fp8 fallback. Same-arch hosts always
+    # have the ops registered here, so they are unaffected.
+    if (
+        get_platform().is_blackwell
+        and is_flashinfer_available()
+        and "_raw_flashinfer_mm_mxfp8" in globals()
+    ):
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
