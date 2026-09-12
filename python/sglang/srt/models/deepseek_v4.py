@@ -4222,6 +4222,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        self._nvme_engram_loaded = False
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -4801,6 +4802,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self._nvme_engram_loaded:
+            raise RuntimeError(
+                "NVMe Engram checkpoints are immutable; restart to reload"
+            )
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -5193,6 +5198,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            self._nvme_engram_loaded = envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
