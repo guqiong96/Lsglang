@@ -148,7 +148,9 @@ python -m sglang.launch_server \
     --chunked-prefill-size 32000 \
     --max-total-tokens 66000 \
     --mem-fraction-static 0.90 \
-    --disable-shared-experts-fusion
+    --disable-shared-experts-fusion \
+    --speculative-algo DSPARK \
+    --speculative-dspark-block-size 5
 ```
 
 ### 配置参数
