@@ -1,18 +1,55 @@
-# Lsglang-v1.5.4
+# Lsglang-v1.5.5
 
 https://github.com/guqiong96/Lsglang/tree/dsv4.1-lkmoe-sm80plus
 
 **Base:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) · **lk_moe v2.4.3**
-**Type:** Decode-throughput release — DeepSeek-V4.1 **plain-decode** fast path on SM89 / SM120
-**Wheel:** `lsglang-1.5.4` — use this single wheel for all GPUs (SM80 → SM120)
+**Type:** Stability release — mixed-arch (SM86+SM120) TP=4 CUDA-graph capture root fix + cold-cubin prewarm family + V4.1 indexer prefill-OOM fix on 16 GB cards
+**Wheel:** `lsglang-1.5.5` — use this single wheel for all GPUs (SM80 → SM120)
 
-Same code paths as `v1.5.3` for single-arch hosts and for speculative (DSPARK) decode;
-this release fixes the **plain-decode** block-fp8 linear route on SM89 / SM120. It inherits
-`v1.5.3`'s mixed-arch TP=4 capture safety and the SM120 sparse-MLA prefill fast path.
+This wheel **supersedes v1.5.4, which was never released separately** — the notes below
+cover everything since v1.5.3, including the v1.5.4 plain-decode routing fixes.
+Single-arch hosts keep their existing code paths; this release makes **mixed-arch TP=4
+capture pass reliably (cold cache included)** and closes the remaining cold-kernel
+first-launch sites. See **Known issues** for the mixed-arch TP=4 output-correctness item
+that is still under investigation.
 
 ## What's new
 
-### DeepSeek-V4.1 plain-decode throughput (SM89 + SM120) — fixed
+### Mixed-arch TP=4 CUDA-graph capture — root-caused and fixed
+The capture loop iterates a **candidate-variant axis** that was gated on a *local*
+`major >= 10` device check: on a mixed host the SM120 ranks captured several variants per
+batch size while SM86 ranks captured one, so the per-bs collective counts diverged and NCCL
+busy-spin deadlocked the warmup. The gate is now a one-time **TP-group AND** (`all_gather`
+of majors, unconditional on every rank): homogeneous hosts keep their native variant tables
+byte-identically, mixed hosts take the common denominator on *every* capture axis
+(c128 buckets + candidate variants). Verified: mixed 2×3090 + 2×5060Ti TP=4 now captures
+and serves with a fully cold triton/flashinfer cache.
+- Plus the remaining **cold-cubin prewarms** at load time (rank-uniform, failure-safe):
+  block-fp8 w8a16 M-buckets, CuTe fused-RMSNorm first-init, `wo_a` bf16 cublasLt heuristic,
+  MoE vision-gate router specializations, and the Marlin single-token align kernels.
+
+### V4.1 low-ratio indexer no longer OOMs long-prompt extends on 16 GB cards
+`Indexer.scores` materialized the full `[rows, 32, lc]` head-concat bf16 cube
+(≈1 GiB per row chunk, ~2.8 GiB transient per low-ratio layer — a 16k-token extend was
+deterministically fatal on RTX 5060Ti-class cards under `--mem-fraction-static 0.95`).
+Columns are now scored in 32 MiB tiles with the head axis reduced per tile (short tail
+tile masked by its own width), so the full cube never exists; peak measured
+**2766 MiB → 154 MiB**, outputs bit-identical on SM86 and SM120, decode/verify and
+short prompts keep the original one-shot path byte-for-byte (~1.0–1.14× on tiled
+prefills only).
+
+### SM89 dense block-fp8 selects kernel by M (RTX 4090/4080 dspark)
+`_is_ada_sm89` → `w8a16` regressed DSPARK verify (bf16 math leaves the Ada fp8 tensor cores
+idle at verify-M). The SM89 dispatch now picks by token count: `M <= SGLANG_SM89_W8A16_MAX_M`
+(default 4) → w8a16 (decode, weight-bandwidth bound), larger M → fp8-dot Triton (verify).
+Verified 4× RTX 4080 SUPER: plain decode 44 t/s **and** DSPARK back to **65 t/s**.
+
+### MXFP8 symbol registration no longer depends on import-time device
+The FlashInfer MXFP8 dense ops are registered when *any* Blackwell GPU is visible
+(`CUDA_VISIBLE_DEVICES` scan) instead of "current device is Blackwell at import", fixing a
+latent `NameError` on SM120 ranks whose process imports before `set_device` (mixed hosts).
+
+### DeepSeek-V4.1 plain-decode throughput (SM89 + SM120)
 On non-SM80 archs the dense block-fp8 linears (block `[32, 32]` + `ue8m0` scales = MXFP8
 semantics: `wqkv_a`, `wq_b`, `wo_b`, `wkv`, the indexer `wq_b`, the shared-expert and
 engram projections) fell back to the Triton block kernel's **untuned default config**
@@ -32,7 +69,7 @@ prefill hid it behind accept-amortization.
 - New diagnostic `SGLANG_DSV41_DISABLE_DECODE_SIDE_STREAMS=1` (default off) collapses the
   three decode-only side streams to the SM80/86 single-stream structure for A/B.
 
-### Mixed-arch TP group (e.g. 2× RTX 3090 + 2× RTX 5060Ti, TP=4) — works end to end
+### Mixed-arch TP group structure (2× RTX 3090 + 2× RTX 5060Ti, TP=4)
 - **Forward structure is now TP-group uniform.** Every arch predicate that changes the
   graph shape (Blackwell split-K sinkhorn, `wo_a` rope fusion, `is_sm90`, `_IS_SM8`) is
   resolved via a one-time TP-group `all_reduce` and cached, so ranks with different
@@ -73,19 +110,36 @@ the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
 | SM | Representative GPUs | Patches | Notes |
 |----|--------------------|---------|-------|
 | **80** | A100, A30 | 01 + 02 | SM8 path shared with SM86 (`w8a16` Triton GEMMs, native-precision fp8 emulation) |
-| **86** | RTX 3090/3080, A6000 | 01 + 02 | ✅ verified: V4.1-Flash on 2×3090 (TP=2) and mixed 4-GPU TP=4 |
+| **86** | RTX 3090/3080, A6000 | 01 + 02 | ✅ verified: V4.1-Flash on 2×3090 (TP=2). Mixed 4-GPU TP=4: captures and serves, but output correctness under investigation (see Known issues) |
 | **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK); plain decode via `w8a16` block-fp8 route since v1.5.4 |
 | **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
 | **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
-| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 and mixed 4-GPU TP=4; sparse-MLA prefill native since v1.5.3, plain-decode block-fp8 → FlashInfer MXFP8 (CUTLASS) since v1.5.4 |
+| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 (plain decode → FlashInfer MXFP8 CUTLASS). Mixed 4-GPU TP=4: output correctness under investigation (see Known issues) |
 
 ✅ = measured on reference hardware (dual-EPYC host). Other rows: enabled-by-construction
 on the shared code paths, not individually bench-tested here — please report issues.
 SM8x ranks mixed with SM12x ranks run on the common-denominator path (see What's new).
 
+## Known issues
+
+### Mixed-arch TP=4 (SM86 + SM120) output correctness — OPEN
+On the 2× RTX 3090 + 2× RTX 5060Ti TP=4 host, V4.1-Flash captures, serves, and streams
+decode (cuda graph True, ~30 t/s) but long generations occasionally emit a garbled token
+(a missing/invalid UTF-8 character, or a wrong identifier inside code output). Every
+single-arch config is clean: **2×3090, 2×5060Ti, and 4×4080S all produce correct output**;
+the fault appears only when SM86 and SM120 ranks share one TP group.
+- Every flag-isolable axis has been ruled out by A/B or offline numeric proof: `_tp_all`
+  group forcing (`SGLANG_DSV4_TP_ARCH_LOCAL=1` — still broken), the TileLang indexer
+  dispatch, the CUTLASS 576→640 MoE padding (byte/bit-exact vs a dequant reference), the
+  MoE backend choice (`--moe-runner-backend marlin` — still broken), and the SM120 dense
+  MXFP8 route (`--fp8-gemm-backend triton` — still broken).
+- Narrowing to the SM86-vs-SM120 attention / KV-selection kernel split under an aligned
+  collective schedule; needs a greedy + `return_logprob` first-divergent-token capture to
+  localize. Single-arch users are unaffected; on a mixed host, use TP=2 pairs for now.
+
 ## Install / build
 ```bash
-pip install lsglang==1.5.4          # or build the wheel from tag lsglang-v1.5.4
+pip install lsglang==1.5.5          # or build the wheel from tag lsglang-v1.5.5
 ```
 
 ## Patches (`patches/` Note: these patches are only meant to document the diff against upstream sglang. They are already included in the lsglang install and can be ignored.)
@@ -183,6 +237,7 @@ SM89 requires the flash-attention PR #2751 patch (prebuilt `flash_attn-2.8.4+pr2
 ## Version history
 
 ```bash
+2026-09-13: Lsglang-v1.5.5 - mixed-arch TP=4 capture root fix (candidate-variant group-AND) + cold-cubin prewarm family + SM89 M-based kernel select + tiled low-ratio indexer scores (16 GB long-prompt extend OOM). branch: dsv4.1-lkmoe-sm80plus
 2026-09-12: Lsglang-v1.5.4 - DeepSeek-V4.1 plain-decode block-fp8 route fixed on SM89/SM120 (SM120 -> FlashInfer MXFP8 CUTLASS, SM89 -> w8a16; #36655 exact-head SM120 decode). branch: dsv4.1-lkmoe-sm80plus
 2026-09-11: Lsglang-v1.5.3 - mixed-arch TP=4 (SM86+SM120) capture-safe, SM120 sparse-MLA prefill fast path (extra-source 64-page split). branch: dsv4.1-lkmoe-sm80plus
 2026-09-11: Lsglang-v1.5.2 - sglang dsv4.1 + lk_moe v2.4.3 + DeepSeek-V4.1 SM80/86 (RTX 30x) support (patches 01+02). branch: dsv4.1-lkmoe-sm80plus
