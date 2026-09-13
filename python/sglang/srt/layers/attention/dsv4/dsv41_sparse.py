@@ -23,6 +23,12 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
 
 
+# Ceiling on one bf16 [t, H, cols] score tile in Indexer.scores; the per-tile
+# transients run ~3x this. Long prefills tile the column axis instead of
+# materializing the full [t, H, n] cube (a 16k-token extend once cost 3 GiB).
+_SCORE_TILE_BYTES = 32 << 20
+
+
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
     """RoPE plus fake FP4 quantization, fused for CUDA BF16 inputs."""
     if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
@@ -281,8 +287,24 @@ class DeepseekV41Indexer(nn.Module):
     def scores(
         self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
-        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
-        bf16 up to the reduction, as the reference does."""
-        s = torch.einsum("bhd,nd->bhn", q, k)
-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        return s.float()
+        """q [t, H, d], k [n, d], weights [t, H] -> [t, n] fp32, summed over all
+        heads; bf16 up to the reduction, as the reference does.
+
+        Columns are scored in tiles so the [t, H, n] head-concat cube is never
+        materialized: each tile reduces its own head axis into the fp32 output
+        (the short tail tile is masked by its own width). Per-column math is
+        unchanged; only a long prefill takes the tiled loop.
+        """
+        t, n = q.shape[0], k.shape[0]
+        if t * self.n_local_heads * n * 2 <= _SCORE_TILE_BYTES:
+            s = torch.einsum("bhd,nd->bhn", q, k)
+            s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+            return s.float()
+        out = torch.empty((t, n), dtype=torch.float32, device=q.device)
+        cols = max(1, _SCORE_TILE_BYTES // (t * q.shape[1] * 2))
+        for start in range(0, n, cols):
+            end = min(start + cols, n)
+            s = torch.einsum("bhd,nd->bhn", q, k[start:end])
+            s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+            out[:, start:end] = s
+        return out

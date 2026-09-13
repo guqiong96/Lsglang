@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -4718,6 +4719,206 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
         torch.cuda.synchronize()
 
+    def _prewarm_fp8_linear_kernels(self) -> None:
+        """Compile+load the w8a16 block-fp8 GEMM cubins the decode graphs use.
+
+        Same cold-cubin family as the engram hash: on a mixed SM86+SM120 host
+        the SM86 ranks stream their dense block-fp8 linears through
+        ``sm8_w8a16_block_fp8_linear`` while the SM120 ranks run FlashInfer
+        MXFP8 and never launch the Triton w8a16 cubin at all. The verify
+        capture (M = bs * block >= 2) and a capture-warmup forward only warm
+        Triton's generic-M specialization; the first DECODE bs=1 forward under
+        capture then cold-loads the M == 1 specialization inside the graph
+        capture and deadlocks the group against the SM120 ranks' collective.
+        Call every block-fp8 linear's own ``quant_method.apply`` (the exact
+        production kernel-selection path, pure local GEMM, no collectives) at
+        each captured-M bucket so every cubin is warm before any capture.
+        Homogeneous hosts just pay a warmup; hosts whose dispatch never
+        reaches w8a16 (SM120+/Blackwell) return immediately.
+        """
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dot_supported
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import _is_ada_sm89
+
+        if fp8_dot_supported() and not _is_ada_sm89():
+            return
+        for module in self.model.modules():
+            if not isinstance(module, LinearBase):
+                continue
+            qm = getattr(module, "quant_method", None)
+            weight = getattr(module, "weight", None)
+            scale = getattr(module, "weight_scale_inv", None)
+            if (
+                not isinstance(qm, Fp8LinearMethod)
+                or weight is None
+                or weight.device.type != "cuda"
+                or scale is None
+                or getattr(qm, "block_quant", False) is not True
+            ):
+                continue
+            # bf16 activations: the w8a16 contract (and what Ada's decode-M
+            # branch of the M-routed callable feeds to the same kernel).
+            k = weight.shape[-1]
+            for m in (1, 2, 16):
+                x = torch.zeros((m, k), dtype=torch.bfloat16, device=weight.device)
+                qm.apply(module, x, None)
+        torch.cuda.synchronize()
+
+    def _prewarm_fused_rmsnorm_kernels(self) -> None:
+        """Compile+load the fused RMSNorm kernels at every captured row count.
+
+        Same cold-inside-capture family again, one layer deeper: the
+        multi-stream ``_forward_prepare*`` paths (capture-mode only, so no
+        eager warmup ever touches them) reach the RMSNorm op through
+        sgl-kernel -> FlashInfer CuTe DSL, whose kernels compile per shape
+        signature at first call. On a mixed host the SM120 ranks hit their
+        warm CuTe disk cache while the SM86 ranks compile/load inside the
+        capture, and the driver call (cuKernelSetAttribute during kernel
+        init) stalls against the peer's NCCL spin -> deadlock. Warm every
+        distinct normalization width of the model, at the row counts the
+        decode graphs         capture, at a rank-uniform point before capture.
+        """
+        seen = set()
+        for module in self.model.modules():
+            if not isinstance(module, RMSNorm):
+                continue
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.device.type != "cuda":
+                continue
+            width = int(weight.shape[-1])
+            key = (width, weight.dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            for m in (1, 2):
+                x = torch.zeros((m, width), dtype=torch.bfloat16, device=weight.device)
+                module(x)
+        torch.cuda.synchronize()
+
+    def _prewarm_wo_a_bf16_matmul(self) -> None:
+        """Run every bf16 wo_a group-GEMM once at the captured token counts.
+
+        Same cold-inside-capture family, but not a cubin: the bf16
+        ``einsum("tgd,grd->tgr")`` first hits cublasLt's TST heuristic, which
+        times candidate kernels and only proceeds when the device is idle. On
+        a mixed host the SM120 ranks race ahead into their first collective
+        (NCCL spin resident on the peer GPU) while the SM86 ranks are still
+        calling GetHeuristic for a shape first seen inside the capture
+        warmup; the timing wait never ends. Warming the exact production path
+        (weights, layouts, T = the decode buckets) at load time caches the
+        heuristic while the device is guaranteed idle. Local GEMMs only, no
+        collectives, so it is rank-uniform and capture-safe.
+        """
+        seen = set()
+        for module in self.model.modules():
+            wo_a = getattr(module, "wo_a", None)
+            weight = getattr(wo_a, "weight", None)
+            if (
+                wo_a is None
+                or weight is None
+                or weight.device.type != "cuda"
+                or weight.dtype != torch.bfloat16
+            ):
+                continue
+            try:
+                g = int(module.n_local_groups)
+                r = int(module.o_lora_rank)
+            except AttributeError:
+                continue
+            key = (g, r, int(weight.shape[-1]), weight.dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            wo_a_v = weight.view(g, r, -1)
+            for t in (1, 2):
+                o = torch.zeros(
+                    (t, g, int(weight.shape[-1])),
+                    dtype=torch.bfloat16,
+                    device=weight.device,
+                )
+                _apply_wo_a_bf16_matmul(
+                    o, wo_a_v, is_decode=True, fuse_inv_rope=False
+                )
+        torch.cuda.synchronize()
+
+    def _prewarm_moe_gate_kernels(self) -> None:
+        """Compile+load the fused MoE router cubin for every captured M spec.
+
+        Same cold-inside-capture family. With the prefill graphs disabled the
+        decode capture warmup is the first forward of the process, so the
+        router triton kernel is first launched there. Triton specializes the
+        int ``M`` arg (``==1`` / ``%16`` / generic): the bs=2 bucket only
+        warms the generic one, and the bs=1 capture then cold-loads the
+        ``M == 1`` cubin on whichever rank's disk cache misses. Warm M in
+        {1, 2, 16} through the exact production call, at a rank-uniform
+        point, device idle, no collectives.
+        """
+        from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+
+        seen = set()
+        for module in self.model.modules():
+            gate = getattr(module, "gate", None)
+            topk = getattr(module, "topk", None)
+            config = getattr(topk, "topk_config", None)
+            bias = getattr(gate, "e_score_correction_bias", None)
+            if (
+                gate is None
+                or config is None
+                or bias is None
+                or getattr(gate, "e_score_correction_bias_vl", None) is None
+                or bias.device.type != "cuda"
+            ):
+                continue
+            key = (int(bias.shape[0]), int(config.top_k), bias.dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Decode passes input_ids_global == forward_batch.input_ids
+            # (int64, non-None) through vision_topk UNCONDITIONALLY, so the
+            # captured launches key on a non-None ids pointer; mirror that
+            # exactly (None would only warm the prefill-side spec).
+            for m in (1, 2, 16):
+                # Router logits reach the kernel as fp32 (the gate upcasts),
+                # matching the captured launch signature (*fp32 scores_ptr).
+                logits = torch.zeros(
+                    (m, int(bias.shape[0])),
+                    dtype=torch.float32,
+                    device=bias.device,
+                )
+                ids = torch.zeros((m,), dtype=torch.int64, device=bias.device)
+                vision_topk(module, logits, ids)
+        logger.info("MoE vision-gate prewarm: %s router spec(s) warmed", len(seen))
+        torch.cuda.synchronize()
+
+    def _prewarm_marlin_align_kernels(self) -> None:
+        """Build+load the Marlin single-token align JIT module before capture.
+
+        Same family, JIT flavor: Marlin MoE routes M==1 decode alignment to
+        ``moe_align_single_token`` (tvm-ffi module, first ``load_jit`` is
+        per-process). SM120 ranks run CUTLASS/Marlin-free expert paths and
+        never touch it, so on a mixed host the SM86 ranks' first launch
+        lands inside the capture warmup and stalls against the peers'
+        collective. Dummy int32 ids compile+load the module for every
+        block-size the M*topk/E heuristic can pick; skipped entirely on
+        hosts where no Marlin method is active.
+        """
+        need = any(
+            "Marlin" in type(getattr(m, "quant_method", None)).__name__
+            for m in self.model.modules()
+        )
+        if not need:
+            return
+        from sglang.kernels.ops.moe.moe_align_single_token import (
+            moe_align_single_token,
+        )
+
+        ids = torch.zeros((1, 6), dtype=torch.int32, device="cuda")
+        for block_size in (8, 16, 32, 48, 64):
+            moe_align_single_token(ids, block_size)
+        logger.info("Marlin single-token align prewarm done")
+        torch.cuda.synchronize()
+
     def _prewarm_mhc_kernels(self) -> None:
         """One-shot MHC JIT prewarm at load time, synced across ranks.
 
@@ -4742,6 +4943,26 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self._prewarm_engram_hash_kernels()
             except Exception as e:
                 logger.debug("engram hash prewarm skipped: %s", e)
+            try:
+                self._prewarm_fp8_linear_kernels()
+            except Exception as e:
+                logger.debug("block-fp8 linear prewarm skipped: %s", e)
+            try:
+                self._prewarm_fused_rmsnorm_kernels()
+            except Exception as e:
+                logger.debug("fused rmsnorm prewarm skipped: %s", e)
+            try:
+                self._prewarm_wo_a_bf16_matmul()
+            except Exception as e:
+                logger.warning("wo_a bf16 matmul prewarm skipped: %s", e)
+            try:
+                self._prewarm_moe_gate_kernels()
+            except Exception as e:
+                logger.warning("moe gate prewarm skipped: %s", e)
+            try:
+                self._prewarm_marlin_align_kernels()
+            except Exception as e:
+                logger.warning("marlin align prewarm skipped: %s", e)
         if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(

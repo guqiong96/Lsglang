@@ -3636,8 +3636,9 @@ class DeepseekV4AttnBackend(
             # pool-sized.
             index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
             k = min(topk, lc)
-            # Every step below is per query row; chunk rows so the [rows, heads, lc]
-            # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+            # Every step below is per query row; chunk rows so the fp32
+            # [rows, lc] score buffer stays well under the budget (scores()
+            # tiles the head axis on its own, cube first, buffer second).
             rows_per_chunk = max(
                 1,
                 _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
@@ -3647,7 +3648,7 @@ class DeepseekV4AttnBackend(
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
                 s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
                 if masks is not None:
                     masks.append(
                         select_candidate_blocks(
@@ -3658,7 +3659,7 @@ class DeepseekV4AttnBackend(
                         )
                     )
                 elif consume is not None:
-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                    s.masked_fill_(~consume[b][rows], -torch.inf)
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
                     idx = _mask_topk_scores(s, idx)

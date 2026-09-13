@@ -336,11 +336,37 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.candidate_filter_span = None
         self.candidate_graph_limits = []
         text_config = model_runner.model_config.hf_text_config
+        # Group-uniform SM100+ arch decision. The candidate-variant capture below
+        # makes capture_one_stream loop one collective-bearing forward_once per
+        # variant; on a heterogeneous TP group SM100+ ranks would capture many
+        # variants while SM8x/SM90 capture none, so ranks issue different
+        # collective counts and NCCL deadlocks the capture warmup. Enable the
+        # candidate graphs only when EVERY rank is SM100+: a homogeneous group
+        # keeps its native behavior (SM120 on, SM8x/SM90 off, byte-for-byte), and
+        # a mixed group disables them everywhere so the variant list -- and thus
+        # the per-bs capture iteration / collective count -- matches across ranks.
+        _sm_major = (
+            torch.cuda.get_device_capability(model_runner.gpu_id)[0]
+            if model_runner.device == "cuda"
+            else -1
+        )
+        _sm100_all = _sm_major >= 10
+        _cand_tg = getattr(model_runner, "tp_group", None)
+        if (
+            getattr(_cand_tg, "world_size", 1) > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            _cand_majors: list = [0] * _cand_tg.world_size
+            torch.distributed.all_gather_object(
+                _cand_majors, _sm_major, group=_cand_tg.cpu_group
+            )
+            _sm100_all = all(_m >= 10 for _m in _cand_majors)
         if (
             self.capture_forward_mode == ForwardMode.DECODE
             and model_runner.device == "cuda"
             and not is_hip()
-            and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+            and _sm100_all
             and getattr(text_config, "model_type", None) == "deepseek_v41"
             and getattr(text_config, "candidate_source_layer_id", -1) >= 0
         ):
