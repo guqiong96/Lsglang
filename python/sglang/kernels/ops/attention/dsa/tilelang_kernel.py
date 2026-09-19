@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -10,6 +11,16 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
+
+# Diagnostic gate: drop tilelang's ROCm target detector so target resolution
+# never spawns `which hipcc`/`hipconfig`. Under compute-sanitizer's tree
+# launcher that fork-exec handshake can wedge the whole TP group. The CUDA
+# detector resolves arch via torch without subprocesses. Same knob as lvllm's
+# VLLM_TILELANG_SKIP_ROCM_TARGET_DETECT.
+if os.environ.get("SGLANG_TILELANG_SKIP_ROCM_TARGET_DETECT", "0") == "1":
+    import tilelang.backend.target as _tt
+
+    _tt._TARGET_DETECTORS.pop("hip", None)
 
 # Workaround a tilelang bug: BaseKernelAdapter._legalize_result_idx mutates the
 # `out_idx` list in place when normalising negative indices to positive ones.
