@@ -147,13 +147,14 @@ Portable diffs against upstream sglang (already included in the wheel — inform
 | Patch | Applies to | Contents |
 |-------|-----------|----------|
 | [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe hybrid MoE integration |
-| [`02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill fast path + V4.1 memory PRs (#27/#28) |
 
 ```bash
 git checkout 1aa0e962b
-git apply patches/01_lk_moe__dsv4.1.patch              # SM89+/SM120 basic: stop here
-git apply patches/02_sm80_sm120_support__dsv4.1.patch  # + SM80/86 + mixed-arch + SM120 fixes
+git apply patches/01_lk_moe__dsv4.1.patch   # SM89+/SM120 basic
 ```
+
+SM80/86 attention & GEMM ports, mixed-arch TP fixes and SM120 prefill fast path ship
+**in the wheel only** — no standalone patch is distributed for them.
 
 ---
 

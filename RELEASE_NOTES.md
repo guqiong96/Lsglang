@@ -199,12 +199,12 @@ pip install lsglang==1.5.6          # or build the wheel from tag lsglang-v1.5.6
 | Patch | Applies to | Contents |
 |-------|-----------|----------|
 | [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe MOE hybrid inference |
-| [`02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill extra-split |
 
 ```bash
 git apply patches/01_lk_moe__dsv4.1.patch            # SM90/SM100 (and SM120 basic) stop here
-git apply patches/02_sm80_sm120_support__dsv4.1.patch # + SM80/86 ports + SM120 mixed-arch & prefill fast path
 ```
+
+SM80/86 ports, SM120 mixed-arch & prefill fast path ship in the wheel only (no standalone patch).
 
 ## Launch — DeepSeek-V4.1-Flash (SM86, reference)
 
