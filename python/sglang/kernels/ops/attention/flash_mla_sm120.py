@@ -250,13 +250,16 @@ def _flash_mla_sm120_prefill(
     # The SM120 sparse-MLA prefill specialization requires page_block_size=64
     # for BOTH sources (the decode path accepts native page sizes).  V4.1
     # ratio-1/2/c128 extra pools use 128/256-token pages, so split them the
-    # same way as the main source.  Token indices are invariant under the
-    # split; the persistent scratch is keyed per role so converting the extra
-    # source can never clobber the main source's buffer (or vice versa).
+    # same way as the main source.  Pools with pages SMALLER than 64 (V4/0731
+    # ratio-4: 16-token pages) pass through untouched -- the kernel's page
+    # addressing is page-size-generic for those, exactly like the decode path.
+    # Token indices are invariant under the split; the persistent scratch is
+    # keyed per role so converting the extra source can never clobber the main
+    # source's buffer (or vice versa).
     if (
         extra_kv_u8 is not None
         and extra_kv_u8.ndim >= 3
-        and extra_kv_u8.shape[1] != _PBS_DST
+        and extra_kv_u8.shape[1] > _PBS_DST
     ):
         extra_kv_u8 = _split_kv_pages_to_64(
             extra_kv_u8,

@@ -537,8 +537,8 @@ class TestTouchedPageSplit(CustomTestCase):
         # bytes below are the ones the kernel writes into.
         dev = k_cache.device
         buffers = get_resources().buffers
-        split_key = f"flash_mla_sm120_split:{dev}"
-        mask_key = f"flash_mla_sm120_mask:{dev}"
+        split_key = f"flash_mla_sm120_split:{dev}:primary"
+        mask_key = f"flash_mla_sm120_mask:{dev}:primary"
         missing = object()
         for key in (split_key, mask_key):
             old = buffers.get(key, missing)
