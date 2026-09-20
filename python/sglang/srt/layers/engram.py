@@ -576,11 +576,11 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        if pin:
-            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-            if int(err) != 0:
-                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
-            self.registered = True
+        # cudaHostRegister pins whatever pages exist right now, and GUP-pinned
+        # base pages can never be folded again by khugepaged or MADV_COLLAPSE.
+        # Defer registration to finish_load, once the pages are in their final
+        # shape (see _register).
+        self.pin = pin
 
     @staticmethod
     def choose_layout(requested: str) -> str:
@@ -609,6 +609,15 @@ class _HostTable:
                 "TP ranks must share a PID namespace"
             ) from e
 
+    def _register(self) -> None:
+        """cudaHostRegister once, after the pages are in their final shape."""
+        if self.registered or not self.pin:
+            return
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), self.nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
+        self.registered = True
+
     def _collapse(self, tries: int = 3) -> None:
         """madvise(MADV_COLLAPSE): synchronously fold whatever is still on base pages
         into huge pages. Anonymous memory only; shmem obeys shmem_enabled and
@@ -635,6 +644,7 @@ class _HostTable:
 
     def finish_load(self, label: str):
         if not self.dirty:
+            self._register()
             return
         self.dirty = False
         if self.layout == "shared":
@@ -647,6 +657,17 @@ class _HostTable:
                 drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+        if (
+            self.pin
+            and huge_kb < mapped_kb * 0.98
+        ):  # khugepaged is the last folder before we pin: give it a bounded window.
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                time.sleep(2.0)
+                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+                if huge_kb >= mapped_kb * 0.98:
+                    break
+        self._register()
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
             f"engram host table {label}: layout={self.layout}, "
