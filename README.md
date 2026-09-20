@@ -1,4 +1,4 @@
-# Lsglang — lk_moe Hybrid Inference for sglang [[中文]](./README_cn.md)
+# Lsglang — lk_moe Hybrid Inference for sglang
 
 Lsglang is a special extension of [sglang](https://github.com/sgl-project/sglang) that adds
 **CPU-GPU hybrid (MOE) inference** on top of the latest sglang release version, fully compatible
