@@ -1406,6 +1406,8 @@ class Envs:
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Optional SM120 MXFP8 route for decode and DSpark verification.
+    SGLANG_SM120_MXFP8_B12X_SMALL_BATCH = EnvBool(False)
     # Exact, bounded-memory lookup from an immutable local safetensors shard.
     # Cache and staging limits are per Engram layer, in bytes.
     SGLANG_ENABLE_DSV41_ENGRAM_NVME = EnvBool(False)
