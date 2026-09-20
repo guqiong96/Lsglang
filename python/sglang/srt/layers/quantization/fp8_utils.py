@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dot_supported,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -23,7 +24,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
     w8a8_block_fp8_matmul_w8a16,
-    fp8_dot_supported,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -575,8 +575,10 @@ if get_platform().is_sm90 and is_flashinfer_available():
 @lru_cache(maxsize=1)
 def _is_ada_sm89() -> bool:
     """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
-    return _is_cuda and torch.cuda.is_available() and (
-        torch.cuda.get_device_capability() == (8, 9)
+    return (
+        _is_cuda
+        and torch.cuda.is_available()
+        and (torch.cuda.get_device_capability() == (8, 9))
     )
 
 
@@ -1541,6 +1543,15 @@ def flashinfer_mxfp8_blockscaled_linear(
     pin_tactic skips autotuning and uses the backend heuristic to preserve row-wise
     batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
     """
+    # An explicit opt-in: retain the selected backend on other architectures,
+    # shapes, and backends. Do not restrict the upstream MXFP8 dispatch to M=1.
+    if (
+        envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
+        and get_platform().is_sm120
+        and backend == "cutlass"
+        and input.numel() in (input.shape[-1], 4 * input.shape[-1], 6 * input.shape[-1])
+    ):
+        backend = "b12x"
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
-import os
 import time
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -210,9 +209,9 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -291,6 +290,7 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
+
 # SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
 # and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
 # RoPE (see deepseek_v4_wo_a_einsum.py). Lazy (not module-level): the probes
@@ -298,6 +298,7 @@ _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 # mixed-arch TP (SM86 + SM120).
 def _IS_SM8() -> bool:
     return is_sm80_supported() and not is_sm120_supported()
+
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -580,9 +581,14 @@ def _tp_all(pred: str) -> bool:
     }[pred]
     group = get_tp_group()
     world = getattr(group, "world_size", 1)
-    if world > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
-        flag = torch.tensor([1 if local else 0], dtype=torch.int32,
-                            device=torch.cuda.current_device())
+    if (
+        world > 1
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        flag = torch.tensor(
+            [1 if local else 0], dtype=torch.int32, device=torch.cuda.current_device()
+        )
         torch.distributed.all_reduce(flag, group=group.device_group)
         result = int(flag.item()) == world
     else:
@@ -2773,10 +2779,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             x.is_cuda
             and torch.version.cuda is not None
-            and (
-                _tp_all("blackwell")
-                or (_tp_all("sm90") and x.shape[0] == 1)
-            )
+            and (_tp_all("blackwell") or (_tp_all("sm90") and x.shape[0] == 1))
             and x.dtype == torch.bfloat16
         ):
             # The split-K partial fixes the reduction order;
@@ -4223,6 +4226,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        self._nvme_engram_loaded = False
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -4837,9 +4841,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     dtype=torch.bfloat16,
                     device=weight.device,
                 )
-                _apply_wo_a_bf16_matmul(
-                    o, wo_a_v, is_decode=True, fuse_inv_rope=False
-                )
+                _apply_wo_a_bf16_matmul(o, wo_a_v, is_decode=True, fuse_inv_rope=False)
         torch.cuda.synchronize()
 
     def _prewarm_moe_gate_kernels(self) -> None:
@@ -5022,6 +5024,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self._nvme_engram_loaded:
+            raise RuntimeError(
+                "NVMe Engram checkpoints are immutable; restart to reload"
+            )
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -5414,6 +5420,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            self._nvme_engram_loaded = envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
