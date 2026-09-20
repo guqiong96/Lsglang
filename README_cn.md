@@ -107,6 +107,8 @@ lk_moe 集成被整理为 [`patches/`](./patches) 下的可移植补丁：
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [输入 131072] | 75 t/s [输入 131072] | 100~132 t/s |
 | deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
+实验性 DeepSeek-V4.1 存储选项：[精确 NVMe Engram 读取](examples/runtime/deepseek_v4/README.engram_nvme.md)。
+
 ### 支持的模型与量化格式
 
 Lsglang 已验证的大部分原版 MOE 模型（Qwen3/GLM/MiniMax 等系列）：

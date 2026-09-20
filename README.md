@@ -115,6 +115,8 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [in 131072] | 75 t/s [in 131072] | 100~132 t/s |
 | deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
 
+Experimental DeepSeek-V4.1 storage option: [exact NVMe Engram lookup](examples/runtime/deepseek_v4/README.engram_nvme.md).
+
 ### Supported models & quant formats
 
 Most original MOE models verified on Lsglang (Qwen3/GLM/MiniMax series etc.):
