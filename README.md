@@ -114,6 +114,7 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.5.0[ branch: 0.5.19-lkmoe-deepseekv4-sm80plus] | EPYC 7642 *2 | 16ch ddr4 3200 | 3090 * 2 | 1060 t/s [in 32768] | 31 t/s [in 32768] | 35~50 t/s |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | Lsglang-v1.4.7 | EPYC 9684x *2 | 24ch ddr5 4800 | pro 6000 * 1 | 4600 t/s [in 131072] | 75 t/s [in 131072] | 100~132 t/s |
 | deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.3 | EPYC 9V74 *2 | ddr5 576g | 4080S * 2 | — | — | 60 t/s |
+| deepseek-ai/DeepSeek-V4.1-Flash | Lsglang-v1.5.6 | EPYC 7642 *2 | 16ch ddr4 3200 | 5060Ti * 2 | — | 21 t/s [in 65536, plain] | — |
 
 Experimental DeepSeek-V4.1 storage option: [exact NVMe Engram lookup](examples/runtime/deepseek_v4/README.engram_nvme.md).
 
@@ -157,6 +158,46 @@ python -m sglang.launch_server \
     --disable-shared-experts-fusion \
     --speculative-algo DSPARK \
     --speculative-dspark-block-size 5
+```
+
+### Quick start (DeepSeek V4.1 Flash [RTX 5060Ti *2])
+
+V4.1 keeps the engram tables in host memory on small cards
+(`SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`, ~48 GiB RAM per engram layer);
+`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0` keeps the GPU MoE pool off a 16 GB card.
+Startup log prints the huge-page verdict — see `RELEASE_NOTES.md` (Launch +
+huge pages) if it reads `0 MiB in huge pages (0%)`.
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=1,2 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_SKIP_P2P_CHECK=1 \
+LK_POWER_SAVING=1 \
+python -m sglang.launch_server \
+    --model /home/guqiong/Models/DeepSeek-V4.1-Flash \
+    --served-model-name DeepSeek-V4.1-Flash \
+    --host 0.0.0.0 --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 1024 \
+    --max-total-tokens 65536 \
+    --mem-fraction-static 0.92 \
+    --cuda-graph-backend-prefill disabled \
+    --disable-shared-experts-fusion \
+    --enable-decoder-swa-bounded-replay \
+    --speculative-algo DSPARK \
+    --speculative-dspark-block-size 5 \
+    --speculative-attention-mode decode
 ```
 
 ### Configuration parameters

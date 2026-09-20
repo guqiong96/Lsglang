@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index 852979c3ab..8fb888dcac 100755
+index 852979c3ab..b63cc25819 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
@@ -7,15 +7,38 @@ index 852979c3ab..8fb888dcac 100755
  [project]
  name = "lsglang"
 -version = "1.5.1"
-+version = "1.5.5"
++version = "1.5.6"
  description = "SGLang is a fast serving framework for large language models and vision language models."
  readme = "README.md"
  requires-python = ">=3.10"
 diff --git a/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py b/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
-index 23d5e30258..8b2992e377 100644
+index 23d5e30258..617b23910a 100644
 --- a/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
 +++ b/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
-@@ -271,20 +271,28 @@ def sparse_attention_fwd_kernel_v1(
+@@ -1,4 +1,5 @@
+ import functools
++import os
+ from functools import lru_cache
+ from typing import Any, Optional, Tuple
+ 
+@@ -11,6 +12,16 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
+ 
+ tilelang.set_log_level("WARNING")
+ 
++# Diagnostic gate: drop tilelang's ROCm target detector so target resolution
++# never spawns `which hipcc`/`hipconfig`. Under compute-sanitizer's tree
++# launcher that fork-exec handshake can wedge the whole TP group. The CUDA
++# detector resolves arch via torch without subprocesses. Same knob as lvllm's
++# VLLM_TILELANG_SKIP_ROCM_TARGET_DETECT.
++if os.environ.get("SGLANG_TILELANG_SKIP_ROCM_TARGET_DETECT", "0") == "1":
++    import tilelang.backend.target as _tt
++
++    _tt._TARGET_DETECTORS.pop("hip", None)
++
+ # Workaround a tilelang bug: BaseKernelAdapter._legalize_result_idx mutates the
+ # `out_idx` list in place when normalising negative indices to positive ones.
+ # That breaks any @tilelang.jit factory that compiles two prim_funcs with
+@@ -271,20 +282,28 @@ def sparse_attention_fwd_kernel_v1(
      block_I=64,
      num_stages=2,
      threads=256,
@@ -47,7 +70,7 @@ index 23d5e30258..8b2992e377 100644
          sm_scale = sm_scale * 1.44269504  # log2(e)
  
      batch = T.symbolic("batch")
-@@ -309,19 +317,22 @@ def sparse_attention_fwd_kernel_v1(
+@@ -309,19 +328,22 @@ def sparse_attention_fwd_kernel_v1(
      D = dim
      D_tail = tail_dim
  
@@ -75,7 +98,7 @@ index 23d5e30258..8b2992e377 100644
          Output: T.Tensor(o_shape, dtype),  # type: ignore
      ):
          with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
-@@ -330,9 +341,11 @@ def sparse_attention_fwd_kernel_v1(
+@@ -330,9 +352,11 @@ def sparse_attention_fwd_kernel_v1(
              bz,
          ):
              Q_shared = T.alloc_shared([H_per_block, D], dtype)
@@ -89,7 +112,7 @@ index 23d5e30258..8b2992e377 100644
              O_shared = T.alloc_shared([H_per_block, D], dtype)
              mask = T.alloc_fragment([BI], "bool")
  
-@@ -354,11 +367,27 @@ def sparse_attention_fwd_kernel_v1(
+@@ -354,11 +378,27 @@ def sparse_attention_fwd_kernel_v1(
              q_i = s_i
              max_kv_i = q_i
  
@@ -119,7 +142,7 @@ index 23d5e30258..8b2992e377 100644
  
              for i_i in T.Pipelined(NI, num_stages=num_stages):
                  for bi_i in T.Parallel(BI):
-@@ -368,10 +397,11 @@ def sparse_attention_fwd_kernel_v1(
+@@ -368,10 +408,11 @@ def sparse_attention_fwd_kernel_v1(
                      KV_shared[bi_i, d_i] = KV[
                          b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
                      ]
@@ -135,7 +158,7 @@ index 23d5e30258..8b2992e377 100644
  
                  for h_i, bi_i in T.Parallel(H_per_block, BI):
                      acc_s[h_i, bi_i] = T.if_then_else(
-@@ -384,13 +414,14 @@ def sparse_attention_fwd_kernel_v1(
+@@ -384,13 +425,14 @@ def sparse_attention_fwd_kernel_v1(
                      transpose_B=True,
                      policy=T.GemmWarpPolicy.FullCol,
                  )
@@ -157,7 +180,7 @@ index 23d5e30258..8b2992e377 100644
                  T.copy(m_i, m_i_prev)
                  T.reduce_max(acc_s, m_i, dim=1, clear=False)
                  for h_i in T.Parallel(H_per_block):
-@@ -1319,13 +1350,18 @@ def tilelang_sparse_fwd(
+@@ -1319,13 +1361,18 @@ def tilelang_sparse_fwd(
      indices: torch.Tensor,
      sm_scale: float,
      d_v: int = 512,
@@ -177,7 +200,7 @@ index 23d5e30258..8b2992e377 100644
  
      if _is_hip:
          is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-@@ -1379,10 +1415,64 @@ def tilelang_sparse_fwd(
+@@ -1379,10 +1426,64 @@ def tilelang_sparse_fwd(
          )
          out = kernel_combine(partial_o_batched, partial_lse_batched)
      else:
@@ -1770,11 +1793,25 @@ index 039bc931ca..584ad96642 100644
                  or get_platform().is_sm120
              )
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index d5dd933966..2f41df3d39 100644
+index d5dd933966..8db08299cc 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1408,6 +1408,15 @@ class Envs:
+@@ -1403,11 +1403,29 @@ class Envs:
+     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
++    # Bound score chunks and the dense FP4 score allocation; bytes.
++    SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES = EnvInt(1 << 30)
+     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
+     # rows from the GPU instead of sharding them over HBM.
      SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
++    # Optional SM120 MXFP8 route for decode and DSpark verification.
++    SGLANG_SM120_MXFP8_B12X_SMALL_BATCH = EnvBool(False)
++    # Exact, bounded-memory lookup from an immutable local safetensors shard.
++    # Cache and staging limits are per Engram layer, in bytes.
++    SGLANG_ENABLE_DSV41_ENGRAM_NVME = EnvBool(False)
++    SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES = EnvInt(1 << 30)
++    SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES = EnvInt(128 << 20)
      # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
      SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
 +    # Diagnostic: disable the decode-only side streams (early compress/indexer
@@ -1789,7 +1826,7 @@ index d5dd933966..2f41df3d39 100644
      # Pin and map the host table with cudaHostRegister. False leaves the plain
      # mapping to the platform (Grace-Blackwell ATS reaches it directly).
      SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
-@@ -1424,7 +1433,6 @@ class Envs:
+@@ -1424,7 +1442,6 @@ class Envs:
      SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
      SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
      SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
@@ -1798,10 +1835,10 @@ index d5dd933966..2f41df3d39 100644
      SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
      # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 6e66a8e0c9..2c869dba26 100644
+index 6e66a8e0c9..6a8b7da15b 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -25,12 +25,18 @@ from sglang.kernels.ops.attention.dsv4 import (
+@@ -25,7 +25,10 @@ from sglang.kernels.ops.attention.dsv4 import (
      topk_transform_ragged_v2,
  )
  from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
@@ -1812,14 +1849,16 @@ index 6e66a8e0c9..2c869dba26 100644
      dequantize_k_cache_paged,
      fp8_dtype,
      gather_dequant_requant_fp8_paged,
-     q8kv8_padded_num_heads,
+@@ -39,6 +42,9 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
  )
+ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+ from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
 +from sglang.kernels.ops.attention.dsv4.sparse_mla_kernels import (
 +    matmul_sparse_mla_attention_with_sink,
 +)
- from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
-     fill_all_compressed_indices,
- )
+ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+     BuildCausalSwaPageIndices,
+     BuildPageTablePositions,
 @@ -100,6 +106,9 @@ from sglang.srt.layers.dp_attention import (
  from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
  from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1834,11 +1873,11 @@ index 6e66a8e0c9..2c869dba26 100644
      resolve_ragged_verify_layout,
  )
  from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
++from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
  
  if TYPE_CHECKING:
      from sgl_kernel.flash_mla import FlashMLASchedMeta
-@@ -125,6 +135,17 @@ if TYPE_CHECKING:
+@@ -125,6 +135,18 @@ if TYPE_CHECKING:
  _is_cuda = is_cuda()
  _is_xpu = is_xpu()
  
@@ -1853,10 +1892,11 @@ index 6e66a8e0c9..2c869dba26 100644
 +    """
 +    return is_sm80_supported() and not is_sm120_supported()
 +
++
  logger = logging.getLogger(__name__)
  
  SWA_WINDOW = 128
-@@ -138,6 +159,14 @@ def _is_sm100_or_newer() -> bool:
+@@ -138,6 +160,14 @@ def _is_sm100_or_newer() -> bool:
      return torch.cuda.get_device_capability()[0] >= 10
  
  
@@ -1871,7 +1911,7 @@ index 6e66a8e0c9..2c869dba26 100644
  def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
      # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
      # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
-@@ -233,6 +262,17 @@ def _fp4_paged_mqa_logits(
+@@ -233,6 +263,17 @@ def _fp4_paged_mqa_logits(
      reference does not apply one."""
      from deep_gemm import fp8_fp4_paged_mqa_logits as fn
  
@@ -1889,7 +1929,50 @@ index 6e66a8e0c9..2c869dba26 100644
      sl = seq_lens.to(torch.int32)
      if sl.dim() == 1:
          sl = sl.unsqueeze(-1)
-@@ -1010,11 +1050,13 @@ class DSV4RawDecodeMetadata:
+@@ -298,7 +339,41 @@ def two_level_decode_logits(
+ 
+ 
+ # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
++_TORCH_INDEXER_SCORE_BUDGET_BYTES = envs.SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES.get()
++if _TORCH_INDEXER_SCORE_BUDGET_BYTES <= 0:
++    raise ValueError("SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES must be positive")
++
++
++class CompactCandidateMask:
++    """Lossless block mask for eager prefill; decode graph tensors stay unchanged."""
++
++    def __init__(self, blocks: torch.Tensor, width: int, block_size: int):
++        self.blocks = blocks
++        self.width = width
++        self.block_size = block_size
++
++    @property
++    def shape(self):
++        return (self.blocks.shape[0], self.width)
++
++    def __getitem__(self, rows):
++        return CompactCandidateMask(self.blocks[rows], self.width, self.block_size)
++
++    def expanded(self, rows, width):
++        return self.blocks[rows].repeat_interleave(self.block_size, dim=-1)[:, :width]
++
++
++def candidate_mask_rows(mask, rows, width):
++    if isinstance(mask, CompactCandidateMask):
++        return mask.expanded(rows, width)
++    return mask[rows, :width]
++
++
++def compact_candidate_blocks(scores, lens, topk_blocks, block_size):
++    # Preserve the exact original top-k/tie behavior. Only the small score chunk
++    # expands to positions, and clone prevents retaining that full backing store.
++    full = select_candidate_blocks(scores, lens, topk_blocks, block_size)
++    return full[:, ::block_size].clone()
+ 
+ 
+ def _mask_topk_scores(
+@@ -1010,11 +1085,13 @@ class DSV4RawDecodeMetadata:
      req_pool_indices: torch.Tensor
      seq_lens: torch.Tensor
      out_cache_loc: torch.Tensor
@@ -1903,7 +1986,7 @@ index 6e66a8e0c9..2c869dba26 100644
  
  
  class _GraphBucket(enum.Enum):
-@@ -1070,6 +1112,64 @@ class DeepseekV4AttnBackend(
+@@ -1070,6 +1147,67 @@ class DeepseekV4AttnBackend(
          self.encoder_replay = False
          self.device = torch.device(model_runner.device)
          self.max_context_len = model_runner.model_config.context_len
@@ -1916,9 +1999,12 @@ index 6e66a8e0c9..2c869dba26 100644
 +        # defaulting to context_len when unset) so the graph captures a fixed
 +        # (smaller) shape; the live length is always <= max_total_tokens//128
 +        # so no valid entry is dropped.
-+        _pool_cap = getattr(
-+            getattr(model_runner, "server_args", None), "max_total_tokens", None
-+        ) or self.max_context_len
++        _pool_cap = (
++            getattr(
++                getattr(model_runner, "server_args", None), "max_total_tokens", None
++            )
++            or self.max_context_len
++        )
 +        self._c128_decode_max_topk = (max(1, _pool_cap) // 128 + 63) // 64 * 64
 +        # Multi-bucket decode widths. The graph is captured once per width; at
 +        # replay we pick the smallest bucket covering the current max seq_len.
@@ -1962,13 +2048,24 @@ index 6e66a8e0c9..2c869dba26 100644
 +        if self._c128_decode_max_topk not in self._c128_topk_buckets:
 +            self._c128_topk_buckets.append(self._c128_decode_max_topk)
 +        self._c128_topk_buckets.sort()
-+        self._sm8_attn_buffers: Dict[Tuple[int, int, int], Tuple[torch.Tensor, ...]] = (
-+            {}
-+        )
++        self._sm8_attn_buffers: Dict[
++            Tuple[int, int, int], Tuple[torch.Tensor, ...]
++        ] = {}
          head_dim = model_runner.model_config.head_dim
          assert head_dim == 512, (
              "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-@@ -1294,6 +1394,7 @@ class DeepseekV4AttnBackend(
+@@ -1100,7 +1238,9 @@ class DeepseekV4AttnBackend(
+         self.has_c128: bool = 128 in self.present_ratios
+         # Per-request candidate masks the candidate_source layer publishes for the
+         # index_source layers after it (torch indexer scratch).
+-        self.candidate_masks: Optional[List[torch.Tensor]] = None
++        self.candidate_masks: Optional[
++            Union[torch.Tensor, List[Union[torch.Tensor, CompactCandidateMask]]]
++        ] = None
+         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+ 
+         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+@@ -1294,6 +1434,7 @@ class DeepseekV4AttnBackend(
          req_pool_indices: torch.Tensor,
          seq_lens: torch.Tensor,
          out_cache_loc: torch.Tensor,
@@ -1976,7 +2073,7 @@ index 6e66a8e0c9..2c869dba26 100644
      ) -> Union[DSV4Metadata, DSV4RawDecodeMetadata]:
          assert (
              req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
-@@ -1303,6 +1404,7 @@ class DeepseekV4AttnBackend(
+@@ -1303,6 +1444,7 @@ class DeepseekV4AttnBackend(
              req_pool_indices=req_pool_indices,
              seq_lens=seq_lens,
              out_cache_loc=out_cache_loc,
@@ -1984,7 +2081,7 @@ index 6e66a8e0c9..2c869dba26 100644
          )
  
      def init_forward_metadata_prefill(
-@@ -1900,6 +2002,33 @@ class DeepseekV4AttnBackend(
+@@ -1900,6 +2042,33 @@ class DeepseekV4AttnBackend(
              out_loc=out_cache_loc,
              need_compress=True,
          )
@@ -2018,7 +2115,7 @@ index 6e66a8e0c9..2c869dba26 100644
          indexer_metadata = (
              self.init_forward_metadata_indexer(core_attn_metadata)
              if self.has_c4
-@@ -2151,7 +2280,7 @@ class DeepseekV4AttnBackend(
+@@ -2151,7 +2320,7 @@ class DeepseekV4AttnBackend(
              logger.debug(
                  f"[IDLE replay] bs={bs}, "
                  f"local_seq_lens_len={len(seq_lens)}, "
@@ -2027,7 +2124,7 @@ index 6e66a8e0c9..2c869dba26 100644
              )
              device = seq_lens.device
              seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-@@ -2172,6 +2301,12 @@ class DeepseekV4AttnBackend(
+@@ -2172,6 +2341,12 @@ class DeepseekV4AttnBackend(
              assert actual_max_seq_len <= chosen_max_seq_len
  
          graph_key = bs
@@ -2040,7 +2137,7 @@ index 6e66a8e0c9..2c869dba26 100644
          if bucket == _GraphBucket.DECODE_OR_IDLE:
              assert out_cache_loc is not None
              assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
-@@ -2191,6 +2326,7 @@ class DeepseekV4AttnBackend(
+@@ -2191,6 +2366,7 @@ class DeepseekV4AttnBackend(
                  req_pool_indices=req_pool_indices,
                  seq_lens=seq_lens,
                  out_cache_loc=out_cache_loc_padded,
@@ -2048,7 +2145,7 @@ index 6e66a8e0c9..2c869dba26 100644
              )
          elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
              block_size = self.speculative_num_draft_tokens - 1
-@@ -2235,7 +2371,7 @@ class DeepseekV4AttnBackend(
+@@ -2235,7 +2411,7 @@ class DeepseekV4AttnBackend(
                  self.online_c128_mtp.clear()
                  self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                      bucket
@@ -2057,7 +2154,7 @@ index 6e66a8e0c9..2c869dba26 100644
                  return
              assert out_cache_loc is not None
              assert num_tokens_v >= len(out_cache_loc), (
-@@ -2293,7 +2429,10 @@ class DeepseekV4AttnBackend(
+@@ -2293,7 +2469,10 @@ class DeepseekV4AttnBackend(
              raise NotImplementedError
  
          self.replay_cuda_graph_metadata_from(
@@ -2069,7 +2166,7 @@ index 6e66a8e0c9..2c869dba26 100644
          )
  
          if in_capture:
-@@ -2596,10 +2735,14 @@ class DeepseekV4AttnBackend(
+@@ -2596,10 +2775,14 @@ class DeepseekV4AttnBackend(
          self.forward_metadata = capture_metadata
  
      def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -2085,7 +2182,7 @@ index 6e66a8e0c9..2c869dba26 100644
                  Union[
                      DSV4Metadata,
                      DSV4RawDecodeMetadata,
-@@ -2640,11 +2783,13 @@ class DeepseekV4AttnBackend(
+@@ -2640,11 +2823,13 @@ class DeepseekV4AttnBackend(
              DSV4RawDecodeMetadata,
          ],
          bucket: _GraphBucket,
@@ -2101,7 +2198,7 @@ index 6e66a8e0c9..2c869dba26 100644
              self.forward_metadata = temp_metadata
              return
          chosen_metadata.copy_(temp_metadata)
-@@ -3020,10 +3165,16 @@ class DeepseekV4AttnBackend(
+@@ -3020,10 +3205,16 @@ class DeepseekV4AttnBackend(
              forward_batch.forward_mode.is_decode()
              or forward_batch.forward_mode.is_target_verify()
          )
@@ -2120,7 +2217,7 @@ index 6e66a8e0c9..2c869dba26 100644
          ):
              self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
          elif is_decode_or_verify:
-@@ -3031,6 +3182,22 @@ class DeepseekV4AttnBackend(
+@@ -3031,13 +3222,33 @@ class DeepseekV4AttnBackend(
          else:
              self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
  
@@ -2143,7 +2240,64 @@ index 6e66a8e0c9..2c869dba26 100644
      @staticmethod
      def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
          return (
-@@ -3469,8 +3636,9 @@ class DeepseekV4AttnBackend(
+             not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
++            and forward_batch.seq_lens_cpu is not None
++            and forward_batch.input_ids.numel()
++            * max(forward_batch.seq_lens_cpu, default=0)
++            * 4
++            <= _TORCH_INDEXER_SCORE_BUDGET_BYTES
+             and _has_dense_fp4_indexer()
+             and forward_batch.forward_mode.is_extend()
+-            and forward_batch.seq_lens_cpu is not None
+             and forward_batch.extend_seq_lens_cpu is not None
+         )
+ 
+@@ -3160,23 +3371,34 @@ class DeepseekV4AttnBackend(
+                 continue
+             scores = logits[rows, :lc]
+             if publish is None:
+-                scores.masked_fill_(~self.candidate_masks[b], -torch.inf)
++                step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // max(1, lc))
++                for offset in range(0, t_len, step):
++                    chunk = slice(offset, offset + step)
++                    scores[chunk].masked_fill_(
++                        ~candidate_mask_rows(self.candidate_masks[b], chunk, lc),
++                        -torch.inf,
++                    )
+                 continue
+             lens = compress_lens[rows, None]
+             # the block selection tells unreachable positions apart by -inf
+             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
+             # the block selection pads and pools a copy of its rows; bound that copy
+             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+-            masks = [
+-                select_candidate_blocks(
+-                    scores[start : start + step],
+-                    lens[start : start + step],
+-                    topk_blocks=indexer.candidate_topk_blocks,
+-                    block_size=indexer.candidate_block_size,
++            block_size = indexer.candidate_block_size
++            blocks = torch.empty(
++                (t_len, (lc + block_size - 1) // block_size),
++                dtype=torch.bool,
++                device=logits.device,
++            )
++            for start in range(0, t_len, step):
++                chunk = slice(start, start + step)
++                blocks[chunk] = compact_candidate_blocks(
++                    scores[chunk],
++                    lens[chunk],
++                    indexer.candidate_topk_blocks,
++                    block_size,
+                 )
+-                for start in range(0, t_len, step)
+-            ]
+-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
++            publish.append(CompactCandidateMask(blocks, lc, block_size))
+         if publish is not None:
+             self.candidate_masks = publish
+ 
+@@ -3469,29 +3691,36 @@ class DeepseekV4AttnBackend(
              # pool-sized.
              index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
              k = min(topk, lc)
@@ -2155,25 +2309,53 @@ index 6e66a8e0c9..2c869dba26 100644
              rows_per_chunk = max(
                  1,
                  _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
-@@ -3480,7 +3648,7 @@ class DeepseekV4AttnBackend(
+             )
+-            masks = [] if publish is not None else None
++            block_size = indexer.candidate_block_size
++            masks = (
++                torch.empty(
++                    (tok.numel(), (lc + block_size - 1) // block_size),
++                    dtype=torch.bool,
++                    device=pos.device,
++                )
++                if publish is not None
++                else None
++            )
+             for start in range(0, tok.numel(), rows_per_chunk):
                  rows = slice(start, start + rows_per_chunk)
                  tok_c, lens_c = tok[rows], lens[rows]
                  s = indexer.scores(q[tok_c], index_k, weights[tok_c])
 -                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
 +                s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
                  if masks is not None:
-                     masks.append(
-                         select_candidate_blocks(
-@@ -3491,7 +3659,7 @@ class DeepseekV4AttnBackend(
-                         )
+-                    masks.append(
+-                        select_candidate_blocks(
+-                            s,
+-                            lens_c[:, None],
+-                            topk_blocks=indexer.candidate_topk_blocks,
+-                            block_size=indexer.candidate_block_size,
+-                        )
++                    masks[rows] = compact_candidate_blocks(
++                        s, lens_c[:, None], indexer.candidate_topk_blocks, block_size
                      )
                  elif consume is not None:
 -                    s = s.masked_fill(~consume[b][rows], -torch.inf)
-+                    s.masked_fill_(~consume[b][rows], -torch.inf)
++                    s.masked_fill_(
++                        ~candidate_mask_rows(consume[b], rows, lc), -torch.inf
++                    )
                  idx = s.topk(k, dim=-1, sorted=False).indices
                  if consume is not None and masks is None:
                      idx = _mask_topk_scores(s, idx)
-@@ -3690,7 +3858,19 @@ class DeepseekV4AttnBackend(
+@@ -3504,7 +3733,7 @@ class DeepseekV4AttnBackend(
+                 if raw_indices is not None:
+                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
+             if masks is not None:
+-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
++                publish.append(CompactCandidateMask(masks, lc, block_size))
+         if publish is not None:
+             self.candidate_masks = publish
+ 
+@@ -3690,7 +3919,19 @@ class DeepseekV4AttnBackend(
                      attn_sink=attn_sink,
                  )
  
@@ -2194,7 +2376,7 @@ index 6e66a8e0c9..2c869dba26 100644
                  from sglang.kernels.ops.attention.flash_mla_sm120 import (
                      SM120_DECODE_MAX_TOKENS,
                      flash_mla_with_kvcache_sm120,
-@@ -3747,6 +3927,107 @@ class DeepseekV4AttnBackend(
+@@ -3747,6 +3988,105 @@ class DeepseekV4AttnBackend(
  
          raise NotImplementedError("ragged attention")
  
@@ -2255,9 +2437,7 @@ index 6e66a8e0c9..2c869dba26 100644
 +            out = torch.empty(
 +                (b, h, self.head_dim_v), dtype=torch.bfloat16, device=device
 +            )
-+            score_buffer = torch.empty(
-+                (b, h, topk), dtype=torch.float32, device=device
-+            )
++            score_buffer = torch.empty((b, h, topk), dtype=torch.float32, device=device)
 +            valid_buf = torch.empty((b, topk), dtype=torch.bool, device=device)
 +            buf = (combined_kv, out, score_buffer, valid_buf)
 +            self._sm8_attn_buffers[key] = buf
@@ -2302,7 +2482,7 @@ index 6e66a8e0c9..2c869dba26 100644
      def _forward_prefill_sparse(
          self,
          q: torch.Tensor,
-@@ -3836,6 +4117,44 @@ class DeepseekV4AttnBackend(
+@@ -3836,6 +4176,44 @@ class DeepseekV4AttnBackend(
          )
          kv = workspace
  
@@ -2732,6 +2912,726 @@ index 7dba72aefc..b864026366 100644
              else:
                  fn = fp8_paged_mqa_logits_torch
          elif is_xpu():
+diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
+index 8f4340f130..2d769d30dd 100644
+--- a/python/sglang/srt/layers/engram.py
++++ b/python/sglang/srt/layers/engram.py
+@@ -576,11 +576,11 @@ class _HostTable:
+             # Every rank holds the fd before rank 0 continues; the /proc path only
+             # resolves while rank 0 keeps its descriptor.
+             group.barrier()
+-        if pin:
+-            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+-            if int(err) != 0:
+-                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+-            self.registered = True
++        # cudaHostRegister pins whatever pages exist right now, and GUP-pinned
++        # base pages can never be folded again by khugepaged or MADV_COLLAPSE.
++        # Defer registration to finish_load, once the pages are in their final
++        # shape (see _register).
++        self.pin = pin
+ 
+     @staticmethod
+     def choose_layout(requested: str) -> str:
+@@ -609,6 +609,15 @@ class _HostTable:
+                 "TP ranks must share a PID namespace"
+             ) from e
+ 
++    def _register(self) -> None:
++        """cudaHostRegister once, after the pages are in their final shape."""
++        if self.registered or not self.pin:
++            return
++        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), self.nbytes, 0)
++        if int(err) != 0:
++            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
++        self.registered = True
++
+     def _collapse(self, tries: int = 3) -> None:
+         """madvise(MADV_COLLAPSE): synchronously fold whatever is still on base pages
+         into huge pages. Anonymous memory only; shmem obeys shmem_enabled and
+@@ -635,6 +644,7 @@ class _HostTable:
+ 
+     def finish_load(self, label: str):
+         if not self.dirty:
++            self._register()
+             return
+         self.dirty = False
+         if self.layout == "shared":
+@@ -647,6 +657,17 @@ class _HostTable:
+                 drop_checkpoint_page_cache()
+             self._collapse()
+             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
++        if (
++            self.pin
++            and huge_kb < mapped_kb * 0.98
++        ):  # khugepaged is the last folder before we pin: give it a bounded window.
++            deadline = time.time() + 20.0
++            while time.time() < deadline:
++                time.sleep(2.0)
++                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
++                if huge_kb >= mapped_kb * 0.98:
++                    break
++        self._register()
+         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
+         msg = (
+             f"engram host table {label}: layout={self.layout}, "
+@@ -686,7 +707,36 @@ class EngramEmbedding(nn.Module):
+         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
+         self.rows = row_end - self.row_start
+         self.host_table: Optional[_HostTable] = None
+-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
++        self.nvme_table = None
++        if envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get():
++            from sglang.srt.layers.engram_nvme import (
++                NvmeEngramStore,
++                validate_configuration,
++            )
++            from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
++
++            validate_configuration(
++                get_parallel(),
++                get_schedule(),
++                get_spec(),
++                get_exec().graph,
++                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),
++            )
++            self.nvme_table = NvmeEngramStore(
++                get_model().model_path,
++                layer_id,
++                num_embeddings,
++                dim,
++                envs.SGLANG_DSV41_ENGRAM_NVME_CACHE_BYTES.get(),
++                envs.SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES.get(),
++            )
++            self.weight = nn.Parameter(
++                torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False
++            )
++            self.scale = nn.Parameter(
++                torch.empty(0, dtype=torch.float8_e8m0fnu), requires_grad=False
++            )
++        elif envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+             self._init_host_table(num_embeddings, dim, layer_id)
+         else:
+             self.weight = nn.Parameter(
+@@ -727,6 +777,11 @@ class EngramEmbedding(nn.Module):
+         return self.host_table is not None and self.host_table.layout == "shared"
+ 
+     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
++        if self.nvme_table is not None:
++            self.nvme_table.validate_weight(
++                "weight" if param is self.weight else "scale", loaded_weight
++            )
++            return
+         rows = slice(self.row_start, self.row_start + self.rows)
+         if self._shared:
+             param.data[rows].copy_(loaded_weight[rows])
+@@ -738,6 +793,8 @@ class EngramEmbedding(nn.Module):
+     def finish_load(self, label: str = ""):
+         """Barrier (shared layout) once every rank has written its rows; log how
+         the table ended up backed."""
++        if self.nvme_table is not None:
++            self.nvme_table.finish_load()
+         if self.host_table is not None:
+             self.host_table.finish_load(label)
+ 
+@@ -793,6 +850,8 @@ class EngramEmbedding(nn.Module):
+ 
+     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
+         """Rows of `indices` this rank's shard holds, zero for the rest."""
++        if self.nvme_table is not None:
++            return self.nvme_table.lookup(indices)
+         if self.rows == 0:
+             return self._empty(indices).zero_()
+         if self.host_table is None and (
+diff --git a/python/sglang/srt/layers/engram_nvme.cpp b/python/sglang/srt/layers/engram_nvme.cpp
+new file mode 100644
+index 0000000000..e741ad53cb
+--- /dev/null
++++ b/python/sglang/srt/layers/engram_nvme.cpp
+@@ -0,0 +1,265 @@
++// Exact immutable FP8 row retrieval; bounded direct-mapped RAM cache.
++// No CUDA calls in the callback: suitable for cudaLaunchHostFunc graph nodes.
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <linux/aio_abi.h>
++#include <mutex>
++#include <new>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++struct Store {
++  int fd;
++  aio_context_t aio = 0;
++  uint8_t *pages = nullptr;
++  std::mutex batch_lock;
++  std::atomic<uint64_t> batches{0}, peak_pages{0};
++  uint64_t rows, weight_offset, scale_offset, slots, row_lo, row_hi;
++  uint8_t *cache;
++  uint64_t *keys;
++  std::atomic<uint64_t> hits{0}, misses{0}, reads{0};
++};
++struct Work {
++  Store *store;
++  const int64_t *ids;
++  uint8_t *weights, *scales;
++  uint64_t count;
++};
++
++static void fail(const char *reason) {
++  std::fprintf(stderr, "Engram retrieval failed: %s (errno=%d)\n", reason,
++               errno);
++  std::abort(); // Never allow a generation to continue with missing/stale rows.
++}
++
++extern "C" void row_store_close(Store *s);
++
++extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
++                                 uint64_t soff, uint64_t budget) {
++  auto *s = new (std::nothrow) Store{};
++  if (!s) {
++    errno = ENOMEM;
++    return nullptr;
++  }
++  s->fd = open(path, O_RDONLY | O_CLOEXEC | O_DIRECT);
++  if (s->fd < 0) {
++    delete s;
++    return nullptr;
++  }
++  struct stat statbuf;
++  if (fstat(s->fd, &statbuf) || !S_ISREG(statbuf.st_mode) ||
++      rows > uint64_t(INT64_MAX) || woff > uint64_t(statbuf.st_size) ||
++      soff > uint64_t(statbuf.st_size) ||
++      rows > (uint64_t(statbuf.st_size) - woff) / 256 ||
++      rows > (uint64_t(statbuf.st_size) - soff) / 8) {
++    row_store_close(s);
++    errno = EINVAL;
++    return nullptr;
++  }
++  s->rows = rows;
++  s->weight_offset = woff;
++  s->scale_offset = soff;
++  s->row_lo = 0;
++  s->row_hi = rows;
++  s->slots = budget / 272;
++  if (s->slots) {
++    s->cache = static_cast<uint8_t *>(mmap(nullptr, s->slots * 264,
++                                           PROT_READ | PROT_WRITE,
++                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    s->keys = static_cast<uint64_t *>(mmap(nullptr, s->slots * sizeof(uint64_t),
++                                           PROT_READ | PROT_WRITE,
++                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    if (s->cache == MAP_FAILED || s->keys == MAP_FAILED) {
++      int error = errno;
++      row_store_close(s);
++      errno = error;
++      return nullptr;
++    }
++  }
++  int error =
++      posix_memalign(reinterpret_cast<void **>(&s->pages), 4096, 128 * 4096);
++  if (error) {
++    row_store_close(s);
++    errno = error;
++    return nullptr;
++  }
++  if (syscall(SYS_io_setup, 128, &s->aio) < 0) {
++    error = errno;
++    row_store_close(s);
++    errno = error;
++    return nullptr;
++  }
++  return s;
++}
++
++// At most 32 misses and 128 unique pages per batch, including boundary
++// crossings.
++struct ReadBatch {
++  std::array<uint64_t, 128> offsets{};
++  std::array<size_t, 128> required{};
++  size_t count = 0;
++  void add(uint64_t offset, size_t length) {
++    while (length) {
++      uint64_t base = offset & ~uint64_t(4095);
++      size_t delta = offset - base, take = std::min(length, 4096 - delta);
++      size_t j = 0;
++      while (j < count && offsets[j] != base)
++        ++j;
++      if (j == count) {
++        if (count == offsets.size())
++          fail("batch page limit");
++        offsets[count++] = base;
++      }
++      required[j] = std::max(required[j], delta + take);
++      offset += take;
++      length -= take;
++    }
++  }
++  void read(Store *s) {
++    if (!count)
++      return;
++    std::array<iocb, 128> requests{};
++    std::array<iocb *, 128> pointers{};
++    for (size_t j = 0; j < count; ++j) {
++      auto &request = requests[j];
++      request.aio_data = j;
++      request.aio_lio_opcode = IOCB_CMD_PREAD;
++      request.aio_fildes = s->fd;
++      request.aio_buf = reinterpret_cast<uint64_t>(s->pages + j * 4096);
++      request.aio_nbytes = 4096;
++      request.aio_offset = offsets[j];
++      pointers[j] = &request;
++    }
++    size_t submitted = 0;
++    while (submitted < count) {
++      long queued;
++      do {
++        queued = syscall(SYS_io_submit, s->aio, count - submitted,
++                         pointers.data() + submitted);
++      } while (queued < 0 && errno == EINTR);
++      if (queued <= 0)
++        fail("io_submit");
++      std::array<io_event, 128> events{};
++      long completed = 0;
++      while (completed < queued) {
++        long got;
++        do {
++          got = syscall(SYS_io_getevents, s->aio, 1, queued - completed,
++                        events.data(), nullptr);
++        } while (got < 0 && errno == EINTR);
++        if (got <= 0)
++          fail("io_getevents");
++        for (long j = 0; j < got; ++j) {
++          const auto &event = events[j];
++          if (event.data < submitted || event.data >= submitted + queued ||
++              event.res < 0 || event.res2 != 0 ||
++              uint64_t(event.res) < required[event.data])
++            fail("short or failed asynchronous read");
++        }
++        completed += got;
++      }
++      submitted += queued;
++    }
++    s->reads.fetch_add(count, std::memory_order_relaxed);
++    ++s->batches;
++    if (count > s->peak_pages.load())
++      s->peak_pages.store(count);
++  }
++  void copy(Store *s, uint64_t offset, uint8_t *out, size_t length) const {
++    while (length) {
++      uint64_t base = offset & ~uint64_t(4095);
++      size_t delta = offset - base, take = std::min(length, 4096 - delta);
++      size_t j = 0;
++      while (j < count && offsets[j] != base)
++        ++j;
++      if (j == count)
++        fail("missing batch page");
++      std::memcpy(out, s->pages + j * 4096 + delta, take);
++      offset += take;
++      out += take;
++      length -= take;
++    }
++  }
++};
++
++extern "C" void row_store_lookup(void *opaque) {
++  auto *work = static_cast<Work *>(opaque);
++  Store *s = work->store;
++  // One callback owns the bounded I/O buffers and cache until every read
++  // completes.
++  std::lock_guard<std::mutex> guard(s->batch_lock);
++  for (uint64_t begin = 0; begin < work->count; begin += 32) {
++    ReadBatch batch;
++    std::array<uint64_t, 32> misses{};
++    size_t miss_count = 0;
++    uint64_t end = begin + std::min(uint64_t(32), work->count - begin);
++    for (uint64_t i = begin; i < end; ++i) {
++      int64_t id = work->ids[i];
++      if (id < 0 || uint64_t(id) >= s->rows)
++        fail("row ID out of bounds");
++      if (uint64_t(id) < s->row_lo || uint64_t(id) >= s->row_hi) {
++        std::memset(work->weights + i * 256, 0, 256);
++        std::memset(work->scales + i * 8, 0, 8);
++        continue;
++      }
++      uint64_t slot = s->slots ? uint64_t(id) % s->slots : 0;
++      if (s->slots && s->keys[slot] == uint64_t(id) + 1) {
++        std::memcpy(work->weights + i * 256, s->cache + slot * 264, 256);
++        std::memcpy(work->scales + i * 8, s->cache + slot * 264 + 256, 8);
++        ++s->hits;
++      } else {
++        misses[miss_count++] = i;
++        batch.add(s->weight_offset + uint64_t(id) * 256, 256);
++        batch.add(s->scale_offset + uint64_t(id) * 8, 8);
++        ++s->misses;
++      }
++    }
++    batch.read(s);
++    for (size_t j = 0; j < miss_count; ++j) {
++      uint64_t i = misses[j], id = work->ids[i];
++      uint8_t row[264];
++      batch.copy(s, s->weight_offset + id * 256, row, 256);
++      batch.copy(s, s->scale_offset + id * 8, row + 256, 8);
++      std::memcpy(work->weights + i * 256, row, 256);
++      std::memcpy(work->scales + i * 8, row + 256, 8);
++      if (s->slots) {
++        uint64_t slot = id % s->slots;
++        std::memcpy(s->cache + slot * 264, row, 264);
++        s->keys[slot] = id + 1;
++      }
++    }
++  }
++}
++
++extern "C" void row_store_stats(Store *s, uint64_t *out) {
++  out[0] = s->hits.load();
++  out[1] = s->misses.load();
++  out[2] = s->reads.load();
++  out[3] = s->slots * 272;
++}
++extern "C" void row_store_range(Store *s, uint64_t lo, uint64_t hi) {
++  if (lo > hi || hi > s->rows)
++    fail("invalid row ownership range");
++  s->row_lo = lo;
++  s->row_hi = hi;
++}
++extern "C" void row_store_close(Store *s) {
++  if (s->cache && s->cache != MAP_FAILED)
++    munmap(s->cache, s->slots * 264);
++  if (s->keys && s->keys != MAP_FAILED)
++    munmap(s->keys, s->slots * sizeof(uint64_t));
++  if (s->aio && syscall(SYS_io_destroy, s->aio) < 0)
++    fail("io_destroy");
++  std::free(s->pages);
++  close(s->fd);
++  delete s;
++}
+diff --git a/python/sglang/srt/layers/engram_nvme.py b/python/sglang/srt/layers/engram_nvme.py
+new file mode 100644
+index 0000000000..1ffcaaec0f
+--- /dev/null
++++ b/python/sglang/srt/layers/engram_nvme.py
+@@ -0,0 +1,312 @@
++"""Opt-in exact NVMe Engram lookup for single-worker CUDA inference.
++
++The checkpoint must remain immutable for the worker's lifetime. Captured CUDA
++graphs contain raw host pointers, so captured stores are retained until process
++exit. They cannot be closed or hot-reloaded independently of their graphs.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import functools
++import json
++import os
++import struct
++import sys
++import weakref
++from pathlib import Path
++
++import torch
++
++
++class _Work(ctypes.Structure):
++    _fields_ = [
++        ("store", ctypes.c_void_p),
++        ("ids", ctypes.c_void_p),
++        ("weights", ctypes.c_void_p),
++        ("scales", ctypes.c_void_p),
++        ("count", ctypes.c_uint64),
++    ]
++
++
++# CUDA graph replay bypasses Python; a Python finalizer alone cannot establish
++# that all graph references are gone. Process ownership makes that explicit.
++_CAPTURED_STORES: set[NvmeEngramStore] = set()
++
++
++def checkpoint_table(model_path, layer_id, rows, dim):
++    """Return validated local shard and offsets without materializing tensors."""
++    if dim != 256 or rows < 1:
++        raise ValueError("NVMe Engram requires nonempty 256-wide FP8 tables")
++    root = Path(model_path).resolve()
++    index_path = root / "model.safetensors.index.json"
++    if not index_path.is_file():
++        raise ValueError("NVMe Engram requires a local indexed safetensors checkpoint")
++    index = json.loads(index_path.read_text())["weight_map"]
++    prefix = f"layers.{layer_id}.engram.embed."
++    names = [prefix + "weight", prefix + "scale"]
++    if any(name not in index for name in names):
++        raise ValueError(f"Missing Engram checkpoint entries for layer {layer_id}")
++    if index[names[0]] != index[names[1]]:
++        raise ValueError("NVMe Engram weight and scale must share a checkpoint shard")
++    shard = (root / index[names[0]]).resolve()
++    if not shard.is_relative_to(root):
++        raise ValueError("Engram shard must be inside the checkpoint directory")
++    with shard.open("rb") as source:
++        size = os.fstat(source.fileno()).st_size
++        raw = source.read(8)
++        if len(raw) != 8:
++            raise ValueError("Truncated safetensors header")
++        length = struct.unpack("<Q", raw)[0]
++        if not 2 <= length <= min(100_000_000, size - 8):
++            raise ValueError("Invalid safetensors header length")
++        header = json.loads(source.read(length))
++    offsets = []
++    extents = []
++    for name, dtype, width in zip(names, ("F8_E4M3", "F8_E8M0"), (256, 8)):
++        tensor = header.get(name, {})
++        span = tensor.get("data_offsets", [])
++        if (
++            tensor.get("dtype") != dtype
++            or tensor.get("shape") != [rows, width]
++            or len(span) != 2
++            or any(type(value) is not int for value in span)
++            or not 0 <= span[0] <= span[1] <= size - 8 - length
++            or span[1] - span[0] != rows * width
++        ):
++            raise ValueError(f"Invalid Engram tensor metadata: {name}")
++        extents.append(span)
++        offsets.append(8 + length + span[0])
++    if max(x[0] for x in extents) < min(x[1] for x in extents):
++        raise ValueError("Overlapping Engram weight and scale extents")
++    return shard, offsets
++
++
++def validate_configuration(parallel, schedule, spec, graph, host_table):
++    if sys.platform != "linux" or torch.version.cuda is None:
++        raise ValueError("NVMe Engram requires Linux and CUDA")
++    if any(
++        getattr(parallel, field) != 1 for field in ("tp_size", "pp_size", "world_size")
++    ):
++        raise ValueError("NVMe Engram currently supports a single worker (TP=PP=1)")
++    if schedule.max_running_requests != 1 or not schedule.disable_overlap_schedule:
++        raise ValueError(
++            "NVMe Engram requires --max-running-requests 1 --disable-overlap-schedule"
++        )
++    if graph.enable_torch_compile:
++        raise ValueError("NVMe Engram does not support torch.compile")
++    if spec.speculative_algorithm not in (None, "DSPARK"):
++        raise ValueError(
++            "NVMe Engram supports only ordinary decode or fixed-width DSpark"
++        )
++    if spec.speculative_algorithm == "DSPARK":
++        from sglang.srt.environ import envs
++
++        width = getattr(spec, "speculative_num_draft_tokens", None)
++        gamma = getattr(spec, "speculative_dspark_block_size", None)
++        if width not in (4, 6) or gamma != width - 1:
++            raise ValueError(
++                "NVMe Engram DSpark requires block size 3 or 5 and "
++                "speculative_num_draft_tokens = block size + 1"
++            )
++        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
++            raise ValueError(
++                "NVMe Engram DSpark requires SGLANG_RAGGED_VERIFY_MODE=static"
++            )
++    if host_table:
++        raise ValueError("NVMe Engram and host-table mode are mutually exclusive")
++
++
++@functools.lru_cache(maxsize=1)
++def _native_library():
++    from torch.utils.cpp_extension import load
++
++    path = load(
++        name="sglang_engram_nvme",
++        sources=[str(Path(__file__).with_suffix(".cpp"))],
++        extra_cflags=["-O3", "-std=c++17", "-pthread"],
++        extra_ldflags=["-pthread"],
++        with_cuda=False,
++        is_python_module=False,
++    )
++    lib = ctypes.CDLL(path, use_errno=True)
++    lib.row_store_open.argtypes = [ctypes.c_char_p] + [ctypes.c_uint64] * 4
++    lib.row_store_open.restype = ctypes.c_void_p
++    lib.row_store_close.argtypes = [ctypes.c_void_p]
++    lib.row_store_close.restype = None
++    lib.row_store_lookup.argtypes = [ctypes.c_void_p]
++    lib.row_store_lookup.restype = None
++    lib.row_store_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
++    lib.row_store_stats.restype = None
++    return lib
++
++
++@functools.lru_cache(maxsize=1)
++def _cuda_library():
++    # Use the runtime already loaded by torch, rather than guessing wheel paths
++    # and potentially loading a different CUDA runtime into the process.
++    paths = {
++        line.split()[-1]
++        for line in Path("/proc/self/maps").read_text().splitlines()
++        if "/libcudart.so" in line and line.split()[-1].startswith("/")
++    }
++    if len(paths) != 1:
++        raise RuntimeError(f"Expected one loaded CUDA runtime; found {len(paths)}")
++    lib = ctypes.CDLL(paths.pop())
++    lib.cudaLaunchHostFunc.argtypes = [ctypes.c_void_p] * 3
++    lib.cudaLaunchHostFunc.restype = ctypes.c_int
++    return lib
++
++
++def _release(lib, store, staging, works, device):
++    if staging:
++        with torch.cuda.device(device):
++            torch.cuda.synchronize()
++    lib.row_store_close(store)
++    staging.clear()
++    works.clear()
++
++
++class NvmeEngramStore:
++    def __init__(self, model_path, layer_id, rows, dim, cache_bytes, staging_bytes):
++        if type(cache_bytes) is not int or not 0 <= cache_bytes < 2**63:
++            raise ValueError("NVMe Engram cache bytes must be a nonnegative int64")
++        if type(staging_bytes) is not int or not 0 < staging_bytes < 2**63:
++            raise ValueError("NVMe Engram staging bytes must be a positive int64")
++        shard, offsets = checkpoint_table(model_path, layer_id, rows, dim)
++        self.rows = rows
++        self._loaded = set()
++        self._staging = {}
++        self._works = {}
++        self._staging_bytes = 0
++        self._staging_limit = staging_bytes
++        self._device = torch.cuda.current_device()
++        self._lib = _native_library()
++        self._cuda = _cuda_library()
++        self._store = self._lib.row_store_open(
++            os.fsencode(shard), rows, *offsets, cache_bytes
++        )
++        if not self._store:
++            error = ctypes.get_errno()
++            raise OSError(
++                error,
++                f"Cannot open NVMe Engram shard: {os.strerror(error)}",
++                str(shard),
++            )
++        self._finalizer = weakref.finalize(
++            self,
++            _release,
++            self._lib,
++            self._store,
++            self._staging,
++            self._works,
++            self._device,
++        )
++        # CUDA may already be torn down during interpreter exit. The OS reclaims
++        # process-owned mappings and descriptors, including captured stores.
++        self._finalizer.atexit = False
++
++    def validate_weight(self, kind, source):
++        if kind in self._loaded:
++            raise RuntimeError(
++                "NVMe Engram checkpoints are immutable; restart to reload"
++            )
++        width, dtype = (
++            (256, torch.float8_e4m3fn)
++            if kind == "weight"
++            else (8, torch.float8_e8m0fnu)
++        )
++        if list(source.shape) != [self.rows, width] or source.dtype != dtype:
++            raise ValueError(f"Engram {kind} checkpoint shape/dtype mismatch")
++        self._loaded.add(kind)
++
++    def close(self):
++        if self in _CAPTURED_STORES:
++            raise RuntimeError(
++                "Captured NVMe Engram storage is owned by the worker until exit"
++            )
++        self._finalizer()
++        self._works.clear()
++
++    def finish_load(self):
++        if self._loaded != {"weight", "scale"}:
++            raise ValueError(
++                "NVMe Engram checkpoint did not load both weight and scale"
++            )
++
++    def stats(self):
++        if not self._finalizer.alive:
++            raise RuntimeError("NVMe Engram store is closed")
++        values = (ctypes.c_uint64 * 4)()
++        self._lib.row_store_stats(self._store, values)
++        return dict(zip(("hits", "misses", "read_pages", "cache_bytes"), values))
++
++    def lookup(self, indices):
++        from sglang.kernels.ops.embeddings.engram_gather import engram_gather
++
++        if not self._finalizer.alive:
++            raise RuntimeError("NVMe Engram store is closed")
++        if (
++            not indices.is_cuda
++            or indices.device.index != self._device
++            or indices.dtype != torch.int64
++        ):
++            raise ValueError("Engram IDs must be int64 on the store's CUDA device")
++        count = indices.numel()
++        out = torch.empty(
++            (*indices.shape, 256), dtype=torch.bfloat16, device=indices.device
++        )
++        if not count:
++            return out
++        capacity = 1 << (count - 1).bit_length()
++        stream = torch.cuda.current_stream(self._device)
++        key = (stream.cuda_stream, capacity)
++        capturing = torch.cuda.is_current_stream_capturing()
++        if key not in self._staging:
++            if capturing:
++                raise RuntimeError(
++                    "Warm NVMe Engram staging on the capture stream before capture"
++                )
++            size = capacity * (8 + 256 + 8 + 256 + 8 + 8)
++            if self._staging_bytes + size > self._staging_limit:
++                raise RuntimeError(
++                    "NVMe Engram staging budget exceeded; reduce prefill chunk size or increase SGLANG_DSV41_ENGRAM_NVME_STAGING_BYTES"
++                )
++            ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
++            w = torch.empty((capacity, 256), dtype=torch.uint8, pin_memory=True)
++            s = torch.empty((capacity, 8), dtype=torch.uint8, pin_memory=True)
++            dw, ds = (
++                torch.empty_like(w, device=indices.device),
++                torch.empty_like(s, device=indices.device),
++            )
++            sequential = torch.arange(
++                capacity, dtype=torch.int64, device=indices.device
++            )
++            self._staging[key] = ids, w, s, dw, ds, sequential
++            self._staging_bytes += size
++        ids, w, s, dw, ds, sequential = self._staging[key]
++        work_key = (stream.cuda_stream, count)
++        if work_key not in self._works:
++            if len(self._works) >= 4096:
++                raise RuntimeError(
++                    "NVMe Engram work metadata budget exceeded; restart the worker"
++                )
++            self._works[work_key] = _Work(
++                self._store, ids.data_ptr(), w.data_ptr(), s.data_ptr(), count
++            )
++        if capturing:
++            _CAPTURED_STORES.add(self)
++        ids[:count].copy_(indices.reshape(-1), non_blocking=True)
++        error = self._cuda.cudaLaunchHostFunc(
++            stream.cuda_stream,
++            ctypes.cast(self._lib.row_store_lookup, ctypes.c_void_p),
++            ctypes.addressof(self._works[work_key]),
++        )
++        if error:
++            raise RuntimeError(f"CUDA Engram host callback failed: {error}")
++        dw[:count].copy_(w[:count], non_blocking=True)
++        ds[:count].copy_(s[:count], non_blocking=True)
++        engram_gather(
++            dw.data_ptr(), ds.data_ptr(), sequential[:count], out.view(-1, 256), 256, 32
++        )
++        return out
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
 index c69d08e5f2..117d9f37c7 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
@@ -2783,15 +3683,22 @@ index c69d08e5f2..117d9f37c7 100644
          self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
          self.block_quant = (
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6093a4f95d..df30113773 100755
+index 6093a4f95d..2db564c01e 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
-@@ -22,6 +22,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
+@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple, Union
+ import torch
+ 
+ from sglang.kernels.ops.quantization.fp8_kernel import (
++    fp8_dot_supported,
+     fp8_dtype,
+     fp8_max,
+     fp8_min,
+@@ -22,6 +23,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
      triton_scaled_mm,
      w8a8_block_fp8_matmul_deepgemm,
      w8a8_block_fp8_matmul_triton,
 +    w8a8_block_fp8_matmul_w8a16,
-+    fp8_dot_supported,
  )
  from sglang.srt.environ import envs
  from sglang.srt.layers import deep_gemm_wrapper
@@ -2821,22 +3728,24 @@ index 6093a4f95d..df30113773 100755
      from flashinfer import SfLayout
      from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
      from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
-@@ -553,6 +572,14 @@ if get_platform().is_sm90 and is_flashinfer_available():
+@@ -553,6 +572,16 @@ if get_platform().is_sm90 and is_flashinfer_available():
      from flashinfer.gemm import fp8_blockscale_gemm_sm90
  
  
 +@lru_cache(maxsize=1)
 +def _is_ada_sm89() -> bool:
 +    """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
-+    return _is_cuda and torch.cuda.is_available() and (
-+        torch.cuda.get_device_capability() == (8, 9)
++    return (
++        _is_cuda
++        and torch.cuda.is_available()
++        and (torch.cuda.get_device_capability() == (8, 9))
 +    )
 +
 +
  def dispatch_w8a8_block_fp8_linear(
      weight_block_size: Optional[List[int]] = None,
      act_scale_ue8m0: bool = False,
-@@ -570,6 +597,43 @@ def dispatch_w8a8_block_fp8_linear(
+@@ -570,6 +599,43 @@ def dispatch_w8a8_block_fp8_linear(
          # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
          # blocks with ue8m0 scales to the MXFP8 dense kernels instead
          # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
@@ -2880,7 +3789,7 @@ index 6093a4f95d..df30113773 100755
          return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
  
      backend = get_fp8_gemm_runner_backend()
-@@ -629,7 +693,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
+@@ -629,7 +695,18 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
      if _is_hip and _is_gfx95_supported:
          return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
  
@@ -2900,7 +3809,7 @@ index 6093a4f95d..df30113773 100755
          if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
              return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
          return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
-@@ -650,10 +725,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
+@@ -650,10 +727,22 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
  
  def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
      """Resolve the FlashInfer MXFP8 backend for 32-wide-K ue8m0 block-fp8 weights.
@@ -2925,7 +3834,7 @@ index 6093a4f95d..df30113773 100755
          backend.is_flashinfer_cutedsl()
          or backend.is_flashinfer_cutlass()
          or backend.is_flashinfer_trtllm()
-@@ -1335,6 +1422,41 @@ def aiter_w8a8_block_fp8_linear(
+@@ -1335,6 +1424,41 @@ def aiter_w8a8_block_fp8_linear(
      ).view(*output_shape)
  
  
@@ -2967,6 +3876,22 @@ index 6093a4f95d..df30113773 100755
  def triton_w8a8_block_fp8_linear(
      input: torch.Tensor,
      weight: torch.Tensor,
+@@ -1419,6 +1543,15 @@ def flashinfer_mxfp8_blockscaled_linear(
+     pin_tactic skips autotuning and uses the backend heuristic to preserve row-wise
+     batch invariance; tactics tuned per M bucket can change the fp32 reduction order.
+     """
++    # An explicit opt-in: retain the selected backend on other architectures,
++    # shapes, and backends. Do not restrict the upstream MXFP8 dispatch to M=1.
++    if (
++        envs.SGLANG_SM120_MXFP8_B12X_SMALL_BATCH.get()
++        and get_platform().is_sm120
++        and backend == "cutlass"
++        and input.numel() in (input.shape[-1], 4 * input.shape[-1], 6 * input.shape[-1])
++    ):
++        backend = "b12x"
+     input_2d = input.view(-1, input.shape[-1])
+     output_shape = [*input.shape[:-1], weight.shape[0]]
+ 
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 index b5fd98325f..a8a99253ba 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
@@ -3495,18 +4420,10 @@ index ee7e9afd53..9da610e4df 100644
  def model_capture_mode():
      global is_capture_mode
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af85866..32637113a9 100644
+index 228af85866..d42663ecab 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -3,6 +3,7 @@ from __future__ import annotations
- import concurrent.futures
- import functools
- import logging
-+import os
- import time
- from contextlib import contextmanager, nullcontext
- from types import SimpleNamespace
-@@ -10,6 +11,7 @@ from typing import (
+@@ -10,6 +10,7 @@ from typing import (
      TYPE_CHECKING,
      Any,
      Callable,
@@ -3514,18 +4431,19 @@ index 228af85866..32637113a9 100644
      Iterable,
      List,
      NamedTuple,
-@@ -210,6 +212,7 @@ from sglang.srt.utils import (
+@@ -208,6 +209,7 @@ from sglang.srt.utils import (
+     log_info_on_rank0,
+     make_layers,
  )
++from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
  from sglang.srt.utils.custom_op import register_custom_op
  from sglang.srt.utils.hf_transformers_utils import get_rope_config
-+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
  
- # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
- # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
-@@ -288,6 +291,14 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+@@ -288,6 +290,16 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
  _MHC_POST_MULT_VALUE = 2.0
  _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
  
++
 +# SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
 +# and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
 +# RoPE (see deepseek_v4_wo_a_einsum.py). Lazy (not module-level): the probes
@@ -3534,10 +4452,11 @@ index 228af85866..32637113a9 100644
 +def _IS_SM8() -> bool:
 +    return is_sm80_supported() and not is_sm120_supported()
 +
++
  DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
      ("gate_up_proj", "gate_proj", 0),
      ("gate_up_proj", "up_proj", 1),
-@@ -454,7 +465,12 @@ if _is_hip:
+@@ -454,7 +466,12 @@ if _is_hip:
  
  
  def _apply_wo_a_bf16_matmul(
@@ -3551,7 +4470,7 @@ index 228af85866..32637113a9 100644
  ) -> torch.Tensor:
      """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
  
-@@ -462,11 +478,24 @@ def _apply_wo_a_bf16_matmul(
+@@ -462,11 +479,24 @@ def _apply_wo_a_bf16_matmul(
      ROCm decode can use aiter batched GEMM; its first runtime failure disables
      that path for the process. Other cases use torch.einsum.
      """
@@ -3577,7 +4496,7 @@ index 228af85866..32637113a9 100644
          and o.shape == (1, 2, 4096)
          and wo_a.shape == (2, 1024, 4096)
          and o.dtype == wo_a.dtype == torch.bfloat16
-@@ -518,6 +547,50 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
+@@ -518,6 +548,55 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
      return x_quant, x_bf16
  
  
@@ -3614,9 +4533,14 @@ index 228af85866..32637113a9 100644
 +    }[pred]
 +    group = get_tp_group()
 +    world = getattr(group, "world_size", 1)
-+    if world > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
-+        flag = torch.tensor([1 if local else 0], dtype=torch.int32,
-+                            device=torch.cuda.current_device())
++    if (
++        world > 1
++        and torch.distributed.is_available()
++        and torch.distributed.is_initialized()
++    ):
++        flag = torch.tensor(
++            [1 if local else 0], dtype=torch.int32, device=torch.cuda.current_device()
++        )
 +        torch.distributed.all_reduce(flag, group=group.device_group)
 +        result = int(flag.item()) == world
 +    else:
@@ -3628,7 +4552,7 @@ index 228af85866..32637113a9 100644
  def make_hc_mixing_params(
      hc_mult: int, hidden_size: int
  ) -> Tuple[
-@@ -907,17 +980,45 @@ class MqaAttentionBase(nn.Module):
+@@ -907,17 +986,45 @@ class MqaAttentionBase(nn.Module):
          self.register_buffer("freqs_cis", freqs_cis, persistent=False)
          self.freqs_cis: torch.Tensor
  
@@ -3680,7 +4604,7 @@ index 228af85866..32637113a9 100644
  
      @contextmanager
      def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
-@@ -1011,7 +1112,7 @@ class MQALayer(MqaAttentionBase):
+@@ -1011,7 +1118,7 @@ class MQALayer(MqaAttentionBase):
              self.alt_streams = None
              self.alt_streams_indexer = None
  
@@ -3689,7 +4613,7 @@ index 228af85866..32637113a9 100644
  
          self.compressor = None
          self.indexer = None
-@@ -1494,11 +1595,12 @@ class MQALayer(MqaAttentionBase):
+@@ -1494,11 +1601,12 @@ class MQALayer(MqaAttentionBase):
          x_linear = x_quant if x_quant is not None else x
          early_sources = (
              _is_cuda
@@ -3703,7 +4627,7 @@ index 228af85866..32637113a9 100644
          )
          src_stream = None
          if early_sources:
-@@ -1843,19 +1945,11 @@ class MQALayer(MqaAttentionBase):
+@@ -1843,19 +1951,11 @@ class MQALayer(MqaAttentionBase):
          )
  
          tp_slice, q_padded, q_out = slice(None), None, None
@@ -3728,7 +4652,7 @@ index 228af85866..32637113a9 100644
              # The kernel reads all padded heads; uninitialized values can affect real-head
              # outputs, so the padding must be zero even though only real heads are written.
              if self.is_dsv41:
-@@ -1880,7 +1974,7 @@ class MQALayer(MqaAttentionBase):
+@@ -1880,7 +1980,7 @@ class MQALayer(MqaAttentionBase):
                  q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
              tp_slice = slice(0, self.n_local_heads)
              q_out = q_padded[:, tp_slice, :]
@@ -3737,7 +4661,7 @@ index 228af85866..32637113a9 100644
  
          if enable_multi_stream:
              # Multi-stream path always fuses cache write into the K kernel,
-@@ -1974,6 +2068,10 @@ class MQALayer(MqaAttentionBase):
+@@ -1974,6 +2074,10 @@ class MQALayer(MqaAttentionBase):
                      save_kv_cache=save_kv_cache,
                  )
              o = o[:, tp_slice, :]
@@ -3748,7 +4672,7 @@ index 228af85866..32637113a9 100644
          if (
              self.wo_a_fp8
              and _wo_a_fp8_mxscale_fused_invrope is not None
-@@ -2006,7 +2104,7 @@ class MQALayer(MqaAttentionBase):
+@@ -2006,7 +2110,7 @@ class MQALayer(MqaAttentionBase):
                      sin4,
                      qk_nope_dim=self.qk_nope_head_dim,
                  )
@@ -3757,7 +4681,7 @@ index 228af85866..32637113a9 100644
                  fused_rope_inplace(
                      o[..., -self.qk_rope_head_dim :],
                      None,
-@@ -2065,7 +2163,12 @@ class MQALayer(MqaAttentionBase):
+@@ -2065,7 +2169,12 @@ class MQALayer(MqaAttentionBase):
                  if wo_a_weight is not None:
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
@@ -3771,7 +4695,7 @@ index 228af85866..32637113a9 100644
                      )
                  else:
                      o = _apply_gguf_grouped_wo_a(
-@@ -2408,7 +2511,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2408,7 +2517,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          if (
              _is_cuda
@@ -3780,7 +4704,7 @@ index 228af85866..32637113a9 100644
              and self.hc_pre_from_prev_sublayer
              and self.hc_mult == 4
              and x.shape[1] == 5120
-@@ -2426,7 +2529,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2426,7 +2535,7 @@ class DeepseekV4DecoderLayer(nn.Module):
  
          if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
              if (
@@ -3789,18 +4713,19 @@ index 228af85866..32637113a9 100644
                  and x.is_cuda
                  and 1 <= x.shape[0] <= 64
                  and x.shape[1] == 5120
-@@ -2671,8 +2774,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2670,10 +2779,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         if (
              x.is_cuda
              and torch.version.cuda is not None
-             and (
+-            and (
 -                get_platform().is_blackwell
 -                or (get_platform().is_sm90 and x.shape[0] == 1)
-+                _tp_all("blackwell")
-+                or (_tp_all("sm90") and x.shape[0] == 1)
-             )
+-            )
++            and (_tp_all("blackwell") or (_tp_all("sm90") and x.shape[0] == 1))
              and x.dtype == torch.bfloat16
          ):
-@@ -2745,7 +2848,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+             # The split-K partial fixes the reduction order;
+@@ -2745,7 +2851,8 @@ class DeepseekV4DecoderLayer(nn.Module):
          stats_stream = (
              self.hc_stats_stream
              if forward_batch.forward_mode.is_decode()
@@ -3810,7 +4735,7 @@ index 228af85866..32637113a9 100644
              else None
          )
          residual = hidden_states
-@@ -3299,6 +3403,12 @@ class DeepseekV4Model(nn.Module):
+@@ -3299,6 +3406,12 @@ class DeepseekV4Model(nn.Module):
          super().__init__()
          self.config = config
          self.pp_group = get_pp_group()
@@ -3823,7 +4748,7 @@ index 228af85866..32637113a9 100644
          self.hidden_size = config.hidden_size
          if self.pp_group.is_first_rank:
              embedding_quant_config = (
-@@ -3339,7 +3449,7 @@ class DeepseekV4Model(nn.Module):
+@@ -3339,7 +3452,7 @@ class DeepseekV4Model(nn.Module):
          self.hc_stats_stream = (
              device_module.Stream()
              if _is_cuda
@@ -3832,7 +4757,7 @@ index 228af85866..32637113a9 100644
              and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
              and config.hc_pre_from_prev_sublayer
              else None
-@@ -3384,6 +3494,7 @@ class DeepseekV4Model(nn.Module):
+@@ -3384,6 +3497,7 @@ class DeepseekV4Model(nn.Module):
          if (
              _is_cuda
              and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
@@ -3840,7 +4765,15 @@ index 228af85866..32637113a9 100644
              and self.pp_group.world_size == 1
              and not is_dp_attention_enabled()
              and config.vision_n_layers == 0
-@@ -4451,6 +4562,363 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4112,6 +4226,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+         # mid-serving (RL refit sends many partial batches); the prewarm and
+         # its barrier must only run on the first (startup) load.
+         self._mhc_prewarmed_at_load = False
++        self._nvme_engram_loaded = False
+ 
+     @property
+     def routed_experts_weights_of_layer(self):
+@@ -4451,6 +4566,361 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          return name
  
@@ -4119,9 +5052,7 @@ index 228af85866..32637113a9 100644
 +                    dtype=torch.bfloat16,
 +                    device=weight.device,
 +                )
-+                _apply_wo_a_bf16_matmul(
-+                    o, wo_a_v, is_decode=True, fuse_inv_rope=False
-+                )
++                _apply_wo_a_bf16_matmul(o, wo_a_v, is_decode=True, fuse_inv_rope=False)
 +        torch.cuda.synchronize()
 +
 +    def _prewarm_moe_gate_kernels(self) -> None:
@@ -4204,7 +5135,7 @@ index 228af85866..32637113a9 100644
      def _prewarm_mhc_kernels(self) -> None:
          """One-shot MHC JIT prewarm at load time, synced across ranks.
  
-@@ -4461,6 +4929,40 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4461,6 +4931,40 @@ class DeepseekV4ForCausalLM(nn.Module):
          if self._mhc_prewarmed_at_load:
              return
          self._mhc_prewarmed_at_load = True
@@ -4245,6 +5176,25 @@ index 228af85866..32637113a9 100644
          if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
              return
          layer = next(
+@@ -4520,6 +5024,10 @@ class DeepseekV4ForCausalLM(nn.Module):
+         )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
++        if self._nvme_engram_loaded:
++            raise RuntimeError(
++                "NVMe Engram checkpoints are immutable; restart to reload"
++            )
+         params_dict = dict(self.named_parameters())
+         loaded_params: Set[str] = set()
+ 
+@@ -4912,6 +5420,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+             for i, layer in enumerate(self.model.layers):
+                 if getattr(layer, "engram", None) is not None:
+                     layer.engram.embed.finish_load(label=f"layer {i}")
++            self._nvme_engram_loaded = envs.SGLANG_ENABLE_DSV41_ENGRAM_NVME.get()
+             self._prewarm_mhc_kernels()
+ 
+     def get_embed_and_head(self):
 diff --git a/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py b/python/sglang/srt/models/deepseek_v4_wo_a_einsum.py
 new file mode 100644
 index 0000000000..7b5d6cc6b8

@@ -1,19 +1,74 @@
-# Lsglang-v1.5.5
+# Lsglang-v1.5.6
 
 https://github.com/guqiong96/Lsglang/tree/dsv4.1-lkmoe-sm80plus
 
 **Base:** sglang `dsv4.1` (upstream branch, commit `1aa0e962b`) · **lk_moe v2.4.3**
-**Type:** Stability release — mixed-arch (SM86+SM120) TP=4 CUDA-graph capture root fix + cold-cubin prewarm family + V4.1 indexer prefill-OOM fix on 16 GB cards
-**Wheel:** `lsglang-1.5.5` — use this single wheel for all GPUs (SM80 → SM120)
+**Type:** Community + stability release — two V4.1 memory PRs from @a775828b-dot (prefill
+scratch bounding, NVMe Engram + SM120 b12x dispatch) + engram host-table pin-order fix
+**Wheel:** `lsglang-1.5.6` — use this single wheel for all GPUs (SM80 → SM120)
 
-This wheel **supersedes v1.5.4, which was never released separately** — the notes below
-cover everything since v1.5.3, including the v1.5.4 plain-decode routing fixes.
-Single-arch hosts keep their existing code paths; this release makes **mixed-arch TP=4
-capture pass reliably (cold cache included)** and closes the remaining cold-kernel
-first-launch sites. See **Known issues** for the mixed-arch TP=4 output-correctness item
-that is still under investigation.
+Everything from v1.5.5 (mixed-arch capture root fix, cold-cubin prewarms, V4.1
+indexer prefill-OOM fix, SM89 by-M select, SM120 plain-decode routing) carries over
+unchanged. This release is additive: all new behavior is **opt-in or default-equivalent**;
+no existing route changes when the new envs stay off.
 
 ## What's new
+
+### V4.1 prefill scratch memory bounded — block-compact candidate masks (PR #27, @a775828b-dot)
+Eager prefill used to retain the **position-expanded** candidate mask per indexer layer
+(one bool per position per layer). The candidate selector only ever decides per *block*,
+so masks are now kept at **block granularity** and the current chunk alone is expanded at
+consumption (bit-exact: the selector's mask is a `repeat_interleave` of block bits, so
+block-compact ↔ expanded is lossless both directions; graph-decode tensor masks are
+untouched). Additionally `SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES` (default 1 GiB, the
+old hard-coded constant) now also gates the **dense FP4** indexer's FP32 score allocation:
+over-budget calls take the existing torch fallback instead of a single huge alloc.
+Lowering the budget trades prefill speed for peak memory. Validated 192
+shape/block/top-k/tie combinations per device against the original selector.
+
+### NVMe Engram backend + SM120 b12x small-batch MXFP8 dispatch (PR #28, @a775828b-dot)
+Two independent opt-ins:
+- **`SGLANG_ENABLE_DSV41_ENGRAM_NVME=1`** — Engram FP8 rows + E8M0 scales stay in the
+  immutable safetensors shards; a direct-I/O reader (native AIO, bounded per-layer row
+  cache + pinned staging) fetches only the rows each forward needs, so host RAM no longer
+  bounds the table size. TP=1, single worker/request, fixed-width DSpark (gamma 3/5,
+  verify width 4/6); every unsupported speculative/compact combination fails closed at
+  init. Mutually exclusive with the host-table option.
+- **`SGLANG_SM120_MXFP8_B12X_SMALL_BATCH=1`** — on SM120 only, the FlashInfer MXFP8
+  linear wrapper's `cutlass` calls at flattened **M=1/4/6** (decode / fixed-width DSpark
+  verify) route to `b12x`; everything else keeps its dispatch. Author's SM120 component
+  bench: 7-shape bundle 0.88 ms → 0.21 ms (4.2x, input quantization included). Note this
+  is component time, not model t/s: hosts whose decode is bound by CPU-expert traffic
+  will see little change.
+See `examples/runtime/deepseek_v4/README.engram_nvme.md` and `README.sm120_mxfp8.md`.
+
+### Engram host table: pin *after* page folding (regression fix)
+`cudaHostRegister` ran inside the table constructor, which **GUP-pins whatever 4K
+fallback pages fault-time THP happened to leave** — after that neither khugepaged nor
+`MADV_COLLAPSE` (absent on 5.14/EL9 kernels, EINVAL) can ever fold them, so a single
+unlucky fault window cost ~10x lookup speed for the process lifetime. Registration is
+now deferred to the end of `finish_load`: collapse attempt first, then a bounded
+khugepaged window (20 s) when still under the 98% huge-page bar, and pin last. The
+resident/huge-page line in the log now reflects the final backing before pinning.
+
+### Huge pages for the Engram host table (launch guidance)
+The 48 GiB/layer host tables want 2 MiB pages; whether you get them is mostly **when**
+you start, not **what flags** you pass:
+- The loader already drops checkpoint page cache before pre-faulting — but any *other*
+  process reading the same checkpoint refills it and steals the contiguous 2 MiB blocks.
+  **Stop the co-resident server during model load**, or at least:
+  `sync; echo 1 > /proc/sys/vm/compact_memory` right before starting.
+- `transparent_hugepage/enabled=always` + `defrag=madvise` is the supported setting
+  (both are the distro default on the reference hosts).
+- Kernel ≥ 6.1 folds synchronously via `MADV_COLLAPSE`; on RHEL9's 5.14 the post-fault
+  `khugepaged` window above is the only folder.
+- Final fix on 1 TiB hosts: reserve 1G pages at boot
+  (`default_hugepagesz=1G hugepagesz=1G hugepages=128`) — the hugetlb-backed table
+  layout is planned for a follow-up release.
+The startup log always prints the verdict: `... MiB in huge pages (NN%)` — 0% with
+`pinned` means the window was lost; expect engram lookups ~10x slower.
+
+## What's new since v1.5.3 (carried from v1.5.4/v1.5.5, unchanged in this release)
 
 ### Mixed-arch TP=4 CUDA-graph capture — root-caused and fixed
 The capture loop iterates a **candidate-variant axis** that was gated on a *local*
@@ -114,7 +169,7 @@ the native-64 layout. Prefill/decode are both native FlashInfer on SM120; the
 | **89** | RTX 4090/4060, L40/L40S | 01 (02 for GPU-resident MoE) | ✅ verified: V4.1-Flash on 2× RTX 4080 SUPER, 60 t/s (DSPARK); plain decode via `w8a16` block-fp8 route since v1.5.4 |
 | **90** | H100/H200/H800/H20 | 01 | upstream-native path (DeepGEMM FP8/FP4, trtllm MoE) |
 | **100** | B200/GB200 | 01 | upstream-native Blackwell path (FlashInfer FP4, split-K sinkhorn) |
-| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 (plain decode → FlashInfer MXFP8 CUTLASS). Mixed 4-GPU TP=4: output correctness under investigation (see Known issues) |
+| **120** | RTX 5060Ti/5080/5090, RTX PRO 6000 | 01 (02 for mixed-arch TP + the sparse-MLA prefill fast path) | ✅ verified: 2×5060Ti TP=2 (plain decode → FlashInfer MXFP8 CUTLASS; optional `SGLANG_SM120_MXFP8_B12X_SMALL_BATCH=1` routes M=1/4/6 to b12x). Mixed 4-GPU TP=4: output correctness under investigation (see Known issues) |
 
 ✅ = measured on reference hardware (dual-EPYC host). Other rows: enabled-by-construction
 on the shared code paths, not individually bench-tested here — please report issues.
@@ -139,7 +194,7 @@ the fault appears only when SM86 and SM120 ranks share one TP group.
 
 ## Install / build
 ```bash
-pip install lsglang==1.5.5          # or build the wheel from tag lsglang-v1.5.5
+pip install lsglang==1.5.6          # or build the wheel from tag lsglang-v1.5.6
 ```
 
 ## Patches (`patches/` Note: these patches are only meant to document the diff against upstream sglang. They are already included in the lsglang install and can be ignored.)
@@ -194,6 +249,49 @@ Adjust `--model` path, `CUDA_VISIBLE_DEVICES` and `LK_THREADS` to your host.
 For a mixed SM86+SM120 host use the same command with `--tensor-parallel-size 4` and
 all four GPUs in `CUDA_VISIBLE_DEVICES` (`CUDA_DEVICE_ORDER=PCI_BUS_ID` is required so
 each rank's arch probe sees its own chip).
+
+## Launch — DeepSeek-V4.1-Flash (SM120, 2× RTX 5060Ti)
+
+**~21 t/s plain decode** (65k context config) — Test environment: Dual EPYC 7642,
+16-channel DDR4 3200, 2× RTX 5060Ti 16 GB (SM120, TP=2), `Lsglang-v1.5.6`.
+The host tables are ~48 GiB per engram layer on a 1 TiB host: keep
+`SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` and read the **huge-pages note** below the
+command before blaming the GPU for a slow first hour.
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=1,2 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_SKIP_P2P_CHECK=1 \
+LK_POWER_SAVING=1 \
+sglang serve \
+  --model ~/Models/DeepSeek-V4.1-Flash \
+  --served-model-name DeepSeek-V4.1-Flash \
+  --host 0.0.0.0 --port 8070 --trust-remote-code \
+  --tensor-parallel-size 2 --max-running-requests 2 \
+  --chunked-prefill-size 1024 --max-total-tokens 65536 --mem-fraction-static 0.92 \
+  --dist-timeout 180 \
+  --cuda-graph-backend-prefill disabled --disable-shared-experts-fusion \
+  --enable-decoder-swa-bounded-replay \
+  --speculative-algo DSPARK --speculative-dspark-block-size 5 \
+  --speculative-attention-mode decode
+```
+
+16 GB cards: `--max-total-tokens` is an **explicit** KV reservation, unlike the
+automatic budget on some engines — 256000 over-reserves ~8.5 GiB and OOMs the engram
+host-table path; 65536 is the verified 5060Ti value. `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0`
+disables the GPU-MoE prefill pool (saves the largest single slice of card memory on
+16 GB cards); raise it to 1024+ only on 24 GB+ cards. Optional decode/verify speedups:
+`SGLANG_SM120_MXFP8_B12X_SMALL_BATCH=1` (see What's new; matters most when the GPU,
+not the CPU expert path, is the bottleneck).
 
 One caveat: `LVLLM_GPU_RESIDENT_MOE_LAYERS` is left unset above, i.e. every expert layer
 stays CPU-resident — that is the ~30 t/s config measured. It is a **layer-index list, not a
