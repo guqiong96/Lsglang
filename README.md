@@ -1,112 +1,42 @@
-# Lsglang — lk_moe Hybrid Inference for sglang
+# Lsglang
 
-Lsglang is a special extension of [sglang](https://github.com/sgl-project/sglang) that adds
-**CPU-GPU hybrid (MOE) inference** on top of the latest sglang release version, fully compatible
-with stock sglang.
+**Lsglang = [sglang](https://github.com/sgl-project/sglang) + [lk_moe](https://pypi.org/project/lk-moe/)**,
+plus **SM80/86 adaptation** and **SM120 tuning/fixes** for the DeepSeek-V4 / V4.1 models.
 
-The actual hybrid inference engine is **[lk_moe](https://pypi.org/project/lk-moe/)**, sglang/vllm
-only provide the "GPU path", lk_moe provides the "hybrid path". Lsglang is the concrete integration
-case of lk_moe into sglang.
-
-> **Release policy:** Lsglang version updates are released **in sync with sglang releases** — on top of
-> a fresh sglang tag we keep the code "as-is + lk_moe". We do **not** pile on extra features; unless a
-> necessary bug-fix patch is required, the diff against upstream stays minimal (just the lk_moe layer).
+- **lk_moe** is the CPU+GPU hybrid, NUMA-aware MoE engine (pip-installable); sglang provides the GPU
+  path. Lsglang is lk_moe's integration into sglang **plus** the low-arch (SM80/86) bring-up and
+  SM120 fixes for these models.
+- **Fully optional**: with `LVLLM_MOE_NUMA_ENABLED=0` it behaves exactly like stock sglang.
+- **Release policy**: Lsglang tracks sglang releases — fresh sglang tag + lk_moe layer kept
+  "as-is"; extra divergence is limited to necessary bug fixes (see [Patches](#patches)).
 
 ---
 
-## Why lk_moe?
+## Model support
 
-lk_moe lets the MOE model footprint span **VRAM + system memory**, and schedules expert
-computation across **CPU + GPU** with NUMA awareness:
+| Model | SM80 | SM86 | SM89 | SM90 | SM100 | SM120 | spec-decode |
+|-------|------|------|------|------|-------|-------|-------------|
+| DeepSeek-V4.1-Flash | ✅ new | ✅ new | ✅ new | ✅ native | ✅ native | ✅ fixed | ✅ dspark |
+| DeepSeek-V4-Flash (0731) | ✅ new | ✅ new | ✅ new | ✅ native | ✅ native | ✅ native | ✅ dspark |
 
-- **VRAM + Memory load balancing**: total footprint = VRAM + memory, so a model can be
-  "1+1=2" and reach 100% VRAM utilization.
-- **CPU-GPU hybrid decode / prefill + GPU prefill**: three computing modes, with GPU prefill
-  running in parallel with hybrid decoding for near-100% GPU utilization.
-- **NUMA thread optimization**: cross-node communication as low as 3%, L3 cache hit rate over 50%.
+`native` = upstream sglang · `new` / `fixed` = added/corrected by this release.
+Full hardware tables, launch recipes and known issues: **[`RELEASE_NOTES.md`](./RELEASE_NOTES.md)**.
 
-| Hybrid modes | Env control |
-|---|---|
-| **master switch** — `0` = stock sglang pure-GPU inference (all modes below off), `1` = enable hybrid | `LVLLM_MOE_NUMA_ENABLED` |
-| CPU prefill / GPU prefill | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` + `LVLLM_GPU_PREFETCH_WINDOW` |
-| GPU prefill & decode | `LVLLM_GPU_RESIDENT_MOE_LAYERS` |
+### Previously verified (lk_moe hybrid) models
 
-Note 1: x86 CPUs with AVX2+ instruction sets and Nvidia GPUs with sm80+ architectures.
+Original MOE models from the Qwen3 / GLM / MiniMax lines, plus
+gemma-4-26B-A4B-it, NVIDIA-Nemotron-3-Super-120B-A12B-BF16, Kimi k2.6 / k2.5.
+Quantizations at runtime: bfloat16 / float16, fp8, nvfp4, mxfp4, awq 4bit symmetric
+(`w4a16`). AWQ models: https://hf-mirror.com/cyankiwi
 
----
-
-## How to integrate lk_moe
-
-lk_moe is a pip-installable package (`pip install lk_moe`). It exposes a small set of C++ kernel
-classes (`MOE_WNA16`, `MOE_FP8`, `MOE_MXFP4`, ...) driven by a `MOEConfigV2` config.
-The engine handles expert weight placement (VRAM / pinned NUMA host memory), NUMA-aware scheduling,
-and quantized kernel execution internally.
-
-The integration work in sglang/vllm is therefore **only about routing each MOE layer to lk_moe**
-(which layers stay on GPU, which go hybrid, which quant kernel to use) and **keeping the feature
-optional** so the branch stays 100% compatible with stock behavior when disabled.
-
-### Core integration principle
-
-> **Every MOE layer can be one of three roles.** The role is decided by a few env vars, and the
-> rest of the engine is unchanged.
-
-| Role | Meaning | Decision |
-|---|---|---|
-| GPU-resident layer | all weights in VRAM, original GPU path | `LVLLM_GPU_RESIDENT_MOE_LAYERS` |
-| CPU layer (hybrid) | MoE weights in memory, attn in VRAM; GPU computes attn + CPU computes MoE | default when enabled |
-| GPU-prefill layer | large batches on GPU, small batches on CPU | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` |
-
-### Minimal integration checklist
-
-1. **Add the dependency** — `lk_moe` in `python/pyproject.toml` (for sglang) / `requirements` (for vllm).
-2. **Add a feature gate** — `is_lk_moe_feature_enabled()` (reads `LVLLM_MOE_NUMA_ENABLED`) so all
-   hybrid behavior is off by default and the branch behaves exactly like stock sglang/vllm.
-3. **Wire the MOE layer** — in the fused-MoE layer, resolve each layer's role, build a
-   `lk_moe.MOEConfigV2`, instantiate the quant-appropriate `MOE_*` class, and call it in `forward`.
-4. **Register per-quantization kernels** — each quant method exposes its own LK MoE kernel class.
-5. **Handle weight loading / placement** — keep CPU-resident weights off the GPU device.
-6. **(Optional) extras** — NUMA thread binding.
-
-### Case study — Lsglang (sglang) file-by-file
-
-The lk_moe integration is captured as portable patches under [`patches/`](./patches):
-
-- [`patches/01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) — **pure lk_moe** MOE
-  hybrid inference: the full diff between upstream `dsv4.1` branch (commit `1aa0e962b`) and
-  branch `dsv4.1-lkmoe`. Apply it alone to a clean `dsv4.1` checkout for SM89+/SM120+ GPUs.
-- [`patches/02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) — **optional**,
-  DeepSeek-V4.1 support for **SM80/SM86 (Ampere / RTX 30)** attention & GEMM ports **and
-  SM120 heterogeneous-TP + sparse-MLA prefill** fixes — including mixed-arch CUDA-graph
-  capture hardening (arch predicates resolved per TP group, cold cubins such as the
-  engram-hash kernels prewarmed at load so first launches never land inside a capture),
-  on top of patch 01 (branch
-  `dsv4.1-lkmoe-sm80plus`). Apply after 01: `git apply patches/01_lk_moe__dsv4.1.patch && git apply patches/02_sm80_sm120_support__dsv4.1.patch`.
-
-| File | What it does |
-|---|---|
-| `python/pyproject.toml` | adds `lk_moe` dependency |
-| `srt/utils/common.py` | the feature-gate helpers: `is_lk_moe_feature_enabled`, `is_lk_moe_cpu_layer`, `is_lk_moe_gpu_resident_layer`, `is_lk_moe_gpu_prefill_layer`, `get_gpu_prefetch_window`, ... |
-| `srt/layers/moe/fused_moe_triton/layer.py` | **the core**: resolve layer role, build `MOEConfigV2`, instantiate `MOE_WNA16` / `MOE_FP8` / `MOE_MXFP4` per quant, and dispatch in `run_moe_core` (GPU resident → `quant_method.apply`; hybrid → `_cpu_decode` / `_cpu_prefill` / `_gpu_prefill`) |
-| `srt/layers/quantization/{fp8,unquant,modelopt_quant,mxfp4_*}.py` | each quant method registers its LK MoE kernel (e.g. `MOE_FP8`, `MOE_MXFP4`) |
-| `srt/layers/quantization/compressed_tensors/schemes/*` | compressed-tensors W8A8-FP8 / W4A4-NVFP4 / WNA16 MoE each register their LK kernel |
-| `srt/model_loader/loader.py` | keep CPU-resident MoE layers off the GPU device; run `process_weights_after_loading` / `clean_weights_after_loading` for lk_moe layers |
-| `srt/utils/numa_utils.py` | when `LVLLM_ENABLE_NUMA_INTERLEAVE=1`, launch workers under `numactl --interleave=all` |
-
-### LvLLM (vllm)
-
-The same method is applied to vLLM in the [Lvllm](https://github.com/guqiong96/Lvllm) repository
-(vllm `model_executor/layers/fused_moe`, `quantization`, `model_loader`), plus dedicated
-DeepSeek-V4 branches: [Lvllmds4](https://github.com/guqiong96/Lvllmds4) (SM120+) and
-[Lvllmds4-x](https://github.com/guqiong96/Lvllmds4-x) (SM80+).
+Unlisted original MOE models from these lines are theoretically supported, pending testing.
 
 ---
 
-## Example — Lsglang (with benchmarks)
+## Benchmarks
 
-### Performance benchmark
-
-Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
+Open GPU Prefill; single request, greedy decode (t/s). Full detail per row:
+[`RELEASE_NOTES.md`](./RELEASE_NOTES.md).
 
 | Model | Version | CPU | Memory | GPU | Prefill | Decode | Spec. Decoding |
 |-------|---------|-----|--------|-----|---------|--------|---------|
@@ -118,104 +48,74 @@ Open GPU Prefill, `max_num_batched_tokens=8192` (row 1) / `32768` (row 2):
 
 Experimental DeepSeek-V4.1 storage option: [exact NVMe Engram lookup](examples/runtime/deepseek_v4/README.engram_nvme.md).
 
-### Supported models & quant formats
+---
 
-Most original MOE models verified on Lsglang (Qwen3/GLM/MiniMax series etc.):
-gemma-4-26B-A4B-it, NVIDIA-Nemotron-3-Super-120B-A12B-BF16, Qwen3.6/3.5-35B-A3B, Qwen3.5-122B-A10B,
-Qwen3.5-397B-A17B, Qwen3-Coder-Next / 30B-A3B, Qwen3-VL-30B, MiniMax-M2.7/2.5/2.1, GLM-5.2-NVFP4,
-GLM-5.1/5.0-FP8, GLM-4.7(-Flash)/4.6V, Kimi k2.6/k2.5, **deepseek-ai/DeepSeek-V4-Flash-0731 [sm80+]**,
-**deepseek-ai/DeepSeek-V4.1-Flash [sm80+]**.
+## Why lk_moe
 
-Quantization formats supported at runtime: bfloat16 / float16, fp8, nvfp4, mxfp4,
-awq 4bit symmetric (`w4a16`). AWQ models: https://hf-mirror.com/cyankiwi
+lk_moe spans a MoE model across **VRAM + system memory** and schedules experts across **CPU + GPU**
+with NUMA awareness — reaching ~100% VRAM utilization and overlapping GPU prefill with hybrid decode.
 
-### Quick start (DeepSeek V4 Flash [RTX 5060Ti *2])
+| Role (per MoE layer) | Meaning | Env |
+|---|---|---|
+| **master switch** | `0` = stock sglang pure-GPU, `1` = hybrid | `LVLLM_MOE_NUMA_ENABLED` |
+| GPU-prefill layer | big batches on GPU, small on CPU | `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` + `LVLLM_GPU_PREFETCH_WINDOW` |
+| GPU-resident layer | weights stay in VRAM | `LVLLM_GPU_RESIDENT_MOE_LAYERS` |
 
-```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID \
-CUDA_VISIBLE_DEVICES=1,2 \
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=48 \
-OMP_NUM_THREADS=1 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_GPU_PREFETCH_WINDOW=1 \
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=1024 \
-SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
-LK_POWER_SAVING=1 \
-python -m sglang.launch_server \
-    --model /home/guqiong/Downloads/DeepSeek-V4-Flash-0731 \
-    --served-model-name DeepSeek-V4-Flash-0731 \
-    --host 0.0.0.0 --port 8070 \
-    --trust-remote-code \
-    --tensor-parallel-size 2 \
-    --max-running-requests 2 \
-    --chunked-prefill-size 4096 \
-    --max-total-tokens 36000 \
-    --mem-fraction-static 0.95 \
-    --tool-call-parser deepseekv4 \
-    --cuda-graph-backend-prefill disabled \
-    --disable-shared-experts-fusion \
-    --speculative-algo DSPARK \
-    --speculative-dspark-block-size 5
+Requires x86 AVX2+ and an NVIDIA GPU (SM75+). The integration itself is one gated wire-up in the
+fused-MoE layer plus per-quant kernel registration — see [`patches/01`](./patches/01_lk_moe__dsv4.1.patch)
+as the readable, self-contained diff. The same method ships for vLLM in
+[Lvllm](https://github.com/guqiong96/Lvllm).
+
+---
+
+## Launch
+
+Ready-made serve scripts (per model × topology) live in **[`commands/`](./commands/)**:
+
+```
+commands/
+  dsv41_serve_tp2_5060ti_dspark.sh    # DeepSeek-V4.1-Flash, 2× RTX 5060Ti, TP=2
 ```
 
-### Quick start (DeepSeek V4.1 Flash [RTX 5060Ti *2])
-
-V4.1 keeps the engram tables in host memory on small cards
-(`SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`, ~48 GiB RAM per engram layer);
-`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0` keeps the GPU MoE pool off a 16 GB card.
-Startup log prints the huge-page verdict — see `RELEASE_NOTES.md` (Launch +
-huge pages) if it reads `0 MiB in huge pages (0%)`.
+Each script is a complete, self-contained `launch_server.py …` (env + args). Pick by GPU
+topology, adjust the model path, and run:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID \
-CUDA_VISIBLE_DEVICES=1,2 \
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=48 \
-OMP_NUM_THREADS=1 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
-LVLLM_GPU_PREFETCH_WINDOW=1 \
-LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 \
-SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
-SGLANG_SKIP_P2P_CHECK=1 \
-LK_POWER_SAVING=1 \
-python -m sglang.launch_server \
-    --model /home/guqiong/Models/DeepSeek-V4.1-Flash \
-    --served-model-name DeepSeek-V4.1-Flash \
-    --host 0.0.0.0 --port 8070 \
-    --trust-remote-code \
-    --tensor-parallel-size 2 \
-    --max-running-requests 2 \
-    --chunked-prefill-size 1024 \
-    --max-total-tokens 65536 \
-    --mem-fraction-static 0.92 \
-    --cuda-graph-backend-prefill disabled \
-    --disable-shared-experts-fusion \
-    --enable-decoder-swa-bounded-replay \
-    --speculative-algo DSPARK \
-    --speculative-dspark-block-size 5 \
-    --speculative-attention-mode decode
+bash commands/dsv41_serve_tp2_5060ti_dspark.sh
 ```
 
-### Configuration parameters
+DeepSeek-V4.1 on 16 GB cards keeps the engram tables in host RAM
+(`SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`, ~48 GiB per engram layer). The startup log
+prints the huge-page verdict; if it reads `0 MiB in huge pages (0%)` see
+**RELEASE_NOTES.md → huge pages** before blaming the GPU.
+
+---
+
+## Configuration
 
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
-| `LVLLM_MOE_NUMA_ENABLED` | core | `0` | enable hybrid inference: `1`-on, `0`-off (off = same as stock vllm) |
-| `LK_THREAD_BINDING` | perf | `CPU_CORE` | `CPU_CORE` bind by core, `NUMA_NODE` bind by node |
-| `LK_THREADS` | perf | - | thread count = (physical cores) / (#GPUs) |
-| `OMP_NUM_THREADS` | perf | - | set to 1 to avoid slow model loading |
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU | none | expert layers resident in VRAM, e.g. `0`, `0-1`, `0,9` |
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK` | GPU | none | DSpark draft model layers in GPU, `0-2` |
-| `LVLLM_GPU_PREFETCH_WINDOW` | prefill | none | prefetch window size, typically `1` |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | prefill | none | GPU prefill starts when input len >= value; `0` disables |
-| `LVLLM_ENABLE_NUMA_INTERLEAVE` | perf | 1 | `1`: avoid NUMA node OOM |
-| `LK_POWER_SAVING` | power | 0 | `1`: enable CPU power saving |
+| `LVLLM_MOE_NUMA_ENABLED` | core | `0` | hybrid on/off (`0` = stock sglang) |
+| `LK_THREADS` | perf | — | threads = physical cores ÷ #GPUs |
+| `LK_THREAD_BINDING` | perf | `CPU_CORE` | `CPU_CORE` (best) / `NUMA_NODE` |
+| `OMP_NUM_THREADS` | perf | — | set to 1 to avoid slow model loading |
+| `LVLLM_GPU_PREFETCH_WINDOW` | prefill | — | prefetch window, typically `1` |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | prefill | — | GPU prefill starts at input ≥ value; `0` = off |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU | none | expert layers in VRAM, e.g. `0`, `0-1,9` |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK` | GPU | none | DSpark draft layers in VRAM, e.g. `0-2` |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | perf | `1` | avoid NUMA node OOM |
+| `LK_POWER_SAVING` | power | `0` | `1` = CPU power saving |
 
-### Installation
+### Optimization tips
+
+- Enable GPU prefill: `LVLLM_GPU_PREFETCH_WINDOW=1`, `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096`,
+  `--chunked-prefill-size 32000`; disable with `…MIN_BATCH_SIZE=0` + `--chunked-prefill-size 4096`.
+- Thread binding `CPU_CORE`; BIOS NUMA: AMD EPYC NPS4 / Intel SNC4 (node count a multiple of GPU count).
+- `--chunked-prefill-size` drives max-batch VRAM usage.
+
+---
+
+## Install
 
 ```bash
 conda create -n Lsglang python==3.12.11 && conda activate Lsglang
@@ -229,8 +129,7 @@ pip install lsglang                   # or build from source below
 From source:
 
 ```bash
-git clone https://github.com/guqiong96/Lsglang.git
-cd Lsglang
+git clone https://github.com/guqiong96/Lsglang.git && cd Lsglang
 pip install -U setuptools wheel scikit-build-core cmake
 pip install torchaudio triton torchvision torch==2.13.0
 pip install grpcio-tools wheel-stub
@@ -239,39 +138,26 @@ CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" \
 pip install -e "python" --no-build-isolation -vvv
 ```
 
-(`MAX_JOBS=32 NVCC_THREADS=1`: reduce compile memory; `CMAKE_BUILD_TYPE=Release`: perf option.)
+---
 
-### Release / packaging example
+## Patches
 
-The Lsglang release workflow is a plain editable-install + wheel build + upload:
+Portable diffs against upstream sglang (already included in the wheel — informational):
+
+| Patch | Applies to | Contents |
+|-------|-----------|----------|
+| [`01_lk_moe__dsv4.1.patch`](./patches/01_lk_moe__dsv4.1.patch) | clean sglang `dsv4.1` (`1aa0e962b`) | pure lk_moe hybrid MoE integration |
+| [`02_sm80_sm120_support__dsv4.1.patch`](./patches/02_sm80_sm120_support__dsv4.1.patch) | after 01 | SM80/86 attention & GEMM ports + mixed-arch TP fixes + SM120 prefill fast path + V4.1 memory PRs (#27/#28) |
 
 ```bash
-# clean any previous build artifacts
-rm -rf python/build dist
-
-# arch list covering the supported GPUs (Ampere sm75/sm80/sm86/sm89,
-# Hopper sm90, Blackwell sm100/sm120)
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 8.9 9.0 10.0 12.0"
-
-# editable install to verify, then build the wheel
-CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" \
-  pip install -e "python" --no-build-isolation -vvv
-CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" \
-  pip wheel ./python --no-build-isolation -v --wheel-dir=dist
-
-# upload to PyPI
-python -m twine upload dist/lsglang*-any*.whl --verbose
+git checkout 1aa0e962b
+git apply patches/01_lk_moe__dsv4.1.patch              # SM89+/SM120 basic: stop here
+git apply patches/02_sm80_sm120_support__dsv4.1.patch  # + SM80/86 + mixed-arch + SM120 fixes
 ```
 
-### Optimization
-
-- **MoE resident in VRAM**: `LVLLM_GPU_RESIDENT_MOE_LAYERS=0-5` (format `0,1,8-9`; some models start at non-zero layer, e.g. Step-3.5-Flash at layer 3).
-- **Enable GPU prefill**: `LVLLM_GPU_PREFETCH_WINDOW=1`, `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=4096`, `--chunked-prefill-size 32000`.
-- **Disable GPU prefill**: `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0`, `--chunked-prefill-size 4096`.
-- **Thread binding**: `LK_THREAD_BINDING=CPU_CORE` (best), `NUMA_NODE` (fixes extreme issues on virtualization / multi-instance).
-- **BIOS NUMA**: AMD EPYC NPS4 / Intel XEON SNC4; use 2,4,8 nodes (multiple of GPU count is best), up to 32.
-- **Thread count**: HT on → physical cores ÷ GPUs; HT off → (physical cores-2) ÷ GPUs.
-- **VRAM**: `--chunked-prefill-size` drives max-batch VRAM usage.
-- **CPU power saving**: `LK_POWER_SAVING=1`.
-
 ---
+
+## Release / history
+
+See **<https://github.com/guqiong96/Lsglang/releases>** and
+[`RELEASE_NOTES.md`](./RELEASE_NOTES.md); support branches are listed at the bottom of the notes.
