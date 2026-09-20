@@ -34,9 +34,6 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.sparse_mla_kernels import (
-    matmul_sparse_mla_attention_with_sink,
-)
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
 )
@@ -45,6 +42,9 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.sparse_mla_kernels import (
+    matmul_sparse_mla_attention_with_sink,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -123,7 +123,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
+from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -145,6 +145,7 @@ def _is_sm8() -> bool:
     ranks in mixed-arch TP (SM86 + SM120).
     """
     return is_sm80_supported() and not is_sm120_supported()
+
 
 logger = logging.getLogger(__name__)
 
@@ -338,7 +339,41 @@ def two_level_decode_logits(
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+_TORCH_INDEXER_SCORE_BUDGET_BYTES = envs.SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES.get()
+if _TORCH_INDEXER_SCORE_BUDGET_BYTES <= 0:
+    raise ValueError("SGLANG_DSV41_INDEXER_SCORE_BUDGET_BYTES must be positive")
+
+
+class CompactCandidateMask:
+    """Lossless block mask for eager prefill; decode graph tensors stay unchanged."""
+
+    def __init__(self, blocks: torch.Tensor, width: int, block_size: int):
+        self.blocks = blocks
+        self.width = width
+        self.block_size = block_size
+
+    @property
+    def shape(self):
+        return (self.blocks.shape[0], self.width)
+
+    def __getitem__(self, rows):
+        return CompactCandidateMask(self.blocks[rows], self.width, self.block_size)
+
+    def expanded(self, rows, width):
+        return self.blocks[rows].repeat_interleave(self.block_size, dim=-1)[:, :width]
+
+
+def candidate_mask_rows(mask, rows, width):
+    if isinstance(mask, CompactCandidateMask):
+        return mask.expanded(rows, width)
+    return mask[rows, :width]
+
+
+def compact_candidate_blocks(scores, lens, topk_blocks, block_size):
+    # Preserve the exact original top-k/tie behavior. Only the small score chunk
+    # expands to positions, and clone prevents retaining that full backing store.
+    full = select_candidate_blocks(scores, lens, topk_blocks, block_size)
+    return full[:, ::block_size].clone()
 
 
 def _mask_topk_scores(
@@ -1121,9 +1156,12 @@ class DeepseekV4AttnBackend(
         # defaulting to context_len when unset) so the graph captures a fixed
         # (smaller) shape; the live length is always <= max_total_tokens//128
         # so no valid entry is dropped.
-        _pool_cap = getattr(
-            getattr(model_runner, "server_args", None), "max_total_tokens", None
-        ) or self.max_context_len
+        _pool_cap = (
+            getattr(
+                getattr(model_runner, "server_args", None), "max_total_tokens", None
+            )
+            or self.max_context_len
+        )
         self._c128_decode_max_topk = (max(1, _pool_cap) // 128 + 63) // 64 * 64
         # Multi-bucket decode widths. The graph is captured once per width; at
         # replay we pick the smallest bucket covering the current max seq_len.
@@ -1167,9 +1205,9 @@ class DeepseekV4AttnBackend(
         if self._c128_decode_max_topk not in self._c128_topk_buckets:
             self._c128_topk_buckets.append(self._c128_decode_max_topk)
         self._c128_topk_buckets.sort()
-        self._sm8_attn_buffers: Dict[Tuple[int, int, int], Tuple[torch.Tensor, ...]] = (
-            {}
-        )
+        self._sm8_attn_buffers: Dict[
+            Tuple[int, int, int], Tuple[torch.Tensor, ...]
+        ] = {}
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -1200,7 +1238,9 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         # Per-request candidate masks the candidate_source layer publishes for the
         # index_source layers after it (torch indexer scratch).
-        self.candidate_masks: Optional[List[torch.Tensor]] = None
+        self.candidate_masks: Optional[
+            Union[torch.Tensor, List[Union[torch.Tensor, CompactCandidateMask]]]
+        ] = None
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -3202,9 +3242,13 @@ class DeepseekV4AttnBackend(
     def _use_dense_fp4_prefill_indexer(forward_batch) -> bool:
         return (
             not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.input_ids.numel()
+            * max(forward_batch.seq_lens_cpu, default=0)
+            * 4
+            <= _TORCH_INDEXER_SCORE_BUDGET_BYTES
             and _has_dense_fp4_indexer()
             and forward_batch.forward_mode.is_extend()
-            and forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
 
@@ -3327,23 +3371,34 @@ class DeepseekV4AttnBackend(
                 continue
             scores = logits[rows, :lc]
             if publish is None:
-                scores.masked_fill_(~self.candidate_masks[b], -torch.inf)
+                step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // max(1, lc))
+                for offset in range(0, t_len, step):
+                    chunk = slice(offset, offset + step)
+                    scores[chunk].masked_fill_(
+                        ~candidate_mask_rows(self.candidate_masks[b], chunk, lc),
+                        -torch.inf,
+                    )
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
-            masks = [
-                select_candidate_blocks(
-                    scores[start : start + step],
-                    lens[start : start + step],
-                    topk_blocks=indexer.candidate_topk_blocks,
-                    block_size=indexer.candidate_block_size,
+            block_size = indexer.candidate_block_size
+            blocks = torch.empty(
+                (t_len, (lc + block_size - 1) // block_size),
+                dtype=torch.bool,
+                device=logits.device,
+            )
+            for start in range(0, t_len, step):
+                chunk = slice(start, start + step)
+                blocks[chunk] = compact_candidate_blocks(
+                    scores[chunk],
+                    lens[chunk],
+                    indexer.candidate_topk_blocks,
+                    block_size,
                 )
-                for start in range(0, t_len, step)
-            ]
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
+            publish.append(CompactCandidateMask(blocks, lc, block_size))
         if publish is not None:
             self.candidate_masks = publish
 
@@ -3643,23 +3698,29 @@ class DeepseekV4AttnBackend(
                 1,
                 _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
             )
-            masks = [] if publish is not None else None
+            block_size = indexer.candidate_block_size
+            masks = (
+                torch.empty(
+                    (tok.numel(), (lc + block_size - 1) // block_size),
+                    dtype=torch.bool,
+                    device=pos.device,
+                )
+                if publish is not None
+                else None
+            )
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
                 s = indexer.scores(q[tok_c], index_k, weights[tok_c])
                 s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
                 if masks is not None:
-                    masks.append(
-                        select_candidate_blocks(
-                            s,
-                            lens_c[:, None],
-                            topk_blocks=indexer.candidate_topk_blocks,
-                            block_size=indexer.candidate_block_size,
-                        )
+                    masks[rows] = compact_candidate_blocks(
+                        s, lens_c[:, None], indexer.candidate_topk_blocks, block_size
                     )
                 elif consume is not None:
-                    s.masked_fill_(~consume[b][rows], -torch.inf)
+                    s.masked_fill_(
+                        ~candidate_mask_rows(consume[b], rows, lc), -torch.inf
+                    )
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
                     idx = _mask_topk_scores(s, idx)
@@ -3672,7 +3733,7 @@ class DeepseekV4AttnBackend(
                 if raw_indices is not None:
                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
             if masks is not None:
-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+                publish.append(CompactCandidateMask(masks, lc, block_size))
         if publish is not None:
             self.candidate_masks = publish
 
@@ -3984,9 +4045,7 @@ class DeepseekV4AttnBackend(
             out = torch.empty(
                 (b, h, self.head_dim_v), dtype=torch.bfloat16, device=device
             )
-            score_buffer = torch.empty(
-                (b, h, topk), dtype=torch.float32, device=device
-            )
+            score_buffer = torch.empty((b, h, topk), dtype=torch.float32, device=device)
             valid_buf = torch.empty((b, topk), dtype=torch.bool, device=device)
             buf = (combined_kv, out, score_buffer, valid_buf)
             self._sm8_attn_buffers[key] = buf
