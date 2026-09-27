@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -157,6 +158,39 @@ def mm_runtime_reservation_gb(
             reserved_mb / 1024,
         )
     return reserved_mb / 1024
+
+
+def _lk_moe_device_reservation_gb() -> float:
+    
+    from sglang.srt.utils.common import is_lk_moe_feature_enabled
+
+    if not is_lk_moe_feature_enabled():
+        return 0.0
+    reported_gb = -1.0
+    try:
+        import lk_moe
+
+        report = getattr(lk_moe, "get_device_mem_usage", None)
+        if report is not None:
+            reported_gb = float(report()) / (1 << 30)
+    except Exception:
+        reported_gb = -1.0
+    if reported_gb > 0.0:
+        logger.info(
+            "lk_moe static device arena: %.2f GB already resident "
+            "(allocated in MOE ctors, excluded from free memory); no "
+            "additional KV reservation.",
+            reported_gb,
+        )
+        return 0.0
+    gb = float(os.environ.get("LVLLM_GPU_RESERVE_GB", "0") or 0)
+    if gb > 0:
+        logger.info(
+            "Reserving %.2f GB of the KV budget for lk_moe device-side "
+            "staging (LVLLM_GPU_RESERVE_GB; no lk_moe report available).",
+            gb,
+        )
+    return gb
 
 
 # base ratio of mamba pool size to max_running_requests. Under
@@ -2176,7 +2210,7 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb - _lk_moe_device_reservation_gb()
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

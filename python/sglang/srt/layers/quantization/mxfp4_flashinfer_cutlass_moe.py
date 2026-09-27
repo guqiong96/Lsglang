@@ -122,6 +122,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         # Preserve the base FP4 post-load handling.
         self._fp8.process_weights_after_loading(layer)
 
