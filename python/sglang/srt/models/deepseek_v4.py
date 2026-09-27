@@ -235,6 +235,73 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
+
+def _super_chunk_hc_bounds(forward_batch, rows: int):
+    """Token-axis [(lo, hi)] slices for row-local hc math while this forward
+    runs inside the super-chunk inner loop, or None for today's monolithic
+    pass. Looping keeps every hc intermediate at chunk-shape (never CAP-shape);
+    every sliced op below is row-local so the per-row kernels are unchanged.
+
+    Guards: a rows mismatch (e.g. a swa/c4 ring clamp that cut the segment
+    below what the plan was built from, or DP-padded rows) falls back to the
+    monolithic pass — slicing by a stale plan is never sound. Capture forwards
+    never carry a plan (wrapper gate), checked here only as a cheap belt.
+    """
+    if forward_batch is None or get_is_capture_mode():
+        return None
+    from sglang.srt.layers.attention.super_chunk_backend import (
+        super_chunk_token_plan,
+    )
+
+    plan = super_chunk_token_plan(forward_batch)
+    if plan is None or len(plan) < 2 or plan[-1][1] != rows:
+        return None
+    return [(lo, hi) for lo, hi, _ in plan]
+
+
+def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
+    """Model-side [(lo, hi, child_forward_batch)] plan for the attention
+    projection loop, or None for today's monolithic pass.
+
+    The attention counterpart of _super_chunk_hc_bounds: qkv / indexer /
+    compressor / attention / o_proj all run per segment so no [CAP, ...]
+    projection intermediate outlives its chunk (the wrapper-level loop can
+    only slice tensors that were already projected at full size). Same
+    stale-plan guard as the hc helper (a rows mismatch = the plan was built
+    from different bounds, slicing by it is never sound). Two extra belts:
+    breakable-capture pieces are excluded (their fused attention helper
+    re-reads the ambient forward_batch, not the child view), and a quantized
+    x whose tensors are not row-major (e.g. a transposed fp8 scale) cannot
+    be sliced on axis 0, so it keeps the monolithic path.
+    """
+    if forward_batch is None or get_is_capture_mode():
+        return None
+    if is_in_breakable_cuda_graph():
+        return None
+    from sglang.srt.layers.attention.super_chunk_backend import (
+        super_chunk_token_plan,
+    )
+
+    plan = super_chunk_token_plan(forward_batch)
+    if plan is None or len(plan) < 2 or plan[-1][1] != rows:
+        return None
+    if x_quant is not None:
+        values = x_quant if isinstance(x_quant, tuple) else (x_quant,)
+        if any(
+            not torch.is_tensor(v) or v.shape[0] != rows for v in values
+        ):
+            return None
+    return plan
+
+
+def _super_chunk_slice_token_arg(value, tok):
+    """Token-axis slice of an attention helper argument (None, tensor, or the
+    (fp8 data, scales) tuple form of x_quant -- row-majorness was already
+    checked by _super_chunk_attn_plan)."""
+    if value is None or torch.is_tensor(value):
+        return None if value is None else value[tok]
+    return tuple(v[tok] for v in value)
+
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
@@ -1704,6 +1771,48 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        child_index = getattr(forward_batch, "super_chunk_child_index", None)
+        if child_index is not None:
+            # This forward IS one segment of the model-side loop below:
+            # metadata/pool helpers (swa_loc, indexer, compressor) must
+            # resolve through the segment's own child backend -- the wrapper
+            # would route the .forward call itself, the helpers would not.
+            child_fn = getattr(attn_backend, "super_chunk_child_backend", None)
+            if child_fn is not None:
+                attn_backend = child_fn(child_index)
+
+        plan = (
+            None
+            if child_index is not None
+            else _super_chunk_attn_plan(forward_batch, x.shape[0], x_quant)
+        )
+        if plan is not None:
+            # Model-side projection loop (the qwen4_exp.self_attention
+            # pattern): the whole qkv/indexer/attention/o_proj stack runs per
+            # sub-chunk so every intermediate stays at chunk shape. The
+            # recursive call carries the child view and routes its backend
+            # calls to the matching child (above), never re-entering this
+            # loop. Output writes stream through one preallocated buffer
+            # (peak = stream + one chunk).
+            out = None
+            pos_is_2d = positions.ndim == 2
+            for lo, hi, child_fb in plan:
+                tok = slice(lo, hi)
+                o_seg = self.forward(
+                    x[tok],
+                    positions[:, tok] if pos_is_2d else positions[tok],
+                    child_fb,
+                    x_quant=_super_chunk_slice_token_arg(x_quant, tok),
+                )
+                if out is None:
+                    out = torch.empty(
+                        (plan[-1][1], *o_seg.shape[1:]),
+                        dtype=o_seg.dtype,
+                        device=o_seg.device,
+                    )
+                out[lo:hi] = o_seg
+            return out
+
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -2269,6 +2378,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # The deepgemm tf32 gemm wins at large M (prefill) but its fixed
         # dispatch cost dominates at small M (decode): dispatch by token count.
+        hc_bounds = None
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
@@ -2289,7 +2399,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            hc_bounds = _super_chunk_hc_bounds(forward_batch, x.shape[0])
+            if hc_bounds is None:
+                x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            else:
+                # Super-chunk loop: per-slice fp32 copy + mix GEMM, so the
+                # [rows, hc*hidden] fp32 transient never peaks at CAP rows.
+                mixes = torch.empty(
+                    (x.shape[0], 1, hc_fn.size(0)),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                x_flat = None
+                xf = x.flatten(1)
+                for lo, hi in hc_bounds:
+                    xc = xf[lo:hi].float()
+                    rsqrt = torch.rsqrt(
+                        xc.square().mean(-1, keepdim=True) + self.rms_norm_eps
+                    )
+                    mixes[lo:hi, 0] = F.linear(xc, hc_fn) * rsqrt
 
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
@@ -2310,7 +2438,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+            if hc_bounds is None:
+                y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+            else:
+                y = torch.empty(
+                    (x.shape[0], x.shape[-1]), dtype=dtype, device=x.device
+                )
+                pre_rows = pre.squeeze(1)
+                for lo, hi in hc_bounds:
+                    hc_combine(
+                        xf[lo:hi].float(),
+                        pre_rows[lo:hi],
+                        self.hc_mult,
+                        dtype,
+                        out=y[lo:hi],
+                    )
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -2319,6 +2461,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        forward_batch=None,
     ):
 
         if x.shape[0] == 0:
@@ -2369,7 +2512,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
             ).type_as(x)
 
-        return hc_post_torch_impl(x, residual, post, comb)
+        hc_bounds = _super_chunk_hc_bounds(forward_batch, x.shape[0])
+        if hc_bounds is None:
+            return hc_post_torch_impl(x, residual, post, comb)
+        # Super-chunk loop: the [rows, hc, hc, hidden] broadcast product never
+        # materialises over more than one chunk of rows at a time.
+        out = torch.empty_like(residual)
+        for lo, hi in hc_bounds:
+            out[lo:hi] = hc_post_torch_impl(
+                x[lo:hi], residual[lo:hi], post[lo:hi], comb[lo:hi]
+            )
+        return out
 
     def forward(
         self,
@@ -2433,7 +2586,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x_quant = None
             else:
                 hidden_states = self.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    forward_batch=forward_batch,
                 )
                 residual = hidden_states
                 hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2515,7 +2672,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if not norm_fused:
                     hidden_states = self.post_attention_layernorm(hidden_states)
             else:
-                hidden_states = self.hc_post(hidden_states, residual, post, comb)
+                hidden_states = self.hc_post(
+                hidden_states, residual, post, comb, forward_batch=forward_batch
+            )
                 residual = hidden_states
                 hidden_states, post, comb, norm_fused = self.hc_pre(
                     hidden_states,
@@ -2528,7 +2687,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if not norm_fused:
                     hidden_states = self.post_attention_layernorm(hidden_states)
         else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            hidden_states = self.hc_post(
+                hidden_states, residual, post, comb, forward_batch=forward_batch
+            )
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -2549,7 +2710,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            hidden_states = self.hc_post(
+                hidden_states, residual, post, comb, forward_batch=forward_batch
+            )
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -2829,6 +2992,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_residual,
             attn_post,
             attn_comb,
+            forward_batch=state.forward_batch,
         )
         ffn_residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -2853,6 +3017,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             state.pop("ffn_residual"),
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
+            forward_batch=state.forward_batch,
         )
         output = dict(
             positions=state.positions,
@@ -3309,14 +3474,22 @@ class DeepseekV4Model(nn.Module):
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+                            hidden_states,
+                            prev_residual,
+                            prev_post,
+                            prev_comb,
+                            forward_batch=forward_batch,
                         )
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    forward_batch=forward_batch,
                 )
 
         if not self.pp_group.is_last_rank:

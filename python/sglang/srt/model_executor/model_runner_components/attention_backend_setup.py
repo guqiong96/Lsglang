@@ -12,13 +12,13 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.utils import init_cublas
+from sglang.srt.utils import get_super_chunk_size, init_cublas
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec
+from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,26 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 resolved=resolved,
                 init_new_workspace=False,
             )
+        )
+        decode_attn_backend = None
+        decode_attn_backend_group = []
+    elif (
+        get_super_chunk_size() > 0
+        and (get_schedule().chunked_prefill_size or 0) > 0
+        and get_super_chunk_size() > get_schedule().chunked_prefill_size
+        and not model_runner.is_draft_worker
+    ):
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            SuperChunkAttnBackend,
+        )
+
+        attn_backend = SuperChunkAttnBackend.init_new(
+            lambda: _build_resolved_backend(
+                model_runner=model_runner,
+                resolved=resolved,
+                init_new_workspace=False,
+            ),
+            inner_size=get_schedule().chunked_prefill_size,
         )
         decode_attn_backend = None
         decode_attn_backend_group = []

@@ -811,6 +811,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_token_plan,
+        )
+
+        plan = super_chunk_token_plan(forward_batch)
+        if plan is None:
+            return self._forward_gdn(hidden_states, forward_batch)
+        # Super-chunk: projections/norm/output-projection run per sub-chunk;
+        # the mamba pool carries the recurrent state across the chunks exactly
+        # like today's scheduler chunks do. The child marker on child_fb routes
+        # self.attn back to the matching child backend without re-slicing.
+        outs = [
+            self._forward_gdn(hidden_states[lo:hi], child_fb)
+            for lo, hi, child_fb in plan
+        ]
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+    def _forward_gdn(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         """
         Forward pass with three parts:
         1. Input projection

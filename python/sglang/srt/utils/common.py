@@ -4874,6 +4874,9 @@ def is_lk_embedding_cpu_enabled() -> bool:
 def is_lk_moe_use_gpu_prefill() -> bool:
     return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
 
+def get_super_chunk_size() -> int:
+    return get_int_env_var("LK_GPU_PREFILL_SUB_M")
+
 def disable_lk_moe_gpu_prefill() -> int:
     origin_value = get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE")
     set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", 0)
@@ -4906,15 +4909,15 @@ def get_model_type_from_layer_name(layer_name: str) -> str:
     
     if layer_name.startswith('stages.'):
         return "dspark"
-    
-    if layer_name.startswith('model.layers.'):
-        return "main"
-    
+    if layer_name.startswith('mtp.') or '.mtp.' in layer_name:
+        return "mtp"
     return "main"
 
 def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
-    if model_type == "dspark":
-        env_value = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK", None)
+    if model_type in ("dspark", "mtp"):
+        env_value = get_str_env_var(
+            f"LVLLM_GPU_RESIDENT_MOE_LAYERS_{model_type.upper()}", None
+        )
         if env_value is not None:
             return env_value
         
@@ -4922,15 +4925,6 @@ def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
     
     return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
 
-def is_lk_moe_gpu_prefill_layer(layer_id: str, model_type: str = "main") -> bool:
-    return (is_lk_moe_use_gpu_prefill() and 
-            not is_lk_moe_gpu_resident_layer(layer_id, model_type))
-    
-def is_lk_moe_cpu_layer(layer_id: str, model_type: str = "main") -> bool:
-    return (is_lk_moe_feature_enabled() and 
-            not is_lk_moe_gpu_resident_layer(layer_id, model_type) and 
-            not is_lk_moe_gpu_prefill_layer(layer_id, model_type))
-    
 def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
     if not is_lk_moe_feature_enabled():
         return True

@@ -529,6 +529,28 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_token_plan,
+        )
+
+        plan = super_chunk_token_plan(forward_batch)
+        if plan is None:
+            return self._forward_gdn(hidden_states, forward_batch)
+        # Super-chunk: projections/norm/output-projection run per sub-chunk;
+        # the mamba pool carries the recurrent state across the chunks exactly
+        # like today's scheduler chunks do. The child marker on child_fb routes
+        # self.attn back to the matching child backend without re-slicing.
+        outs = [
+            self._forward_gdn(hidden_states[lo:hi], child_fb)
+            for lo, hi, child_fb in plan
+        ]
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+    def _forward_gdn(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, forward_batch

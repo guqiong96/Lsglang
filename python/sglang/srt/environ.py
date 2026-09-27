@@ -505,6 +505,10 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Verify-side RS probe: dump per-row draft_probs rowsums / accept counts.
+    SGLANG_RS_DEBUG = EnvBool(False)
+    # QSA indexer probe: shapes through the super-chunk model-side loop.
+    SGLANG_QSA_LOOP_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)

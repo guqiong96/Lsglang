@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -914,6 +915,18 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
+        if envs.SGLANG_RS_DEBUG.get() and bs > 1:
+            _qs = draft_probs.sum(dim=-1).cpu().tolist()
+            _nan = torch.isnan(draft_probs).any(dim=-1).cpu().tolist()
+            logger.warning(
+                "[rs-dbg] q_rowsum=%s q_nan=%s p_sum_err=%s",
+                [[round(v, 3) for v in row] for row in _qs],
+                _nan,
+                [
+                    round(v, 3)
+                    for v in (target_probs.sum(dim=-1) - 1).abs().max(-1).values.cpu().tolist()
+                ],
+            )
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
             seq_lens=batch.seq_lens,
@@ -938,6 +951,17 @@ def eagle_sample(
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
+        if envs.SGLANG_RS_DEBUG.get():
+            _ac = num_correct_drafts.reshape(-1).tolist()
+            _q = verify_input.draft_probs
+            _qrow = (
+                _q.reshape(_q.shape[0], -1, _q.shape[-1]).sum(-1)
+                .round(decimals=2)
+                .tolist()
+                if _q is not None
+                else None
+            )
+            logger.warning("[rs-dbg] accept=%s probs_rowsum=%s", _ac, _qrow)
         del (
             expanded_temperature,
             target_probs,

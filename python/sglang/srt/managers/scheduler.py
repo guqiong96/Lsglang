@@ -343,7 +343,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, get_super_chunk_size
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -3822,6 +3822,16 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Super-chunk prefill (LK_GPU_PREFILL_SUB_M, the MoE big-segment knob):
+        # raise the per-forward token budget to it; attention iterates the
+        # super-chunk at chunked_prefill_size, MoE gets it whole in one call.
+        super_chunk_size = get_super_chunk_size()
+        if super_chunk_size > 0:
+            chunked_prefill_size = max(chunked_prefill_size or 0, super_chunk_size)
+            max_prefill_tokens = max(self.max_prefill_tokens, chunked_prefill_size)
+        else:
+            max_prefill_tokens = self.max_prefill_tokens
+
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
@@ -3836,7 +3846,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,

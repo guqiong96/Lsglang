@@ -105,6 +105,36 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def _fuse_residual_linear_shared(
         self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        # Row-parallel (norms and both projections); a super-chunk draft-extend
+        # feeds CAP rows here, so block the token axis to keep the fused
+        # [rows, hc, hidden] chain at the inner chunk footprint instead of
+        # 320MB @16K. Small forwards (decode/verify graphs) keep this exact
+        # single-shot path.
+        rows = hidden_states.shape[0]
+        from sglang.srt.runtime_context import get_schedule
+
+        block = get_schedule().chunked_prefill_size or 0
+        if (
+            block > 0
+            and rows > block
+            and hidden_states.is_cuda
+            and hidden_states.ndim == 2
+        ):
+            out = hidden_states.new_empty(
+                (rows, self.hc_count, self.hidden_size),
+                dtype=self.fc_hidden.weight.dtype,
+            )
+            for lo in range(0, rows, block):
+                sl = slice(lo, min(lo + block, rows))
+                emb = self.fc_embedding(
+                    self.pre_fc_norm_embedding(input_embeds[sl])
+                )
+                normed = self.pre_fc_norm_hidden(hidden_states[sl])
+                out[sl] = emb.unsqueeze(-2) + self.fc_hidden(
+                    normed.view(-1, self.hc_count, self.hidden_size)
+                )
+            return out.view(rows, self.hc_count * self.hidden_size)
+
         input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)

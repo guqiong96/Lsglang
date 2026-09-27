@@ -21,6 +21,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
@@ -545,6 +546,24 @@ class QSAIndexer(MultiPlatformOp):
         # DP MAX_LEN padding adds token rows without assigning them to a
         # request. token_to_batch_idx is the source of truth for semantic rows.
         num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
+        if envs.SGLANG_QSA_LOOP_DEBUG.get():
+            import sys
+
+            print(
+                "[qsa-dbg] mode=%s hid=%s pos(arg)=%s pos(fb)=%s map=%d child_idx=%s"
+                % (
+                    forward_mode,
+                    tuple(hidden_states.shape),
+                    tuple(positions.shape),
+                    tuple(fb_pos.shape)
+                    if (fb_pos := getattr(forward_batch, "positions", None)) is not None
+                    else None,
+                    num_valid_tokens,
+                    getattr(forward_batch, "super_chunk_child_index", None),
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if logical_positions.numel() < num_valid_tokens:
             raise ValueError(
                 "QSA logical positions are shorter than the request mapping: "

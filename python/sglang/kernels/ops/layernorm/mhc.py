@@ -2028,12 +2028,21 @@ def _hc_combine_kernel(
 
 
 def hc_combine(
-    x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
+    x_flat: torch.Tensor,
+    pre: torch.Tensor,
+    hc: int,
+    out_dtype: torch.dtype,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h].
+
+    *out* (row-slice of a pre-allocated buffer) lets super-chunk hc loops
+    write straight into the downstream [rows, h] stream; the kernel is
+    per-row so sliced calls are bitwise identical to the monolithic one.
+    """
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
-    y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
+    y = out if out is not None else torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
     _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
         x_flat,

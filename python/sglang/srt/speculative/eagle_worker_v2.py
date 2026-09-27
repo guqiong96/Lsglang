@@ -383,9 +383,44 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
-            self.draft_runner.attn_backend = self.draft_extend_attn_backend
+            self.draft_runner.attn_backend = self._maybe_wrap_draft_extend_super_chunk(
+                draft_backend_factory
+            )
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
+
+    def _maybe_wrap_draft_extend_super_chunk(self, draft_backend_factory):
+        """Super-chunk prefill: a draft-extend forward can carry a whole CAP
+        segment (up to 16K tokens) while the draft backend has no wrapper.
+        Give draft_runner an iterator view so its projections/attention loop
+        sub-chunks internally (chunk-sized footprint, identical math). The
+        raw backend stays on self.draft_extend_attn_backend for graph
+        capture, index sharing and isinstance consumers; a per-child clone
+        set is created lazily, sharing nothing but the pool references."""
+        from sglang.srt.runtime_context import get_schedule
+        from sglang.srt.utils import get_super_chunk_size
+
+        inner = get_schedule().chunked_prefill_size or 0
+        if (
+            get_super_chunk_size() <= 0
+            or inner <= 0
+            or get_super_chunk_size() <= inner
+        ):
+            return self.draft_extend_attn_backend
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            SuperChunkAttnBackend,
+        )
+
+        logger.info(
+            "Draft-extend attention wrapped in super-chunk iterator "
+            f"(CAP={get_super_chunk_size()}, inner={inner})."
+        )
+        return SuperChunkAttnBackend(
+            primary=self.draft_extend_attn_backend,
+            inner_size=inner,
+            creator=draft_backend_factory.create_draft_extend_backend,
+            allow_spec_info_extend=True,
+        )
 
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;

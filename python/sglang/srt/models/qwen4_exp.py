@@ -68,8 +68,8 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.utils import get_int_env_var, get_super_chunk_size, logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -376,6 +376,22 @@ def _ple_track_targets(
         return None
 
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
+
+
+def _ple_conv_block_tokens() -> int:
+    """Token budget for one padded-conv pass. A super-chunk forward keeps the
+    dense [rows, row_width, C] intermediates at the inner chunk size instead
+    of the full CAP; matches the attention backend's inner loop knob.
+
+    The shell's per-block temporaries (projections, norms, gated value) are
+    the last block-scale peak inside the loop, so this one knob may go below
+    the attention inner size without touching any other component (the pass
+    is row-parallel; bit-parity is block-size independent)."""
+    override = get_int_env_var("SGLANG_PLE_BLOCK_TOKENS")
+    if override > 0:
+        return override
+    size = get_schedule().chunked_prefill_size or 0
+    return size if size > 0 else 8192
 
 
 def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
@@ -1049,6 +1065,10 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
+        block = _ple_conv_block_tokens()
+        if batch.row_width > block and not batch.mode.is_target_verify():
+            return self._short_conv_blocked(x, forward_batch, batch, conv_state, block)
+
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(
             (batch.lengths.shape[0], batch.row_width, self.conv_channels)
@@ -1119,6 +1139,101 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
 
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
+
+    def _short_conv_blocked(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+        conv_state: torch.Tensor,
+        block: int,
+    ) -> torch.Tensor:
+        """Padded-conv over a super-chunk without materializing [rows, CAP, C].
+
+        Each pass convolves one token-axis block per row, prefixed by a gather
+        of the state_len tokens right before the window (from x, or from the
+        pool state where the request starts inside the block). The depthwise
+        receptive field is exactly that window, so outputs and the final state
+        match the single dense conv column for column.
+        """
+        device = x.device
+        state_len = self.short_conv_state_len
+        channels = self.conv_channels
+        total = x.shape[0]
+        rows = batch.lengths.shape[0]
+        starts = torch.cumsum(batch.lengths, dim=0) - batch.lengths
+        state_cols = torch.arange(state_len, device=device, dtype=torch.long)
+        state_rows = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+        weight = self.conv1d.weight.to(dtype=x.dtype)
+        positions = torch.arange(total, device=device)
+
+        def _tokens_before(ends: torch.Tensor) -> torch.Tensor:
+            # local ends -> [rows, C, state_len] holding tokens [ends-S, ends),
+            # falling back to the pool state where ends - S + c < 0.
+            loc = ends.unsqueeze(1) - state_len + state_cols
+            from_x = loc.view(rows, 1, state_len) >= 0
+            idx = (starts.unsqueeze(1) + loc).clamp(min=0, max=total - 1)
+            token_side = (
+                x.index_select(0, idx.reshape(-1))
+                .reshape(rows, state_len, channels)
+                .transpose(1, 2)
+            )
+            state_side = torch.gather(
+                state_rows,
+                2,
+                (loc + state_len).clamp(min=0, max=state_len - 1)
+                .unsqueeze(1)
+                .expand(rows, channels, state_len),
+            )
+            return torch.where(from_x, token_side, state_side)
+
+        # State commits read x only, so they run before the in-place loop below.
+        conv_state[batch.state_indices] = _tokens_before(batch.lengths).to(
+            dtype=conv_state.dtype
+        )
+        track = _ple_track_targets(forward_batch, batch)
+        if track is not None:
+            track_indices, track_offsets = track
+            conv_state[track_indices] = _tokens_before(track_offsets).to(
+                dtype=conv_state.dtype
+            )
+
+        # Blocks run high to low and write their silu result into x in place:
+        # every read (window tokens, left context) lives at or below the block's
+        # own range, which earlier iterations never touched. No [total, C]
+        # output tensor is ever materialized.
+        for hi in range(total, 0, -block):
+            lo = max(hi - block, 0)
+            window_lo = (lo - starts).clamp(min=0).minimum(batch.lengths)
+            window_hi = (hi - starts).clamp(min=0).minimum(batch.lengths)
+            width = int((window_hi - window_lo).max().item())
+            seq_block = x.new_zeros((rows, width, channels))
+            req_block = batch.req_indices[lo:hi]
+            edge = starts + window_lo
+            # Invalid (padding-slot) tokens keep their value irrelevant by the
+            # forward's valid mask, so clamping their column is safe.
+            col_block = (
+                (positions[lo:hi] - edge.index_select(0, req_block))
+                .clamp_(min=0)
+                .clamp_(max=width - 1)
+            )
+            seq_block[req_block, col_block] = x[lo:hi]
+            conv_input = x.new_empty((rows, channels, state_len + width))
+            conv_input[:, :, :state_len].copy_(_tokens_before(window_lo))
+            conv_input[:, :, state_len:].copy_(seq_block.transpose(1, 2))
+            del seq_block
+            conv_block = F.conv1d(
+                conv_input,
+                weight,
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=channels,
+            ).transpose(1, 2)
+            del conv_input
+            x[lo:hi] = conv_block[req_block, col_block]
+            torch.ops.aten.silu_(x[lo:hi])
+
+        return x
 
     def forward_idle(self, forward_batch: ForwardBatch) -> None:
         if self._prefetch_state is not None:
@@ -1211,8 +1326,19 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         batch: _PLEBatch,
-    ) -> torch.Tensor:
+        accumulate_into: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         hidden_states = hidden_states[: batch.processed_tokens]
+        block = _ple_conv_block_tokens()
+        if (
+            not batch.use_decode_fast_path
+            and not batch.mode.is_target_verify()
+            and batch.row_width > block
+            and not self.ple_embedding.gather_dp_tokens
+        ):
+            return self._forward_blocked(
+                hidden_states, forward_batch, batch, block, accumulate_into
+            )
         if self._prefetch_state is not None:
             embeddings = self._consume_prefetched_embeddings(forward_batch)
         else:
@@ -1255,13 +1381,217 @@ class Qwen4ExpPLELayer(nn.Module):
             forward_batch,
             batch,
         )
-        output = gated_value + conv_output
+        # gated_value is dead after this sum: fold in place, and mask in place
+        # (torch.where + zeros_like would peak at three [tokens, C] tensors).
+        output = gated_value.add_(conv_output)
         if not batch.use_decode_fast_path:
-            output = torch.where(
-                batch.valid_tokens.unsqueeze(-1),
-                output,
-                torch.zeros_like(output),
+            output.masked_fill_(~batch.valid_tokens.unsqueeze(-1), 0.0)
+        return _pad_token_rows(output, batch.physical_tokens)
+
+    def _forward_blocked(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+        block: int,
+        accumulate_into: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Whole-shell PLE pass in token blocks over a super-chunk.
+
+        The dense pass keeps ~4 CAP-sized token intermediates (embedding
+        gather, key/value projections, gated value, its norm). The shell is
+        token-parallel, so this blocks all of it: the conv reads its left
+        context from a per-row carry buffer (initialised from the pool state,
+        updated block by block) instead of a materialised [tokens, C] input.
+        Convolving carry+window reproduces the dense conv column for column,
+        so state, track snapshots and outputs match the single dense pass.
+
+        With ``accumulate_into`` the per-block result folds straight into the
+        residual stream (in place, row ranges never revisited): no CAP-sized
+        output tensor and no full-width add; returns None. Without it a fresh
+        [tokens, C] output is materialised and returned (dense semantics).
+        """
+        device = hidden_states.device
+        total = hidden_states.shape[0]
+        rows = batch.lengths.shape[0]
+        channels = self.conv_channels
+        state_len = self.short_conv_state_len
+        starts = torch.cumsum(batch.lengths, dim=0) - batch.lengths
+        state_cols = torch.arange(state_len, device=device, dtype=torch.long)
+        pool = get_req_to_token_pool()
+        conv_state = pool.short_conv_layer_cache(self.layer_id)
+        state_rows = conv_state.index_select(0, batch.state_indices).to(
+            dtype=hidden_states.dtype
+        )
+        carry = state_rows.clone()
+        weight = self.conv1d.weight.to(dtype=hidden_states.dtype)
+        positions = torch.arange(total, device=device)
+
+        if self._prefetch_state is not None:
+            # The prefetch buffer is already [tokens, ple_embed_dim]
+            # (allocate_output's shape), same as the dense forward's input.
+            embeddings = self._consume_prefetched_embeddings(forward_batch)
+            ngram_embedding = None
+        else:
+            ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+            embeddings = None
+            ngram_embedding = self.ple_embedding.ngram_embedding
+
+        track = _ple_track_targets(forward_batch, batch)
+        if track is not None:
+            # Values are buffered and committed after the working state, in
+            # the dense pass's write order (state first, track wins).
+            track_state = torch.zeros(
+                (rows, channels, state_len),
+                dtype=hidden_states.dtype,
+                device=device,
             )
+            track_ready = torch.zeros(rows, dtype=torch.bool, device=device)
+
+        if accumulate_into is not None:
+            output = accumulate_into[:total]
+            accumulating = True
+        else:
+            output = hidden_states.new_empty((total, channels))
+            accumulating = False
+
+        # Fixed-capacity conv staging, allocated once per pass: a per-block
+        # width-varying (re)allocation churns the caching allocator exactly at
+        # the memory-tight super-chunk stages (fragmented reserved-but-
+        # unusable blocks -> OOM on the next block). Every read below stays
+        # inside [0, width + state_len) of the current block's writes
+        # (causal depthwise window, carry/track gathers), so stale bytes in
+        # the reused tail can never reach an output column.
+        w_max = min(block, total)
+        seq_buf = hidden_states.new_zeros((rows, w_max, channels))
+        conv_buf = hidden_states.new_empty((rows, channels, state_len + w_max))
+
+        for lo in range(0, total, block):
+            hi = min(lo + block, total)
+            tok = slice(lo, hi)
+
+            if embeddings is not None:
+                emb = embeddings[tok]
+            else:
+                emb = (
+                    ngram_embedding(ngram_ids[tok]) * ngram_embedding.weight_scale
+                ).flatten(-2)
+            key, _ = self.key_proj(emb)
+            value, _ = self.value_proj(emb)
+
+            token_count = hi - lo
+            key = key.reshape(token_count, self.hc_count, self.hidden_size)
+            query = hidden_states[tok].reshape(
+                token_count, self.hc_count, self.hidden_size
+            )
+            key_normed = self._apply_ple_norm(self.norm_key, key)
+            query_normed = self._apply_ple_norm(self.norm_query, query)
+            gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            gate = gate / math.sqrt(self.hidden_size)
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gate = torch.sigmoid(gate)
+            gated_value = gate * value.unsqueeze(-2)
+            gated_value_normed = self._apply_ple_norm(
+                self.norm_conv, gated_value
+            ).flatten(-2)
+            gated_value = gated_value.flatten(-2)
+
+            window_lo = (lo - starts).clamp(min=0).minimum(batch.lengths)
+            window_hi = (hi - starts).clamp(min=0).minimum(batch.lengths)
+            width = int((window_hi - window_lo).max().item())
+            req_block = batch.req_indices[tok]
+            edge = starts + window_lo
+            col_block = (
+                (positions[tok] - edge.index_select(0, req_block))
+                .clamp_(min=0)
+                .clamp_(max=width - 1)
+            )
+            seq_buf[req_block, col_block] = gated_value_normed
+            conv_input = conv_buf
+            # Prefix = tokens [window_lo - S, window_lo): the carry where the
+            # local offset is inside this forward, the pool state where the
+            # request starts (same fallback as the blocked dense-input conv).
+            loc = window_lo.unsqueeze(1) - state_len + state_cols
+            from_carry = loc.view(rows, 1, state_len) >= 0
+            # carry's columns already align with state_cols (its right edge is
+            # this block's window_lo for every row it holds), so only the pool
+            # side needs a gather (it stays anchored at the request start).
+            state_side = torch.gather(
+                state_rows,
+                2,
+                (loc + state_len)
+                .clamp(min=0, max=state_len - 1)
+                .unsqueeze(1)
+                .expand(rows, channels, state_len),
+            )
+            conv_input[:, :, :state_len].copy_(
+                torch.where(from_carry, carry, state_side)
+            )
+            conv_input[:, :, state_len : state_len + width].copy_(
+                seq_buf[:, :width].transpose(1, 2)
+            )
+            del gated_value_normed
+
+            # Track commit: first block whose window right edge reaches the
+            # boundary offset; the state [off-S, off) is fully inside this
+            # block's conv_input span (its left end is window_lo - S <= off).
+            if track is not None:
+                _, track_offsets = track
+                hit = (~track_ready) & (window_hi > window_lo) & (
+                    track_offsets <= window_hi
+                )
+                if bool(hit.any()):
+                    track_state[hit] = conv_input[hit].gather(
+                        2,
+                        (track_offsets[hit] - window_lo[hit])
+                        .unsqueeze(1)
+                        .unsqueeze(-1)
+                        .expand(-1, channels, state_len)
+                        + state_cols,
+                    )
+                track_ready |= hit
+
+            conv_block = F.conv1d(
+                conv_input,
+                weight,
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=channels,
+            ).transpose(1, 2)
+            if state_len:
+                # Right edge is the ROW's window_hi, not the shared block
+                # width: rows with fewer tokens in this block must not pull
+                # the padding columns into their carry.
+                present = window_hi > window_lo
+                next_carry = torch.gather(
+                    conv_input,
+                    2,
+                    ((window_hi - window_lo).view(rows, 1, 1) + state_cols)
+                    .expand(rows, channels, state_len),
+                )
+                carry = torch.where(present.view(-1, 1, 1), next_carry, carry)
+
+            conv_out = conv_block[req_block, col_block]
+            del conv_block
+            torch.ops.aten.silu_(conv_out)
+            out_block = gated_value.add_(conv_out)
+            out_block.masked_fill_(~batch.valid_tokens[tok].unsqueeze(-1), 0.0)
+            if accumulating:
+                # Query rows were consumed above (into query_normed) and the
+                # carry path never reads hidden_states, so an in-place add on
+                # this block's rows is safe; padding rows stay as hidden+0.
+                output[tok].add_(out_block)
+            else:
+                output[tok] = out_block
+
+        conv_state[batch.state_indices] = carry.to(dtype=conv_state.dtype)
+        if track is not None:
+            # Rows never hit (zero-length rows): their boundary is the request
+            # start, i.e. exactly the pool state, as the dense pass commits.
+            track_state[~track_ready] = state_rows[~track_ready]
+            conv_state[track[0]] = track_state.to(dtype=conv_state.dtype)
+        if accumulating:
+            return None
         return _pad_token_rows(output, batch.physical_tokens)
 
 
@@ -1320,6 +1650,28 @@ class Qwen4ExpLayerExtensionMixin:
             use_combine=True,
         )
 
+    def _qwen4_hc_stream(self, rows: int, forward_batch):
+        """Static hc-stream slice ([rows, hc*hidden]) for an active super-chunk
+        forward, else None (= today's allocating path).
+
+        The buffer is model-owned, CAP-sized and allocated before the KV pool
+        profiles memory; layer-0 seeds it with the hc replication and every
+        combine writes back through it (row-local math, bit-identical).
+        Decode / CUDA capture / inactive plans never route here.
+        """
+        buf = getattr(self, "_hc_stream_buf", None)
+        if buf is None or rows == 0 or rows > buf.shape[0]:
+            return None
+        if forward_batch is None or get_is_capture_mode():
+            return None
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_token_plan,
+        )
+
+        if super_chunk_token_plan(forward_batch) is None:
+            return None
+        return buf[:rows]
+
     def _prepare_qwen4_exp_attn(
         self,
         hidden_states: torch.Tensor,
@@ -1331,9 +1683,16 @@ class Qwen4ExpLayerExtensionMixin:
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
-            hidden_states = torch.cat(
-                [hidden_states for _ in range(self.hc_count)], dim=-1
-            )
+            stream = self._qwen4_hc_stream(hidden_states.shape[0], forward_batch)
+            if stream is not None:
+                stream.unflatten(-1, (self.hc_count, self.hidden_size)).copy_(
+                    hidden_states.unsqueeze(-2)
+                )
+                hidden_states = stream
+            else:
+                hidden_states = torch.cat(
+                    [hidden_states for _ in range(self.hc_count)], dim=-1
+                )
 
         if self.ple is not None:
             if ple_batch is None:
@@ -1346,9 +1705,16 @@ class Qwen4ExpLayerExtensionMixin:
                 ple_query = (
                     hidden_states if residual is None else hidden_states + residual
                 )
-                hidden_states = hidden_states + self.ple(
-                    ple_query, forward_batch, ple_batch
+                ple_output = self.ple(
+                    ple_query,
+                    forward_batch,
+                    ple_batch,
+                    # Blocked passes fold into the residual stream directly:
+                    # no [CAP, C] output tensor and no CAP-wide add.
+                    accumulate_into=hidden_states,
                 )
+                if ple_output is not None:
+                    hidden_states = hidden_states + ple_output
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
         return hidden_states, residual
@@ -1361,7 +1727,12 @@ class Qwen4ExpLayerExtensionMixin:
     ):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+        hidden_states = self.attn_hyper_connection.combine(
+            hidden_states,
+            residual,
+            in_place=self._qwen4_hc_stream(residual[0].shape[0], forward_batch)
+            is not None,
+        )
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
@@ -1428,7 +1799,12 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        hidden_states = self.mlp_hyper_connection.combine(
+            hidden_states,
+            residual,
+            in_place=self._qwen4_hc_stream(residual[0].shape[0], forward_batch)
+            is not None,
+        )
         return hidden_states, None
 
 
@@ -1512,6 +1888,13 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         backend = get_attn_backend()
+        child_index = getattr(forward_batch, "super_chunk_child_index", None)
+        if child_index is not None:
+            # Super-chunk loop: metadata/pool bookkeeping must resolve through
+            # the sub-chunk's own backend (== today's per-chunk indexer call).
+            child_fn = getattr(backend, "super_chunk_child_backend", None)
+            if child_fn is not None:
+                backend = child_fn(child_index)
         sparse_backend = resolve_qsa_sparse_backend(backend)
         should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)
         if should_reuse is not None and should_reuse(forward_batch):
@@ -1557,6 +1940,45 @@ class Qwen4ExpAttentionDecoderLayer(
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
+        # Super-chunk forward: run qkv/gate/o_proj inside the sub-chunk loop so
+        # no [CAP, qkv] intermediate outlives its chunk (the wrapper-level loop
+        # can only slice tensors that were already projected at full size).
+        # The indexer joins the loop too (causal; its pool writes and MTP
+        # capture follow the same order as today's per-chunk forwards), so no
+        # [CAP, ...] indexer tensor outlives its chunk. Capture-mode overlap
+        # is mutually exclusive with the plan.
+        from sglang.srt.layers.attention.super_chunk_backend import (
+            super_chunk_token_plan,
+        )
+
+        plan = None if overlap_indexer else super_chunk_token_plan(forward_batch)
+        if plan is not None:
+            outs = []
+            # mrope (VL checkpoints) carries positions as [axes, tokens]; the
+            # token axis is the LAST one, not dim 0.
+            pos_is_2d = positions.ndim == 2
+            for lo, hi, child_fb in plan:
+                tok = slice(lo, hi)
+                pos_sl = (
+                    positions[:, lo:hi] if pos_is_2d else positions[tok]
+                )
+                qsa_kwargs = {}
+                if self.is_qsa:
+                    qsa_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
+                        hidden_states[tok], pos_sl, child_fb
+                    )
+                q, k, v, gate = self._prepare_qkv_gate(
+                    positions=pos_sl,
+                    hidden_states=hidden_states[tok],
+                    forward_batch=child_fb,
+                )
+                outs.append(
+                    self._attend_and_project(
+                        q, k, v, gate, child_fb, **qsa_kwargs
+                    )
+                )
+            return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
@@ -1578,6 +2000,19 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
+        return self._attend_and_project(
+            q, k, v, gate, forward_batch, **attention_kwargs
+        )
+
+    def _attend_and_project(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        **attention_kwargs,
+    ) -> torch.Tensor:
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
             if attn_output.is_cuda:
@@ -1663,6 +2098,33 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+
+        # Super-chunk forwards keep the inter-layer hc stream in ONE static
+        # CAP-sized buffer (cat-into at layer 0, in-place combines after each
+        # block_output). Allocated at model-init so the KV pool's free-memory
+        # profile already accounts for it (same placement rule as the lk_moe
+        # arena); decode / capture / non-super-chunk / oversized forwards
+        # never touch it and keep the allocating path.
+        self._hc_stream_buf = None
+        _stream_cap = get_super_chunk_size()
+        if _stream_cap > 0 and self.hc_count > 1:
+            self._hc_stream_buf = torch.empty(
+                (_stream_cap, self.hc_count * self.hidden_size),
+                dtype=torch.bfloat16,
+                device=torch.cuda.current_device(),
+            )
+            for _layer in self.layers:
+                _layer._hc_stream_buf = self._hc_stream_buf
+            # Allocated through the caching allocator before the KV pool
+            # profiles free memory, so _profile_available_bytes already
+            # charges it; log the exact figure for the pool ledger.
+            logger.info(
+                "Super-chunk hc stream: static buffer %d x %d bf16 = %.3f GB "
+                "per rank (charged to the KV pool profile at init).",
+                _stream_cap,
+                self.hc_count * self.hidden_size,
+                self._hc_stream_buf.numel() * 2 / (1 << 30),
+            )
 
     def forward(
         self,
