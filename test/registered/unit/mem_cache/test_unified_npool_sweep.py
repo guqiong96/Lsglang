@@ -50,7 +50,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # hermetic convention of the pool-geometry tests in this directory (see
 # test_multi_ended_allocator.py): no heavy sglang.test.test_utils import
 # chain, so the suite runs in a lean torch-only environment.
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
