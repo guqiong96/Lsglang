@@ -95,6 +95,7 @@ from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    get_str_env_var,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -183,11 +184,11 @@ def _lk_moe_device_reservation_gb() -> float:
             reported_gb,
         )
         return 0.0
-    gb = float(os.environ.get("LVLLM_GPU_RESERVE_GB", "0") or 0)
+    gb = float(get_str_env_var("LK_GPU_RESERVE_GB", "0") or 0)
     if gb > 0:
         logger.info(
             "Reserving %.2f GB of the KV budget for lk_moe device-side "
-            "staging (LVLLM_GPU_RESERVE_GB; no lk_moe report available).",
+            "staging (LK_GPU_RESERVE_GB; no lk_moe report available).",
             gb,
         )
     return gb

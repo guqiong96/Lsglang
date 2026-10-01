@@ -1293,6 +1293,36 @@ def set_int_env_var(name: str, value: int):
     os.environ[name] = str(value)
 
 
+# Historical LVLLM_* env names are auto-renamed to the unified LK_* names once
+# at import, so existing scripts keep working (both set -> LK_* wins).
+_LK_ENV_RENAMES = {
+    "LVLLM_MOE_NUMA_ENABLED": "LK_MOE_HYBRID_ENABLED",
+    "LVLLM_ENABLE_NUMA_INTERLEAVE": "LK_NUMA_INTERLEAVE",
+    "LVLLM_EMBEDDING_NUMA_ENABLED": "LK_EMBEDDING_NUMA",
+    "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": "LK_GPU_PREFILL_MIN_BATCH_SIZE",
+    "LVLLM_GPU_PREFETCH_WINDOW": "LK_GPU_PREFETCH_WINDOW",
+    "LVLLM_GPU_RESIDENT_MOE_LAYERS": "LK_GPU_RESIDENT_MOE_LAYERS",
+    "LVLLM_GPU_RESIDENT_MOE_LAYERS_SPEC": "LK_GPU_RESIDENT_MOE_LAYERS_SPEC",
+    "LVLLM_GPU_RESIDENT_MOE_LAYERS_MTP": "LK_GPU_RESIDENT_MOE_LAYERS_MTP",
+    "LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK": "LK_GPU_RESIDENT_MOE_LAYERS_DSPARK",
+    "LVLLM_ENABLE_MOE_LAYERWISE_LOAD": "LK_MOE_LAYERWISE_LOAD",
+    "LVLLM_GPU_RESERVE_GB": "LK_GPU_RESERVE_GB",
+}
+
+def migrate_lk_env_vars() -> None:
+    for legacy, current in _LK_ENV_RENAMES.items():
+        value = os.environ.pop(legacy, None)
+        if value is None:
+            continue
+        if current not in os.environ:
+            os.environ[current] = value
+        logger.warning(
+            "lk_moe: env %s was renamed to %s%s", legacy, current,
+            " (renamed value dropped, both were set)" if current in os.environ and os.environ[current] != value else "")
+
+migrate_lk_env_vars()
+
+
 def get_float_env_var(name: str, default: float = 0.0) -> float:
     # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)
@@ -4860,30 +4890,32 @@ def get_str_env_var(var_name: str, default: str = None) -> str:
     return os.getenv(var_name, default) 
 
 def is_lk_moe_feature_enabled() -> bool:
-    return get_bool_env_var("LVLLM_MOE_NUMA_ENABLED")
+    return get_bool_env_var("LK_MOE_HYBRID_ENABLED")
 
 def is_numa_interleave_enabled() -> bool:
-    return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
+    return get_bool_env_var("LK_NUMA_INTERLEAVE")
  
 # Whether to keep the (very large) n-gram embedding table resident on CPU /
 # NUMA host memory and gather it via lk_moe, instead of VRAM. Defaults to the
 # original GPU-resident behavior.
 def is_lk_embedding_cpu_enabled() -> bool:
-    return get_bool_env_var("LVLLM_EMBEDDING_NUMA_ENABLED")
+    return get_bool_env_var("LK_EMBEDDING_NUMA")
 
 def is_lk_moe_use_gpu_prefill() -> bool:
-    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
+    return get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE") > 0
 
 def get_super_chunk_size() -> int:
+    if not is_lk_moe_use_gpu_prefill():
+        return 0
     return get_int_env_var("LK_GPU_PREFILL_SUB_M")
 
 def disable_lk_moe_gpu_prefill() -> int:
-    origin_value = get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE")
-    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", 0)
+    origin_value = get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE")
+    set_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE", 0)
     return origin_value
 
 def enable_lk_moe_gpu_prefill(value: int) -> int:
-    set_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", value)
+    set_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE", value)
     return value
 
 _is_in_profile_run = True
@@ -4896,11 +4928,11 @@ def set_profile_run(status: bool):
     _is_in_profile_run = status
 
 def get_gpu_prefill_min_batch_size() -> int:
-    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") 
+    return get_int_env_var("LK_GPU_PREFILL_MIN_BATCH_SIZE")
 
 
 def get_gpu_prefetch_window() -> int:
-    return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
+    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
 
 
 def get_model_type_from_layer_name(layer_name: str) -> str:
@@ -4915,15 +4947,20 @@ def get_model_type_from_layer_name(layer_name: str) -> str:
 
 def get_gpu_resident_env_var(model_type: str = "main") -> Optional[str]:
     if model_type in ("dspark", "mtp"):
-        env_value = get_str_env_var(
-            f"LVLLM_GPU_RESIDENT_MOE_LAYERS_{model_type.upper()}", None
-        )
+        env_value = get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS_SPEC", None)
         if env_value is not None:
             return env_value
-        
-        return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
-    
-    return get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+
+        role_env = (
+            "LK_GPU_RESIDENT_MOE_LAYERS_MTP"
+            if model_type == "mtp"
+            else "LK_GPU_RESIDENT_MOE_LAYERS_DSPARK"
+        )
+        env_value = get_str_env_var(role_env, None)
+        if env_value is not None:
+            return env_value
+
+    return get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS", None)
 
 def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> bool:
     if not is_lk_moe_feature_enabled():
@@ -4956,6 +4993,44 @@ def is_lk_moe_gpu_resident_layer(layer_id: str, model_type: str = "main") -> boo
      
     return layer_id in disabled_layers
 
+def get_lk_pool_layer_set() -> Optional[set]:
+    # Same grammar as the resident-layer env; None (unset) = all non-resident
+    # layers get a pool. The engine never reads this env: membership lands on
+    # MOEConfigV2.gpu_pool at construction time.
+    layers_env = get_str_env_var("LK_POOL_LAYERS", None)
+    if not layers_env:
+        return None
+
+    pool_layers = set()
+    for part in layers_env.strip().split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                start, end = map(int, part.split('-'))
+                if start <= end:
+                    pool_layers.update(range(start, end + 1))
+            except ValueError:
+                continue
+        else:
+            try:
+                pool_layers.add(int(part))
+            except ValueError:
+                continue
+    return pool_layers
+
+def is_lk_pool_layer(layer_id: str, model_type: str = "main") -> bool:
+    if model_type != "main":
+        return False
+    if is_lk_moe_gpu_resident_layer(layer_id, model_type):
+        return False
+    pool_layers = get_lk_pool_layer_set()
+    return pool_layers is None or layer_id in pool_layers
+
+def lk_route_probe_enabled() -> bool:
+    return os.environ.get("LK_ROUTE_PROBE") is not None
+
 def enabled_layerwise_load() -> bool:
-    return get_bool_env_var("LVLLM_ENABLE_MOE_LAYERWISE_LOAD")
+    return get_bool_env_var("LK_MOE_LAYERWISE_LOAD")
 

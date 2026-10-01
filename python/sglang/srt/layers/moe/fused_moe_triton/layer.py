@@ -106,18 +106,23 @@ logger = logging.getLogger(__name__)
 
 import threading
 from sglang.srt.utils.common import is_pin_memory_available
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, get_model_type_from_layer_name
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, get_model_type_from_layer_name, is_lk_pool_layer, lk_route_probe_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
-    import  lk_moe    
+    import lk_moe
+    import triton
+    from lk_moe._hybrid_gemv_kernel import (
+        gather_rows, slot_table_fill, moe_gateup, reduce_gate, moe_down, reduce_down)
 else:
-    logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
+    logger.error("Failed to import lk_moe module or LK_MOE_HYBRID_ENABLED is not set to 1, lk::MOE implementation will not be available")
     
 # Log the deferred-finalize config at most once per process (rank). Different MoE
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
 _deferred_finalize_info_logged = False
+
+LK_POOL_MAX_TOKENS = 2
 
 
 def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
@@ -515,6 +520,7 @@ class FusedMoE(torch.nn.Module):
         self.gpu_prefetch_window = get_gpu_prefetch_window()
         self.lk_moe = None
         self.lk_moe_config = None 
+        self._pool_gpu = None
         self.model_type = get_model_type_from_layer_name(self.layer_name)
 
         self.use_gpu_prefill = is_lk_moe_use_gpu_prefill()
@@ -1976,6 +1982,13 @@ class FusedMoE(torch.nn.Module):
         if self.moe_ep_size > 1:
             return self.moe_ep_size, self.moe_ep_rank, torch.cuda.current_device()
         return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
+
+    def _set_pool_identity(self, cfg):
+        # Pool membership (draft role, GPU-resident, LK_POOL_LAYERS) collapses
+        # into one predicate here; the engine only ever sees cfg.gpu_pool.
+        cfg.layer_id = self.layer_id
+        cfg.route_probe = lk_route_probe_enabled()
+        cfg.gpu_pool = is_lk_pool_layer(self.layer_id, self.model_type)
                 
     def _get_quant_params(self, w13_weight, w13_weight_scale, w2_weight, w2_weight_scale, pack_ratio):
         unpack_factor = 1 if pack_ratio == 1 else 2  # FP8=1, 4bit=2
@@ -2021,6 +2034,7 @@ class FusedMoE(torch.nn.Module):
         
         # V2: MOEConfigV2 + MOE_WNA16
         self.lk_moe_config = lk_moe.MOEConfigV2()
+        self._set_pool_identity(self.lk_moe_config)
         self.lk_moe_config.num_processes = num_processes
         self.lk_moe_config.process_id = process_id
         self.lk_moe_config.gpu_id = gpu_id
@@ -2101,6 +2115,7 @@ class FusedMoE(torch.nn.Module):
 
         # V2: MOEConfigV2 + MOE_FP8
         self.lk_moe_config = lk_moe.MOEConfigV2()
+        self._set_pool_identity(self.lk_moe_config)
         self.lk_moe_config.num_processes = num_processes
         self.lk_moe_config.process_id = process_id
         self.lk_moe_config.gpu_id = gpu_id
@@ -2154,6 +2169,7 @@ class FusedMoE(torch.nn.Module):
         num_processes, process_id, gpu_id = self._get_processes_info()
         
         self.lk_moe_config = lk_moe.MOEConfigV2()
+        self._set_pool_identity(self.lk_moe_config)
         self.lk_moe_config.num_processes = num_processes
         self.lk_moe_config.process_id = process_id
         self.lk_moe_config.gpu_id = gpu_id
@@ -2224,6 +2240,7 @@ class FusedMoE(torch.nn.Module):
         num_processes, process_id, gpu_id = self._get_processes_info()
          
         self.lk_moe_config = lk_moe.MOEConfigV2()
+        self._set_pool_identity(self.lk_moe_config)
         self.lk_moe_config.num_processes = num_processes
         self.lk_moe_config.process_id = process_id
         self.lk_moe_config.gpu_id = gpu_id
@@ -2284,6 +2301,7 @@ class FusedMoE(torch.nn.Module):
 
         # V2: MOEConfigV2 + MOE_MXFP4
         self.lk_moe_config = lk_moe.MOEConfigV2()
+        self._set_pool_identity(self.lk_moe_config)
         self.lk_moe_config.num_processes = num_processes
         self.lk_moe_config.process_id = process_id
         self.lk_moe_config.gpu_id = gpu_id
@@ -2353,19 +2371,158 @@ class FusedMoE(torch.nn.Module):
                 dtype=torch.float32,
                 requires_grad=False
             ).contiguous()
+
+        self._init_pool_gpu_half()
+
+    def _init_pool_gpu_half(self):
+        self._pool_gpu = None
+        self.lk_moe.pool_gpu_report(False)
+        info = self.lk_moe.pool_layer_info()
+        caps = info.get("kernel_caps") if info else None
+        if not caps or info.get("gpu_view_ok", 0) != 1:
+            return
+        gds = self.lk_moe.pool_gds()
+        if not gds.get("gpu_half_on", 0):
+            return
+        cfg = self.lk_moe.cfg
+        H, I, k = cfg.hidden_size, cfg.intermediate_size, cfg.top_k
+        SB = caps["stride_n"]
+        PK = caps["packed_k_per_iter"]
+        ITERS = 16
+        NB_GATEUP, NB_DOWN = I // SB, H // SB
+        total_iters = (H // PK) // ITERS
+        NGK = next(cand for cand in (16, 8, 4, 2, 1)
+                   if total_iters % cand == 0
+                   and k * NB_GATEUP * cand <= 2048)
+        KS = total_iters // NGK
+        rows = LK_POOL_MAX_TOKENS * k
+        dev = torch.cuda.current_device()
+        if not hasattr(FusedMoE, "pool_hbuf"):
+            FusedMoE.pool_hbuf = torch.zeros((rows, 2 * I), dtype=torch.float32, device=dev)
+            FusedMoE.pool_gout = torch.zeros((LK_POOL_MAX_TOKENS, H), dtype=torch.float32, device=dev)
+            FusedMoE.pool_slot_tab = torch.full((rows,), -1, dtype=torch.int32, device=dev)
+            FusedMoE.pool_gathered_ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
+            FusedMoE.pool_gathered_weights = torch.zeros((rows,), dtype=torch.float32, device=dev)
+            FusedMoE.pool_stream = torch.cuda.Stream()
+        if (not hasattr(FusedMoE, "pool_hpart")
+                or FusedMoE.pool_hpart.shape != (NGK, rows, 2 * I)):
+            FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
+            FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
+        self._pool_gpu = dict(
+            snapshot_addr=info["snapshot_addr"],
+            weight_addr=info["weight_addr"], scale_addr=info["scale_addr"],
+            slot_bytes=info["slot_weight_bytes"],
+            slot_scale_bytes=info["slot_scale_bytes"],
+            gateup_gds=gds["gateup_global_scale_addr"],
+            down_gds=gds["down_global_scale_addr"],
+            H=H, I=I, k=k, NB_GATEUP=NB_GATEUP, NB_DOWN=NB_DOWN,
+            NGK=NGK, KS=KS, ITERS=ITERS, **caps,
+        )
+        self.lk_moe.pool_gpu_report(True)
+
+    def _pool_gpu_launch(self, hidden_states, topk_ids, topk_weights,
+                         real_tokens=None, rows_per_token=1):
+        geo = self._pool_gpu
+        H, I, k = geo["H"], geo["I"], geo["k"]
+        SG, SGB, PK = geo["scale_group"], geo["scale_groups_blk"], geo["packed_k_per_iter"]
+        real_tokens = hidden_states.size(0) if real_tokens is None else real_tokens
+        n_slots = real_tokens * k
+        hpart, hbuf, gout = FusedMoE.pool_hpart, FusedMoE.pool_hbuf, FusedMoE.pool_gout
+        gout_part = FusedMoE.pool_gout_part
+        slot_tab = FusedMoE.pool_slot_tab
+        side_stream = FusedMoE.pool_stream
+        if rows_per_token > 1:
+            gathered_ids = FusedMoE.pool_gathered_ids[:n_slots]
+            gathered_weights = FusedMoE.pool_gathered_weights[:n_slots]
+        else:
+            gathered_ids, gathered_weights = topk_ids, topk_weights
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            if rows_per_token > 1:
+                gather_rows[(triton.cdiv(n_slots, 128),)](
+                    topk_ids, topk_weights, gathered_ids, gathered_weights,
+                    k, rows_per_token, n_slots,
+                    BLOCK=triton.next_power_of_2(n_slots))
+            # ONE volatile gather of the mapped snapshot into a device table:
+            # per-program host reads (k*NB_GATEUP*NGK PCIe round-trips/layer, queued
+            # behind the pump's H2D) were the whole speed regression.
+            slot_table_fill[(1,)](
+                gathered_ids, geo["snapshot_addr"], slot_tab, n_slots,
+                BLOCK=triton.next_power_of_2(n_slots))
+            gout_part.zero_()
+            moe_gateup[(n_slots, geo["NB_GATEUP"], geo["NGK"])](
+                gathered_ids, slot_tab,
+                geo["weight_addr"][0], geo["scale_addr"][0],
+                geo["weight_addr"][1], geo["scale_addr"][1], geo["gateup_gds"],
+                hpart, hidden_states, n_slots, k, rows_per_token,
+                GDS_COLS=2 if geo["has_gate"] else 1,
+                NCOL=I, K_PER_BLOCK=H // PK, SCALE_GROUPS_BLK=H // SGB,
+                SLOT_BYTES=geo["slot_bytes"][0],
+                SLOT_SCALE_BYTES=geo["slot_scale_bytes"][0],
+                HIDDEN=H, ITERS=geo["ITERS"], SCALE_GROUP=SG,
+                FORMAT=geo["format"], FORMAT_PACKED_K=PK,
+                HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
+                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
+                KS=geo["KS"], NGK=geo["NGK"])
+            reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
+                hpart, hbuf, n_slots * 2 * I, NGK=geo["NGK"], BLOCK=1024)
+            moe_down[(n_slots, geo["NB_DOWN"])](
+                gathered_ids, slot_tab, gathered_weights,
+                geo["weight_addr"][2], geo["scale_addr"][2], geo["down_gds"],
+                hbuf, gout_part, n_slots,
+                NCOL=H, N_PARTIAL=I, K_PER_BLOCK=I // PK,
+                SCALE_GROUPS_BLK=I // SGB,
+                SLOT_BYTES=geo["slot_bytes"][2],
+                SLOT_SCALE_BYTES=geo["slot_scale_bytes"][2],
+                ITERS=geo["ITERS"], SCALE_GROUP=SG,
+                FORMAT=geo["format"], FORMAT_PACKED_K=PK,
+                HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
+                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"])
+            reduce_down[(triton.cdiv(H, 1024),)](
+                gout_part, gout[:real_tokens], slot_tab, HIDDEN=H,
+                SLOTS_PER_TOKEN=k, BATCH=real_tokens, BLOCK=1024,
+                RESIDENT_ONLY=1)
+
     
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
+        bs = hidden_states.size(0)
+
+        draft_tokens = getattr(self, "speculative_num_draft_tokens", 1) or 1
+        rows_per_token = draft_tokens if (
+            draft_tokens > 1 and bs > LK_POOL_MAX_TOKENS and bs % draft_tokens == 0
+            and bs // draft_tokens <= LK_POOL_MAX_TOKENS) else 1
+        real_tokens = bs // rows_per_token
+
+        covered = self._pool_gpu is not None and real_tokens <= LK_POOL_MAX_TOKENS
+ 
+        if covered:
+            self._pool_gpu_launch(hidden_states, topk_ids, topk_weights,
+                                  real_tokens=real_tokens,
+                                  rows_per_token=rows_per_token)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self.lk_moe.cpu_decode(
             stream_ptr,
-            hidden_states.size(0),
+            bs,
             self.top_k,
             hidden_states.data_ptr(),
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
-            FusedMoE.output_gpu.data_ptr()
+            FusedMoE.output_gpu.data_ptr(),
+            real_tokens=real_tokens,
+            rows_per_token=rows_per_token,
         )
-        
+
+        if covered:
+            torch.cuda.current_stream().wait_stream(FusedMoE.pool_stream)
+            if rows_per_token == 1:
+                FusedMoE.output_gpu[:real_tokens].add_(
+                    FusedMoE.pool_gout[:real_tokens])
+            else:
+                for tok in range(real_tokens):
+                    real_row = tok * rows_per_token
+                    FusedMoE.output_gpu[real_row:real_row + 1].add_(
+                        FusedMoE.pool_gout[tok:tok + 1])
+
         output = FusedMoE.output_gpu[:hidden_states.size(0)]
         if self.check_nan_in_output:
             torch.nan_to_num(output, nan=0.0, out=output)
@@ -2373,6 +2530,21 @@ class FusedMoE(torch.nn.Module):
  
 
     def _cpu_prefill(self, hidden_states, topk_weights, topk_ids): 
+        # Split prefill: GPU group-GEMM half covers the pool-resident slots on
+        # a side stream while the CPU half skips exactly those (same frozen
+        # snapshot on both sides; no arming of the decode half). See
+        # lk_moe/pool_prefill_half.py.
+        half = self._pool_prefill_half()
+        gpu_part = None
+        gpu_ev = None
+        if half is not None:
+            try:
+                r = half.launch(hidden_states, topk_ids, topk_weights)
+                if r is not None:
+                    gpu_ev, gpu_part = r
+            except Exception:
+                gpu_part = None
+        pool_skip = gpu_part is not None
          
         expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', non_blocking=True)
         weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', non_blocking=True)
@@ -2389,14 +2561,34 @@ class FusedMoE(torch.nn.Module):
             weights_cpu.data_ptr(),
             hidden_states_cpu.data_ptr(),
             output_cpu.data_ptr(),
+            pool_skip,
         )
              
-        output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
+        if pool_skip:
+            current_stream.wait_event(gpu_ev)
+            output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=torch.float32, non_blocking=True)
+            output_gpu += gpu_part
+            output_gpu = output_gpu.to(hidden_states.dtype)
+        else:
+            output_gpu = output_cpu.to(torch.cuda.current_device(), dtype=hidden_states.dtype, non_blocking=True) 
         
         if self.check_nan_in_output:
             torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
         
         return output_gpu
+
+    def _pool_prefill_half(self):
+        cached = getattr(self, "_pool_half", False)
+        if cached is not False:
+            return cached
+        if self.lk_moe is None:
+            return None
+        try:
+            from lk_moe.pool_prefill_half import PoolPrefillHalf
+            self._pool_half = PoolPrefillHalf.probe(self.lk_moe)
+        except Exception:
+            self._pool_half = None
+        return self._pool_half
 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
         output = torch.empty_like(hidden_states)

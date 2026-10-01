@@ -37,6 +37,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import is_lk_moe_feature_enabled
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -45,6 +46,20 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+
+@contextmanager
+def _park_expert_pool():
+    if not is_lk_moe_feature_enabled():
+        yield
+        return
+    import lk_moe
+
+    lk_moe.pool_capture_pause()
+    try:
+        yield
+    finally:
+        lk_moe.pool_capture_resume()
 
 
 def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
@@ -172,6 +187,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with (
+            _park_expert_pool(),
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
