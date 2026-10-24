@@ -33,7 +33,7 @@ LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_POOL_SLOTS=16 \
 FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-/home/guqiong/.conda/envs/Lsglang/bin/python /home/guqiong/Downloads/sglang/python/sglang/launch_server.py \
+/home/guqiong/.conda/envs/Lsglang/bin/python /home/guqiong/Downloads/sglang/python/sglang/launch_server.py --sleep-on-idle \
   --model ~/Models/GLM-5.3-Flash-NVFP4 \
   --served-model-name GLM-5.3-Flash-NVFP4 \
   --host 0.0.0.0 \

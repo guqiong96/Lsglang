@@ -29,7 +29,7 @@ LK_GPU_PREFILL_SUB_M=65536 \
 LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LK_POOL_SLOTS=128 \
-sglang serve \
+sglang serve --sleep-on-idle \
     --model ~/Models/Qwen3.6-35B-A3B-NVFP4 \
     --served-model-name Qwen3.6-35B-A3B-NVFP4 \
     --host 0.0.0.0 \

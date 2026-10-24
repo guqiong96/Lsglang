@@ -33,7 +33,7 @@ LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
 LK_POOL_SLOTS=48 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-sglang serve \
+sglang serve --sleep-on-idle \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4 \
   --host 0.0.0.0 \

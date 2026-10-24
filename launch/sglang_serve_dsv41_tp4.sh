@@ -38,7 +38,7 @@ SGLANG_SM8X_MARLIN_GROUP32=1 \
 SGLANG_SM8X_MARLIN_GROUP32_ONLY=1 \
 FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-sglang serve \
+sglang serve --sleep-on-idle \
   --model ~/Models/DeepSeek-V4.1-Flash-1017 \
   --served-model-name DeepSeek-V4.1-Flash-1017 \
   --host 0.0.0.0 \

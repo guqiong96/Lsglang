@@ -36,7 +36,7 @@ LK_POOL_SLOTS=96 \
 LK_POOL_LOG=0 \
 FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-/home/guqiong/.conda/envs/Lsglang/bin/sglang serve \
+/home/guqiong/.conda/envs/Lsglang/bin/sglang serve --sleep-on-idle \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4 \
   --host 0.0.0.0 \
