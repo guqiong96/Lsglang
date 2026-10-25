@@ -169,22 +169,76 @@ def _cuda_host_register(
         chunk_bytes = (
             chunk_limit_bytes // registration_granularity_bytes
         ) * registration_granularity_bytes
+    # A single cudaHostRegister call above ~2 GiB returns EINVAL on the 595.x
+    # driver (dmesg: "Cannot map memory with base addr ... and size of ...
+    # pages"), and the default chunk limit is far above that, so the legacy
+    # single-call path could never pin a multi-GiB host pool.  Consecutive
+    # chunks stay byte-contiguous, so a transfer spanning a boundary is still
+    # entirely pinned.
+    pin_one_call_max = 1 << 30
+    if chunk_bytes > pin_one_call_max:
+        if registration_granularity_bytes:
+            aligned = (
+                pin_one_call_max // registration_granularity_bytes
+            ) * registration_granularity_bytes
+            chunk_bytes = aligned if aligned > 0 else pin_one_call_max
+        else:
+            chunk_bytes = pin_one_call_max
     registered_ranges: list[tuple[int, int]] = []
-    try:
-        offset = 0
-        while offset < total:
-            size = min(chunk_bytes, total - offset)
-            ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
-            if rc != 0:
-                raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
-                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
-                    f"pinned and device transfers may silently return stale data."
-                )
+
+    def register_range(ptr: int, size: int, depth: int = 0) -> None:
+        """Register [ptr, ptr+size), halving on EINVAL.
+
+        The driver refuses some registrations that are valid in isolation when
+        they run in a process that already pinned other pools; halving isolates
+        whether a size or an address is the problem, and succeeds where the
+        large call does not.
+        """
+        rc = int(cudart.cudaHostRegister(ptr, size, 0))
+        if rc == 0:
             registered_ranges.append((ptr, size))
-            offset += size
+            return
+        # Keep every split on the caller's copy granularity: a direct-IO batch
+        # copy must not span two registrations, so halves are whole multiples of
+        # the same unit the pool was laid out in.
+        gran = registration_granularity_bytes or (64 << 20)
+        minimum = max(64 << 20, gran)
+        if size <= minimum or depth >= 8:
+            try:
+                detail = cudart.cudaGetErrorString(rc)
+            except Exception:
+                detail = f"error {rc}"
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={rc}, {detail}) at "
+                f"ptr%4096={(ptr % 4096)} size={size} (total={total}, "
+                f"chunk_limit={chunk_bytes}); host buffer is not pinned and "
+                f"device transfers may silently return stale data."
+            )
+        half = ((size // 2) // gran) * gran
+        if half <= 0:
+            half = min(size // 2, gran)
+        if os.environ.get("SGLANG_PIN_DEBUG") == "1":
+            logger.warning(
+                "cudaHostRegister(0x%x, %d) rc=%d; splitting into %d + %d (gran=%d)",
+                ptr, size, rc, half, size - half, gran,
+            )
+        register_range(ptr, half, depth + 1)
+        register_range(ptr + half, size - half, depth + 1)
+
+    try:
+        # Single-call pin first (the framework's original behaviour): a fixed
+        # kernel (6.13+) accepts the whole pool in one cudaHostRegister even
+        # above 2 GiB.  The chunked path below only runs when the driver says
+        # no, so on a fixed host this is exactly upstream's code path.
+        single_rc = int(cudart.cudaHostRegister(base, total, 0))
+        if single_rc == 0:
+            registered_ranges.append((base, total))
+        else:
+            offset = 0
+            while offset < total:
+                size = min(chunk_bytes, total - offset)
+                register_range(base + offset, size)
+                offset += size
 
         # Keep the exact registration bases alive with the tensor. CUDA requires
         # cudaHostUnregister to receive each base pointer, not just the tensor's
