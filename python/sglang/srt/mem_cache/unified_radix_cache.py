@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from array import array
@@ -153,6 +154,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# Diagnostic only: log every tree match/insert so a "no prefix hit" report can be
+# traced to the cache instead of guessed at.  Off unless SGLANG_RADIX_DEBUG=1.
+_RADIX_DEBUG = os.environ.get("SGLANG_RADIX_DEBUG") == "1"
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -618,6 +623,24 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if _RADIX_DEBUG:
+            stats = self._prefetch_outcome_stats
+            logger.info(
+                "RADIXDBG match disable=%s key_len=%d full_hit=%s swa_host_hit=%s "
+                "host_hit=%s pf(attempts=%s issued=%s too_short=%s dev_covered=%s "
+                "l3_demand=%s l3_miss_tok=%s)",
+                self.disable,
+                len(params.key),
+                getattr(result, "full_kv_hit_length", None),
+                getattr(result, "swa_host_hit_length", None),
+                getattr(result, "host_hit_length", None),
+                stats.get("attempts"),
+                stats.get("issued"),
+                stats.get("declined_too_short"),
+                stats.get("declined_device_covered"),
+                stats.get("l3_demand_requests"),
+                stats.get("l3_miss_tokens"),
+            )
         return result
 
     def supports_fast_match_prefix(self) -> bool:
@@ -652,6 +675,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if _RADIX_DEBUG:
+                        logger.info(
+                            "RADIXDBG insert key_len=%d prefix_len=%s",
+                            len(params.key),
+                            getattr(step.result, "prefix_len", None),
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
