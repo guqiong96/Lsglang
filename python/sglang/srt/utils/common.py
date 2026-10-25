@@ -1119,7 +1119,14 @@ def get_device_memory_capacity(device: str = None):
     return gpu_mem
 
 
-def get_device_name(device_id: int = 0) -> str:
+def get_device_name(device_id: Optional[int] = None) -> str:
+    """Return the device name, matching the torch APIs: ``None`` resolves to the
+    *current* device, so a bare call from a TP rank process answers for its own
+    GPU.  The previous default of ``0`` made every bare caller key its tuning
+    tables on the first GPU, which is wrong in a heterogeneous TP group and
+    silently so (a table miss just falls back to default configs).  Code that
+    really means GPU 0 must pass ``0`` explicitly.
+    """
     if hasattr(torch, "mps") and torch.mps.is_available():
         return torch.backends.mps.get_name()
 
