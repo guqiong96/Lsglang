@@ -2398,11 +2398,13 @@ class FusedMoE(torch.nn.Module):
   
     def _initialize_cuda_graph_buffers(self): 
         if not hasattr(FusedMoE, 'cuda_graphs'):
-            max_batch_size = self.max_num_seqs
+            # Decode rows, not a token batch: self.max_num_seqs is max_running_requests
+            # (times 1+draft with speculative decoding), see _get_max_num_seqs().
+            decode_batch_size = self.max_num_seqs
             current_device = torch.cuda.current_device()
              
             FusedMoE.output_gpu = torch.zeros(
-                (max_batch_size, self.hidden_size),
+                (decode_batch_size, self.hidden_size),
                 device=current_device,
                 dtype=torch.float32,
                 requires_grad=False
