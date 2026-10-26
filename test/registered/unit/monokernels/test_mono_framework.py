@@ -39,7 +39,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=11, stage="base-a", runner_config="cpu")
 
 ARCH = "FakeMonoForCausalLM"
 BACKEND = "fake"

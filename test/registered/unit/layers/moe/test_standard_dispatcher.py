@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_dispatch_preserves_negative_routing_sentinel():

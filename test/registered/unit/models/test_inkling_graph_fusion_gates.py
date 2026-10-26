@@ -12,7 +12,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_s
 from sglang.srt.models.inkling_common.kernels import comm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize("scope", ["eager", "breakable", "full", "decode_breakable"])
