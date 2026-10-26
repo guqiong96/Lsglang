@@ -1,3 +1,54 @@
+# lsglang v1.6.6 — Host Pins Fall Back, They No Longer Fail
+
+**Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.4**.
+
+## What Changed
+
+- **Every host-memory pin can now fall back instead of failing** (PR #30):
+  the engram host table and the HiCache host KV pools register their NUMA
+  arenas with one `cudaHostRegister` call where the kernel allows it, and
+  granule- / aligned-chunk-sized registration takes over where it does not
+  (pre-6.13 kernels, `expandable_segments` setups). A pin that cannot be
+  established says so on one line instead of dying or running silently
+  unpinned. lk_moe v2.7.4 carries the same rule in its C++ helper.
+- **`get_device_name()` answers for the current device** when called without
+  an index; the three-key discipline (locate by id, gate by cap, look the
+  name up in a table) is now enforced at every call site that used to guess
+  from a name string.
+- **Group configs gather over the CPU (gloo) group**, so heterogeneous-rank
+  launches cannot wedge the CUDA collective during init.
+- **The HiCache storage hash JIT finds conda's openssl** instead of the
+  system libcrypto.
+- **All serve scripts pass `--sleep-on-idle`**: idle schedulers park.
+- **`--disable-custom-all-reduce` retires from the 3090 TP2 serve scripts**:
+  custom allreduce ran clean on the production box (2000+ decode steps over
+  several windows, plus a 49K-token dspark prefill with it on).
+- **The 5060Ti and 0731-dspark scripts carry the measured boot shapes**:
+  5060Ti qwen38 at frac 0.88 / KV 65536; 0731 dspark at super-chunk 16384
+  (8192 starved prefill staging on this box) / KV 262144.
+- Optional **radix tracing of host hits and storage-prefetch outcomes** for
+  cache debugging (log-only, default off).
+- lk_moe v2.7.4 companion: `frozen_chunk` thaws every pool it froze when a
+  mid-freeze error fires (the partial-freeze leak the teardown-deadlock
+  audit convicted), plus a faster MXFP4 gemv (fp16-LUT decode, e8m0 folded
+  into A) -- +32-36% in the kernel microbenchmark; the end-to-end decode
+  gain measured on production shapes is well short of that.
+
+## Verified
+
+- 8070 production (2x3090, qwen3.8): zero pin WARN lines at boot = every
+  one-shot register succeeded on this box; 2000+ decode steps, zero hangs.
+- Fallback ceiling measured with `LK_PIN_FORCE_FAIL=1`: 6.5k-token prefill
+  8.48 s -> 9.62 s (-13.5%) is what granule-first costs when it fires.
+- PR #30 chain merged with the author's attribution and ran clean on the
+  3090 dsv4.1 NVMe production box.
+- 49K-token dspark prefill with superchunk loops (this tree, 3090):
+  `wrapper active` + LOOP lines present, no stall, custom allreduce on.
+
+## Commits
+
+Everything added since v1.6.5: `git log --oneline lsglang-v1.6.5..HEAD`.
+
 # lsglang v1.6.5 — The NVMe Engram Can No Longer Fail Silently
 
 **Base:** upstream sglang main @ `06342acad2`; **lk_moe v2.7.3**.
