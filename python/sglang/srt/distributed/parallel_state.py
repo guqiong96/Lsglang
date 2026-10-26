@@ -3036,8 +3036,11 @@ def create_custom_parallel_group(
 
     if not (_is_npu and is_standard_partition):
         # General path: collect every rank's group via all_gather_object.
-        gathered_configs = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(gathered_configs, local_config)
+        # Route the object collective over the world CPU (gloo) group: the
+        # default group is NCCL, which needs a CUDA tensor for this and dies
+        # with "CUDA error: invalid argument" on hosts where the cache builder
+        # calls it while the GPU context is busy pinning host pools.
+        gathered_configs = get_world_group().all_gather_object(local_config)
     else:
         # NPU fast path: all_gather_object on the default HCCL PG allocates
         # an HCCL buffer; instead derive the standard TP/DP groups locally.

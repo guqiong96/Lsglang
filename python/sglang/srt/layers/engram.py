@@ -606,6 +606,12 @@ def _drop_page_cache_once(reason: str) -> None:
     )
 
 
+# cudaHostRegister granularity for the host table: a single call above ~2 GiB
+# fails with EINVAL on the 595.x driver (kernel log: "Cannot map memory with
+# base addr ... and size of ... pages"), so the pin is applied in 1 GiB steps.
+_PIN_GRANULE = 1 << 30
+
+
 @functools.cache
 def _hip_runtime() -> ctypes.CDLL:
     """
@@ -695,7 +701,16 @@ class _HostTable:
         self.registered = False
 
     def _register(self) -> None:
-        """cudaHostRegister once, after the pages are in their final shape."""
+        """Pin the table once, after the pages are in their final shape.
+
+        The pin is applied in page-aligned granules: a single
+        ``cudaHostRegister`` above ~2 GiB returns EINVAL on the 595.x driver
+        (the kernel log shows the whole range failing to map: "Cannot map
+        memory with base addr ... and size of ... pages"), while 1-2 GiB calls
+        succeed.  UVA keeps the kernel-visible device address equal to the host
+        address on CUDA, so chunking is invisible to the gather kernels; HIP
+        still resolves the base pointer once, after every granule is pinned.
+        """
         if self.registered:
             return
         if not envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get():
@@ -703,13 +718,32 @@ class _HostTable:
             # row; skip the multi-minute GUP pin at startup with
             # SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN=0.
             return
-        err = torch.cuda.cudart().cudaHostRegister(
-            self.bytes.data_ptr(), self.nbytes, 0
-        )
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
+        cudart = torch.cuda.cudart()
+        base = self.bytes.data_ptr()
+        total = self.nbytes
+        # Single-call pin first: that is what the framework originally did and
+        # what a fixed kernel (6.13+, mm/gup FOLL_LONGTERM) supports even for a
+        # ~94 GiB shard.  Only a driver that rejects the large call falls back
+        # to the page-aligned granule path below.
+        if int(cudart.cudaHostRegister(base, total, 0)) == 0:
+            self.registered = True
+            self.device_ptr = _registered_device_ptr(base)
+            return
+        granule = min(_PIN_GRANULE, total)
+        off = 0
+        while off < total:
+            size = min(granule, total - off)
+            err = int(cudart.cudaHostRegister(base + off, size, 0))
+            if err != 0:
+                for done in range(0, off, granule):
+                    cudart.cudaHostUnregister(base + done)
+                raise RuntimeError(
+                    f"cudaHostRegister({size} bytes at +{off}) failed: {err} "
+                    f"(table {total} bytes)"
+                )
+            off += size
         self.registered = True
-        self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+        self.device_ptr = _registered_device_ptr(base)
 
     @staticmethod
     def _memfd(name: str) -> int:

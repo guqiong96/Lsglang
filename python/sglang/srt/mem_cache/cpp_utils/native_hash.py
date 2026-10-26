@@ -17,6 +17,37 @@ def _cpu_supports_avx2() -> bool:
 
 
 @lru_cache(maxsize=1)
+def _openssl_build_dirs() -> tuple[list, list]:
+    """Include/lib dirs of the running conda env that carry openssl.
+
+    The extension includes <openssl/sha.h> and links -lcrypto.  In a conda env
+    both live under the prefix, which is not on the compiler's default search
+    path, so the build failed and every L3 storage lookup raised instead of
+    hitting (writes still landed on disk, reads always missed).  Point cc/ld at
+    the prefix(es) that actually have the headers/library.
+    """
+    inc_dirs, lib_dirs = [], []
+    prefixes = []
+    for attr in ("prefix", "base_prefix"):
+        prefix = getattr(sys, attr, None)
+        if prefix:
+            prefixes.append(prefix)
+    conda = os.environ.get("CONDA_PREFIX")
+    if conda:
+        prefixes.append(conda)
+    for prefix in prefixes:
+        inc = os.path.join(prefix, "include")
+        if os.path.isdir(os.path.join(inc, "openssl")):
+            inc_dirs.append(inc)
+        lib = os.path.join(prefix, "lib")
+        if os.path.isdir(lib) and any(
+            name.startswith("libcrypto") for name in os.listdir(lib)
+        ):
+            lib_dirs.append(lib)
+    return inc_dirs, lib_dirs
+
+
+@lru_cache(maxsize=1)
 def _load_native_hash_module() -> Any:
     if sys.byteorder != "little" or not sys.platform.startswith("linux"):
         raise RuntimeError(
@@ -32,11 +63,14 @@ def _load_native_hash_module() -> Any:
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
+        inc_dirs, lib_dirs = _openssl_build_dirs()
+        extra_cflags += [f"-I{d}" for d in inc_dirs]
+        extra_ldflags = [f"-L{d}" for d in lib_dirs] + ["-lcrypto"]
         return load_extension_with_recovery(
             name="hicache_hash_cpp",
             sources=[f"{abs_path}/hash_binding.cpp"],
             extra_cflags=extra_cflags,
-            extra_ldflags=["-lcrypto"],
+            extra_ldflags=extra_ldflags,
             with_cuda=False,
         )
     except Exception as exc:
