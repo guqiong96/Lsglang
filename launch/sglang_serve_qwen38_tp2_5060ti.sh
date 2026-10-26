@@ -46,8 +46,8 @@ sglang serve --sleep-on-idle \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 262144 \
-  --mem-fraction-static 0.80 \
+  --max-total-tokens 65536 \
+  --mem-fraction-static 0.88 \
   --warmups prefill_shapes \
   --mm-feature-transport=cpu \
   --mm-attention-backend flashinfer_cudnn \
