@@ -45,7 +45,6 @@ sglang serve --sleep-on-idle \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
   --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
   --chunked-prefill-size 1024 \
