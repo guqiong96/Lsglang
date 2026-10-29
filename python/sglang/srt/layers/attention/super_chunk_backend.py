@@ -35,6 +35,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.utils import logger
 
+# One line per process, not per wrapper instance: the wrapper is built per
+# layer, so a per-instance guard prints the same line once per layer per rank.
+_SC_ACTIVE_LOGGED = False
+_SC_WARNED_REASONS = set()
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -423,8 +428,8 @@ class SuperChunkAttnBackend(AttentionBackend):
             self._active = False
             self._child_batches = None
             self._child_bounds = None
-            if reason not in self._warned_reasons:
-                self._warned_reasons.add(reason)
+            if reason not in _SC_WARNED_REASONS:
+                _SC_WARNED_REASONS.add(reason)
                 logger.warning(
                     "[sc-dbg] disabled reason=%s rows=%s inner=%s",
                     reason,
@@ -449,8 +454,9 @@ class SuperChunkAttnBackend(AttentionBackend):
         # be sliced by token-axis child views).
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         self._active = True
-        if not self._dbg_active_logged:
-            self._dbg_active_logged = True
+        global _SC_ACTIVE_LOGGED
+        if not _SC_ACTIVE_LOGGED:
+            _SC_ACTIVE_LOGGED = True
             logger.info(
                 "[sc-dbg] wrapper active rows=%s chunks=%d inner=%s",
                 forward_batch.extend_num_tokens,

@@ -63,6 +63,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+_SC_LOGGED = False
 
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
@@ -1268,8 +1269,12 @@ class Engram(nn.Module):
             return self._forward_rows(
                 x, hash_ids, forward_batch, cp_all_tokens=cp_all_tokens
             )
-        if not getattr(self, "_super_chunk_logged", False):
-            self._super_chunk_logged = True
+        # ONCE PER PROCESS, not once per module: engram is built per layer, so a
+        # per-instance guard prints the same line once per layer per rank (45 x
+        # 2 on this model) which floods the boot log without adding information.
+        global _SC_LOGGED
+        if not _SC_LOGGED:
+            _SC_LOGGED = True
             logger.info(
                 "[sc-dbg] engram LOOP active plan=%d rows=%d chunk_max=%d",
                 len(plan),
