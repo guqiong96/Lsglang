@@ -207,10 +207,23 @@ def is_lk_prefill_debug() -> bool:
 def get_prefill_wave_experts() -> int:
     # Tier wave width, ONE geometry for all three engines: <=0 (default)
     # = every expert in one wave (wave = E); >0 = W experts per wave, a
-    # per-wave gemm loop only the cutlass engine has -- the staging
-    # engines abort at init on a narrower wave. The working set occupies
+    # per-wave gemm loop only the cutlass engine has. The working set occupies
     # 2*wave rows of the pool's row space (shared, zero extra VRAM).
-    return get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
+    #
+    # The knob is cutlass-only (LK_GPU_PREFILL_WAVE_EXPERTS in the README
+    # table), so a positive width means nothing to the staging engines: they
+    # gemm the whole layer per stage. Normalise it here, once, instead of
+    # letting the tier refuse to start a valid staging deployment.
+    wave = get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
+    if wave > 0:
+        engine = get_gpu_prefill_engine()
+        if engine != "cutlass":
+            warnings.warn(
+                f"LK_GPU_PREFILL_WAVE_EXPERTS={wave} is cutlass-only; ignoring "
+                f"it for engine={engine} (auto = one wave per layer)"
+            )
+            return -1
+    return wave
 
 
 def get_prefill_d_slots() -> int:
