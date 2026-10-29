@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.triton_preload import batch_buckets
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -783,7 +784,7 @@ def preload_eagle_sampling(
     else:
         return
 
-    for bs in range(1, max(1, batch_size) + 1):
+    for bs in batch_buckets(batch_size):
         rows = bs * num_draft_tokens
         probs = torch.full(
             (rows, vocab_size), 1.0 / vocab_size, dtype=torch.float32, device=device
