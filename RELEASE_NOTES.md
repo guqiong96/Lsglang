@@ -29,8 +29,16 @@
 
 - Super-chunk prefill no longer splits a sequence across chunk boundaries
   (a source of degraded output in mixed long batches). Fixes #17.
-- Kernel images are preloaded at boot: no first-request JIT stall, no
-  mid-serve allocation hitches.
+- Speculative decode no longer stalls on the first sampled request
+  (EAGLE / NEXTN and DSpark). No parameter change.
+- Long prompts no longer pay a one-off compile. No parameter change.
+- Parameters that were tightened to stay clear of those stalls can be restored:
+  put `--mem-fraction-static` and `--max-total-tokens` back to your usual
+  values on speculative-decode deployments.
+- `LK_GPU_PREFILL_WAVE_EXPERTS` applies to the cutlass engine only. With
+  `LK_GPU_PREFILL_ENGINE=triton` or `flashinfer` it is ignored with a warning
+  instead of aborting startup: remove the line from those launch scripts, or
+  leave it in place.
 
 ## Docs
 
