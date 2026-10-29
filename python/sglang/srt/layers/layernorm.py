@@ -523,6 +523,18 @@ class RMSNorm(BaseFusedOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        _wdt = self.weight.data.dtype
+        if _wdt not in (torch.float16, torch.bfloat16) or x.dtype != _wdt:
+            # The fused CUDA kernels exist for fp16/bf16 weight+activation
+            # pairs only: an fp32 weight either fails to dispatch (SM120
+            # routes to FlashInfer's CuTe DSL, which raises "Mismatched
+            # Tensor ... expected dtype=bfloat16" -- that killed the 0731
+            # boot on 5060Ti at the MHC load-time prewarm) or upcasts the
+            # output on SM8x. dsv4's compressor norms keep an fp32 weight by
+            # design (fp32 compression math), so the native fp32 path is
+            # their real path; a mismatched pair has no correct fused kernel
+            # either way. Same guard as forward_aiter below.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
