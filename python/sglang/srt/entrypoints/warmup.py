@@ -145,6 +145,12 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         if mid <= 32768:
             sizes.add(mid)
         base *= 2
+    # NOTE (2026-10-27): a full _hybrid_buckets() sweep here was tried and
+    # REVERTED -- ~21 extra CuTe DSL compiles at boot made the VLM warmup's
+    # cudnn handle creation fail (cudaStreamCreateWithFlags) on the 5060Ti.
+    # The ladder already compiles every power-of-two bucket; non-power shapes
+    # pay one cute.compile on first sight. The mid-serving repeat tax is fixed
+    # on the launch side (bucket-only routing above the cap) instead.
     sizes = sorted(sizes)
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
