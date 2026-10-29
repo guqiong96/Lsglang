@@ -47,7 +47,6 @@ FLASHINFER_DISABLE_VERSION_CHECK=1 \
   --tensor-parallel-size 4 \
   --max-running-requests 2 \
   --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
   --ple-offload-embedding \
   --ple-offload-backend nvme \
   --ple-offload-dir /home/guqiong/Models/.ple_cache/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \

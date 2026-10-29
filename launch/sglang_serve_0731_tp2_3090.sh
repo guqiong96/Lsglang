@@ -50,5 +50,6 @@ sglang serve --sleep-on-idle \
   --disable-shared-experts-fusion \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
-  --mem-fraction-static 0.85 \
+  --mem-fraction-static 0.90 \
+  --warmups prefill_shapes \
   --cuda-graph-backend-prefill disabled

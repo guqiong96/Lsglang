@@ -43,7 +43,6 @@ FLASHINFER_DISABLE_VERSION_CHECK=1 \
   --max-running-requests 2 \
   --max-mamba-cache-size 11 \
   --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.80 \

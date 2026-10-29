@@ -56,4 +56,5 @@ sglang serve --sleep-on-idle \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.78 \
+  --warmups prefill_shapes \
   --cuda-graph-backend-prefill disabled

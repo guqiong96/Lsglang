@@ -24,7 +24,8 @@ OMP_NUM_THREADS=1 \
 LK_POWER_SAVING=1 \
 LK_NUMA_INTERLEAVE=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
-LK_GPU_PREFILL_ENGINE=cutlass \
+LK_GPU_PREFILL_ENGINE=flashinfer \
+LK_GPU_PREFILL_SM120_W4A4=1 \
 LK_GPU_PREFILL_SUB_M=65536 \
 LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
@@ -52,4 +53,5 @@ sglang serve --sleep-on-idle \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --moe-runner-backend sm12x_nvfp4_bf16

@@ -26,6 +26,7 @@ LK_GPU_PREFILL_MIN_TOKENS=1024 \
 LK_GPU_PREFILL_ENGINE=cutlass \
 LK_GPU_PREFILL_SUB_M=8192 \
 LK_GPU_PREFILL_D_SLOTS=16384 \
+LK_GPU_PREFILL_WAVE_EXPERTS=128 \
 LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
@@ -50,8 +51,8 @@ sglang serve --sleep-on-idle \
   --reasoning-parser auto \
   --tool-call-parser auto \
   --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
   --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.80 \
+  --warmups prefill_shapes \
   --speculative-attention-mode decode

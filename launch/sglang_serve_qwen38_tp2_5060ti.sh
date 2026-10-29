@@ -24,7 +24,8 @@ OMP_NUM_THREADS=1 \
 LK_THREAD_BINDING=NUMA_NODE \
 LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
-LK_GPU_PREFILL_ENGINE=cutlass \
+LK_GPU_PREFILL_ENGINE=flashinfer \
+LK_GPU_PREFILL_SM120_W4A4=1 \
 LK_GPU_PREFILL_SUB_M=32768 \
 LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_NUMA_INTERLEAVE=1 \
@@ -42,12 +43,11 @@ sglang serve --sleep-on-idle \
   --tensor-parallel-size 2 \
   --max-running-requests 2 \
   --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 65536 \
-  --mem-fraction-static 0.88 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.80 \
   --warmups prefill_shapes \
   --mm-feature-transport=cpu \
   --mm-attention-backend flashinfer_cudnn \
@@ -59,4 +59,5 @@ sglang serve --sleep-on-idle \
   --max-mamba-cache-size 11 \
   --reasoning-parser auto \
   --tool-call-parser auto \
-  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"medium"}'
+  --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"medium"}' \
+  --moe-runner-backend sm12x_nvfp4_bf16
