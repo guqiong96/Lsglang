@@ -221,13 +221,32 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
-| `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer (extra VRAM = slots × layers × expert size); not enabled by default |
+| `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND expert-cache capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer. It sizes the CACHE only: the domain's total VRAM is `max(cache, prefill working set)` — see [VRAM sizing](#vram-sizing-pool--gpu-prefill). Must be `>= top_k` when non-zero |
 | `LK_POOL_DECODE` | pool | follow pool | decode GPU half: pool-resident experts go to the GPU resident-gemv half. `1` on / `0` off explicitly; unset follows `LK_POOL_SLOTS` > 0 |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
 | `LK_POOL_INFLIGHT` | pool | `16` | in-flight DMA jobs / event-ring depth (backpressure cap = 8x; lower values false-positive under small batches) |
 | `LK_POOL_LAYERS` | pool | -- | RETIRED: pool membership is global (`LK_POOL_SLOTS` > 0); the parser is dead code and per-layer mixing with GPU prefill is not supported |
 | `LK_POOL_STAGE` | pool | 1 | coalesced H2D staging ring (read by lk_moe) |
 | `LK_POOL_LOG` | pool | 0 | windowed `[pool]` stats line every N decode steps (0 = silent) |
+
+### VRAM sizing (pool + GPU prefill)
+
+Each weight type owns one static VRAM domain that holds two overlapping
+demands — the expert cache (`LK_POOL_SLOTS` x layers) and the prefill working
+set (wave / `LK_GPU_PREFILL_D_SLOTS` / `LK_GPU_PREFILL_SUB_M`) — and the domain
+is `max(cache, prefill)`, never their sum. So `LK_POOL_SLOTS` buys cache only,
+and a prefill larger than the cache grows the domain and eats KV one-for-one.
+The server logs the plan at boot:
+
+```
+arena: 4.75 GiB total = max(cache 4.75 GiB [720 rows], prefill 4.32 GiB [192 map + 464 act rows])
+```
+
+How to size each knob, which wave to use (and why wave is not a performance
+knob), the shipped per-recipe budgets and the pitfalls are in
+**[docs/vram_sizing.md](docs/vram_sizing.md)** — read it before changing
+`LK_POOL_SLOTS`, `LK_GPU_PREFILL_WAVE_EXPERTS`, `LK_GPU_PREFILL_D_SLOTS` or
+`LK_GPU_PREFILL_SUB_M`.
 
 ### Speculative decode
 
