@@ -88,29 +88,69 @@ def _super_chunk_unsupported_reason(
     num = fb.extend_num_tokens
     if num is None or num <= inner_size:
         return "single sub-chunk"
+    # Defense-in-depth: no child may straddle a sequence boundary (that is the
+    # Xid-43 crash shape). compute_super_chunk_token_bounds cuts at the
+    # sequence boundaries, so this only fires when it cannot know them
+    # (extend_seq_lens_cpu missing, or its sum disagreeing with the token
+    # axis while the batch packs several requests).
+    ext_lens = getattr(fb, "extend_seq_lens_cpu", None)
+    if ext_lens is not None and len(ext_lens) > 1:
+        boundaries = []
+        cum = 0
+        for el in ext_lens[:-1]:
+            cum += int(el)
+            boundaries.append(cum)
+        if any(
+            lo < b < hi
+            for b in boundaries
+            for lo, hi in compute_super_chunk_token_bounds(fb, inner_size)
+        ):
+            return "child would straddle a sequence boundary"
     return None
 
 
 def compute_super_chunk_token_bounds(
     fb: ForwardBatch, inner_size: int
 ) -> List[Tuple[int, int]]:
-    """Token-axis [lo, hi) bounds, cut at multiples of inner_size."""
+    """Token-axis [lo, hi) bounds, cut at multiples of inner_size AND at every
+    sequence boundary (cumulative extend_seq_lens_cpu).
+
+    The scheduler sizes EXTEND batches to CAP=LK_GPU_PREFILL_SUB_M, so one
+    forward can pack several requests; a grid-only cut then puts a seam
+    inside one request's rows while the same child covers the next request's
+    head, and that child view misdescribes its rows: the attention kernels
+    trap (Xid 43, scheduler SIGABRT). Cutting at grid UNION sequence
+    boundaries makes every child lie within exactly one sequence; short
+    remainder children are fine (single-sequence slices are supported at any
+    length). When extend_seq_lens_cpu is unavailable the grid-only cut is
+    kept (no allocation here); the gate in _super_chunk_unsupported_reason is
+    what disables the wrapper for batches whose children would straddle.
+    """
     total = fb.extend_num_tokens
-    bounds = []
-    lo = 0
-    while lo < total:
-        hi = min(lo + inner_size, total)
-        bounds.append((lo, hi))
-        lo = hi
-    return bounds
+    cuts = {0, total}
+    grid = inner_size
+    while grid < total:
+        cuts.add(grid)
+        grid += inner_size
+    ext_lens = getattr(fb, "extend_seq_lens_cpu", None)
+    if ext_lens is not None and sum(int(el) for el in ext_lens) == total:
+        cum = 0
+        for el in ext_lens:
+            cum += int(el)
+            if 0 < cum < total:
+                cuts.add(cum)
+    pts = sorted(cuts)
+    return list(zip(pts, pts[1:]))
 
 
 def build_super_chunk_children(
     fb: ForwardBatch, bounds: List[Tuple[int, int]]
 ) -> List[ForwardBatch]:
     """Per-sub-chunk ForwardBatch views. Sequential token layout: request r
-    owns [cum[r], cum[r+1]); a sub-chunk intersects a contiguous request run,
-    with head/tail requests possibly cut mid-sequence."""
+    owns [cum[r], cum[r+1]). With the sequence-aware cuts in
+    compute_super_chunk_token_bounds each child lies within exactly one
+    sequence (batch_size 1, possibly mid-sequence with a grown prefix); the
+    run-scan below still handles multi-request children generically."""
     ext_lens = fb.extend_seq_lens_cpu
     pref_lens = fb.extend_prefix_lens_cpu
     assert ext_lens is not None and pref_lens is not None
