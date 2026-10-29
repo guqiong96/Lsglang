@@ -5,6 +5,10 @@ Everything LK_* lives here so the knobs have a single source of truth; callers
 keep importing the names from ``sglang.srt.utils.common`` (compat re-export).
 """
 
+import warnings
+
+import torch
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -121,13 +125,41 @@ def get_gpu_prefill_engine() -> str:
     #                         -- see journal 2026-10-22; set "triton" to opt out)
     #   "triton"            = staging group-GEMM over pool slots (legacy,
     #                         fp32 activations, matches the CPU reference)
+    #   "flashinfer"        = SM120/SM121 only: stage FP4, bridge the rows to
+    #                         flashinfer's CuTe DSL moe_nvfp4_w4a16 layout and
+    #                         run the FP4 tensor cores directly (no dequant,
+    #                         1/4 the staged bytes; same numerics as W4A16)
     # Unset and unrecognized values both select cutlass (2026-10-23: restored
     # as the default, reversing the 2026-10-22 hotfix; every production launch
     # script now pins the engine explicitly, so this default only matters for
     # direct python embedding). Inert unless the tier is on. Forwarded to
-    # lk_moe via cfg.use_gpu_prefill.
+    # lk_moe as cfg.gpu_prefill_engine ("" when the tier is off -- the string
+    # carries the tier bit by being non-empty; the C++ decodes it into the
+    # staging-ring / cutlass-arena buffer builds at ctor time).
     val = get_str_env_var("LK_GPU_PREFILL_ENGINE", "cutlass").strip().lower()
-    return "triton" if val == "triton" else "cutlass"
+    return val if val in ("triton", "flashinfer") else "cutlass"
+
+def is_gpu_prefill_sm120_w4a4_enabled() -> bool:
+    # Quantization-level switch for the LK GPU-prefill tier (2026-10-27
+    # doctrine: three orthogonal factors, any one off degrades safely to
+    # W4A16, whose numerics equal the BF16-activation paths). Two of them
+    # are decided here, in one place: this env (pure switch, default off --
+    # lk_switch_doctrine rule 2) and the device capability (SM120 family,
+    # hard check; the three-key rule -- capability decides correctness,
+    # never the name). The third is the engine's w4a4_support(), asked by
+    # the caller against the driver it just created. There is NO second
+    # token threshold inside the tier: the batch gate is
+    # LK_GPU_PREFILL_MIN_TOKENS and nothing else (the retired
+    # MIN_TOKENS-version threshold left no compatibility layer).
+    if not get_bool_env_var("LK_GPU_PREFILL_SM120_W4A4"):
+        return False
+    if torch.cuda.get_device_capability()[0] != 12:  # SM120 family
+        # warnings.warn dedups per call site: one line, not one per layer.
+        warnings.warn(
+            "LK_GPU_PREFILL_SM120_W4A4=1 but this device is not SM120-"
+            "family -> prefill stays W4A16", stacklevel=2)
+        return False
+    return True
 
 def get_pool_window() -> int:
     # Tuned default (hit ~81%). The ONLY pool switch is LK_POOL_SLOTS: any
@@ -172,28 +204,20 @@ def is_lk_prefill_debug() -> bool:
     # Extra tracing inside the prefill staging tier.
     return get_bool_env_var("LK_PP_DEBUG")
 
-def get_gpu_prefetch_window() -> int:
-    # Triton staging-ring depth (NOT a cross-layer prefetch: staging always
-    # starts after this layer's topk). 1 (default) = one block, copy/gemm
-    # serialize; 2 = two blocks, the next stage's H2D can overlap the previous
-    # layer's gemm - only worth it with fast PCIe. Ignored by cutlass.
-    return get_int_env_var("LK_GPU_PREFETCH_WINDOW", 1)
-
-
 def get_prefill_wave_experts() -> int:
-    # CUTLASS wave width: -1 (default) = auto -- the largest W whose deq
-    # blocks plus whole tail staging layers still fit the borrow slab,
-    # clamped to E (adaptive for E=256/384/512); 0 = single-shot gemm; >0 =
-    # explicit cap. Waves run inside each SUB_M pass. Ignored by triton.
+    # Tier wave width, ONE geometry for all three engines: <=0 (default)
+    # = every expert in one wave (wave = E); >0 = W experts per wave, a
+    # per-wave gemm loop only the cutlass engine has -- the staging
+    # engines abort at init on a narrower wave. The working set occupies
+    # 2*wave rows of the pool's row space (shared, zero extra VRAM).
     return get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
 
 
 def get_prefill_d_slots() -> int:
-    # CUTLASS act slice window in slot rows (act VRAM decoupling): 0
-    # (default) = one window per pass (classic full layout, bitwise); >0 =
-    # the four act regions (reordered input / f32 D / GU / down-out) hold
-    # one window and reorder->gemm->fuse->down->sum pipelines per window
-    # inside each SUB_M pass. Ignored by triton.
+    # Tier act window in slot rows, ONE formula for all engines: 0/-1
+    # (default) = sub_m*topk + 7*E; >0 = that many rows, clamped. The
+    # cutlass act planes are the tier arena's tail sized from it; the
+    # staging drivers keep their own fixed-size launch-block buffers.
     return get_int_env_var("LK_GPU_PREFILL_D_SLOTS", 0)
 
 
@@ -292,6 +316,8 @@ def get_lk_pool_layer_set() -> set | None:
 
 
 def get_pool_slots() -> int:
+    # Expert-cache slots per layer. 0 = cache off (prefill is sized
+    # independently: the arena is max(cache, prefill)).
     return get_int_env_var("LK_POOL_SLOTS", 0)
 
 def is_lk_pool_enabled() -> bool:

@@ -1165,6 +1165,25 @@ class Envs:
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
     # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    # sm12x_nvfp4_bf16 launch blocks follow --chunked-prefill-size (the
+    # stack-wide prefill batch budget); batches above it are split into
+    # chunk-sized launches.  No separate env knob by design -- a second
+    # ceiling source would drift from the server argument.
+    # With --moe-runner-backend sm12x_nvfp4_bf16, route batches with at least
+    # this many tokens through flashinfer's moe_nvfp4_w4a4 kernel
+    # (NVFP4-quantized activations), ~1.4x faster on prefill but slightly less
+    # accurate. 0 (default) disables the hybrid path; 256 is a good crossover
+    # estimate.
+    SGLANG_SM12X_W4A4_PREFILL_MIN_TOKENS = EnvInt(0)
+    # sm12x_nvfp4_bf16 launch plan: the fused single-launch (persistent) kernel
+    # measures slower than the tiled route/gemm/act/final sequence at every
+    # token bucket swept on SM120, so it stays an escape hatch (flashinfer's own
+    # host glue would take it whenever rows-per-CTA == 1).
+    SGLANG_SM12X_W4A16_PERSISTENT = EnvBool(False)
+    # sm12x_nvfp4_bf16: replace flashinfer's analytic rows-per-CTA rule with the
+    # SM120-measured bucket ladder (~10% at T=512). OFF restores stock flashinfer
+    # planning; launch-plan only, never numerics.
+    SGLANG_SM12X_W4A16_BM_LADDER = EnvBool(True)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

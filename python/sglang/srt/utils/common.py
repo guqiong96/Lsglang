@@ -127,7 +127,6 @@ from sglang.srt.utils.env_vars import (
 from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     LkMoeConfig,
     enabled_layerwise_load,
-    get_gpu_prefetch_window,
     get_gpu_prefill_engine,
     get_gpu_prefill_min_tokens,
     get_gpu_resident_env_var,
@@ -145,6 +144,7 @@ from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     get_super_chunk_size,
     get_verify_resident,
     get_verify_skip_miss,
+    is_gpu_prefill_sm120_w4a4_enabled,
     is_lk_gpu_prefill_enabled,
     is_lk_moe_feature_enabled,
     is_lk_moe_gpu_resident_layer,
@@ -1565,13 +1565,11 @@ _LK_ENV_RENAMES = {
     "LVLLM_MOE_NUMA_ENABLED": "LK_MOE_HYBRID_ENABLED",
     "LVLLM_ENABLE_NUMA_INTERLEAVE": "LK_NUMA_INTERLEAVE",
     "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": "LK_GPU_PREFILL_MIN_TOKENS",
-    "LVLLM_GPU_PREFETCH_WINDOW": "LK_GPU_PREFETCH_WINDOW",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS": "LK_GPU_RESIDENT_MOE_LAYERS",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS_SPEC": "LK_GPU_RESIDENT_MOE_LAYERS_SPEC",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS_MTP": "LK_GPU_RESIDENT_MOE_LAYERS_MTP",
     "LVLLM_GPU_RESIDENT_MOE_LAYERS_DSPARK": "LK_GPU_RESIDENT_MOE_LAYERS_DSPARK",
     "LVLLM_ENABLE_MOE_LAYERWISE_LOAD": "LK_MOE_LAYERWISE_LOAD",
-    "LVLLM_GPU_RESERVE_GB": "LK_GPU_RESERVE_GB",
 }
 
 def migrate_lk_env_vars() -> None:

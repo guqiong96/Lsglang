@@ -688,7 +688,22 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     return out_cache_loc
 
 
-@triton.jit
+# The four per-call tensors arrive as slices of bigger buffers, so their
+# 16B-alignment bit (part of triton's cubin key) varies at RUNTIME: every
+# pre-warm enumeration uses base-aligned tensors and can never cover the
+# unaligned variants, and the boot that still lazy-loaded one at the first
+# draft step deadlocked (py-spy: main thread cuModuleLoadData queued behind
+# the pool worker's cuMemcpyAsync on the ctx rwlock, both ranks). Taking the
+# alignment bit out of the key makes the dtype x batch-size cube complete:
+# after boot there is no cubin left to load, at any moment, ever.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "req_pool_indices",
+        "start_offset",
+        "end_offset",
+        "out_cache_loc",
+    ]
+)
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token,
@@ -734,6 +749,9 @@ def _device_type(batch: ScheduleBatch) -> str:
     return torch.device(batch.device).type
 
 
+_LK_LATE_LOAD_SEEN: set = set()
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -752,6 +770,46 @@ def assign_req_to_token_pool_func(
             req_to_token.shape[1],
         )
         return
+    # LK late-load guard: every specialization of this kernel (pool_len,
+    # bs_upper and the pointer dtypes are its key) is its own cubin, and a
+    # lazy cuModuleLoadData racing a peer's spin-allreduce deadlocks TP --
+    # verified across three wedged boots. Pre-warms load the common ones;
+    # THIS is what closes the class: the function body is the one place
+    # every caller passes through (module-attr patches are bypassed by
+    # the spec workers' from-import bindings). The first launch of a
+    # never-seen spec synchronizes first: in lockstep TP every rank is
+    # at a quiet point there, so the load cannot race a collective.
+    _lk_key = (
+        req_to_token.data_ptr(),
+        req_to_token.shape[1],
+        req_to_token.dtype,
+        req_pool_indices.dtype,
+        start_offset.dtype,
+        end_offset.dtype,
+        out_cache_loc.dtype,
+        batch_size,
+        # Keep the key as fine as triton's own: the alignment bits join as
+        # defense-in-depth for triton versions that ignore do_not_specialize
+        # (an extra sync on an unseen alignment is harmless; a lazy load at
+        # that first launch is exactly what this guard exists to serialize).
+        req_pool_indices.data_ptr() % 16 == 0,
+        start_offset.data_ptr() % 16 == 0,
+        end_offset.data_ptr() % 16 == 0,
+        out_cache_loc.data_ptr() % 16 == 0,
+    )
+    if _lk_key not in _LK_LATE_LOAD_SEEN:
+        _LK_LATE_LOAD_SEEN.add(_lk_key)
+        logger.warning(
+            "LK alloc first-launch spec: pool_len=%s pool_align16=%s "
+            "idx=%s/%s out=%s/%s off=%s/%s bs=%s(%s)",
+            req_to_token.shape[1], req_to_token.data_ptr() % 16 == 0,
+            req_pool_indices.dtype, req_pool_indices.data_ptr() % 16 == 0,
+            out_cache_loc.dtype, out_cache_loc.data_ptr() % 16 == 0,
+            start_offset.dtype, end_offset.dtype,
+            batch_size, "pow2" if batch_size & (batch_size - 1) == 0 else "x",
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.synchronize()
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,

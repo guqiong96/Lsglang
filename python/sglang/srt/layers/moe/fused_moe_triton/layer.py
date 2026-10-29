@@ -107,8 +107,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 _LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
+_LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -596,7 +597,6 @@ class FusedMoE(torch.nn.Module):
         self.gpu_prefill_min_tokens = get_gpu_prefill_min_tokens()
      
         
-        self.gpu_prefetch_window = get_gpu_prefetch_window()
         self.prefill_wave_experts = get_prefill_wave_experts()
         self.prefill_d_slots = get_prefill_d_slots()
         self.lk_moe = None
@@ -2076,7 +2076,8 @@ class FusedMoE(torch.nn.Module):
         if is_lk_pool_enabled():
             # Composite/multimodal configs keep num_hidden_layers on the text
             # sub-config (Qwen4Exp & co.); reading only the top level yields 0
-            # and silently disables the pool slab, so prefill can never borrow.
+            # and leaves the pool slab at zero rows, so prefill staging has
+            # no tier to join.
             model_cfg = process_model_config()
             text_cfg = getattr(model_cfg, "hf_text_config", None)
             if text_cfg is None:
@@ -2085,12 +2086,8 @@ class FusedMoE(torch.nn.Module):
             cfg.pool_member_layers = sum(
                 1 for i in range(n_layers)
                 if not is_lk_moe_gpu_resident_layer(i))
-        cfg.prefill_gpu = self.is_gpu_prefill_layer
-        # cutlass engine (pre-408b570) shares the GPU-prefill tier gate but
-        # needs its own StaticGPUMemory arena built in the MOE_V2 ctor; the
-        # triton staging path leaves this False (no arena, uses pool slots).
-        cfg.use_gpu_prefill = (self.is_gpu_prefill_layer
-                               and get_gpu_prefill_engine() == "cutlass")
+        cfg.gpu_prefill_engine = (get_gpu_prefill_engine()
+                                  if self.is_gpu_prefill_layer else "")
         cfg.role_draft = self.model_type != "main"
         cfg.pool_decode = self.pool_decode
         cfg.pool_slots = get_pool_slots()
@@ -2115,7 +2112,6 @@ class FusedMoE(torch.nn.Module):
         if self.swiglu_limit is not None:
             cfg.swiglu_limit = self.swiglu_limit
         cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
-        cfg.prefill_window = self.gpu_prefetch_window
         cfg.prefill_wave_experts = self.prefill_wave_experts
         cfg.prefill_d_slots = self.prefill_d_slots
         cfg.pool_window = get_pool_window()
@@ -2427,11 +2423,25 @@ class FusedMoE(torch.nn.Module):
                     raise RuntimeError(
                         f"GPU-prefill layer {self.layer_name}: cutlass engine "
                         f"probe failed (build lacks gpu_prefill or arena not "
-                        f"initialised -- check cfg.use_gpu_prefill)")
+                        f"initialised -- check cfg.gpu_prefill_engine)")
+            elif get_gpu_prefill_engine() == "flashinfer":
+                from lk_moe.prefill_flashinfer import FlashinferPrefill
+                drv = FlashinferPrefill.probe(self.lk_moe)
+                if drv is None:
+                    raise RuntimeError(
+                        f"GPU-prefill layer {self.layer_name}: flashinfer "
+                        f"engine probe failed (SM120 NVFP4 only; see the "
+                        f"warning above for the reason)")
             else:
                 from lk_moe.prefill_staging import StagingPrefill
                 drv = StagingPrefill.probe(self.lk_moe)
             self._gpu_prefill_driver = drv
+            # Quantization-level switch: armed at the spot where the engine
+            # was just chosen -- no quant-method-side arm hook. env and the
+            # SM120-family capability are decided by the helper; the engine
+            # answers for itself via w4a4_support().
+            if is_gpu_prefill_sm120_w4a4_enabled():
+                self.lk_moe_arm_w4a4()
         self._pool_layer_info = None
         self.lk_moe.pool_gpu_report(False)
         if self.pool_decode:
@@ -2492,10 +2502,25 @@ class FusedMoE(torch.nn.Module):
                 or FusedMoE.pool_hpart.shape != (NGK, rows, 2 * I)):
             FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
             FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
+        # fix-4a canonical pool slots: the plane bases carry the set's row
+        # offset inside the shared region (row_base % 128 == 0 by the C++
+        # guard, so the SF swizzle splits exactly); the strides already are
+        # the region strides. Native pools bake nothing and flag native.
+        canon = bool(int(info.get("canonical") or 0))
+        if canon:
+            rb = [int(v) for v in info["canon_row_base"]]
+            ckp = [int(v) for v in info["canon_kp"]]
+            ckpp = [int(v) for v in info["canon_kpp"]]
+            wa = [int(info["weight_addr"][i]) + rb[i] * ckp[i] for i in range(3)]
+            sa = [int(info["scale_addr"][i]) + rb[i] * ckpp[i] for i in range(3)]
+        else:
+            wa = [int(v) for v in info["weight_addr"]]
+            sa = [int(v) for v in info["scale_addr"]]
         self._pool_layer_info = dict(
             layer=info["layer"],
             snapshot_addr=info["snapshot_addr"],
-            weight_addr=info["weight_addr"], scale_addr=info["scale_addr"],
+            weight_addr=wa, scale_addr=sa,
+            layout="canonical" if canon else "native",
             slot_bytes=info["slot_weight_bytes"],
             slot_scale_bytes=info["slot_scale_bytes"],
             gateup_gds=gds["gateup_global_scale_addr"],
@@ -2582,7 +2607,7 @@ class FusedMoE(torch.nn.Module):
                 FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
                 HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
                 ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
-                KS=geo["KS"], NGK=geo["NGK"])
+                KS=geo["KS"], NGK=geo["NGK"], LAYOUT=geo["layout"])
             reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
                 hpart, hbuf, n_slots * 2 * I, NGK=geo["NGK"], BLOCK=1024)
             moe_down[(n_slots, geo["NB_DOWN"])](
@@ -2596,7 +2621,8 @@ class FusedMoE(torch.nn.Module):
                 ITERS=geo["ITERS"], SCALE_GROUP=SG,
                 FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
                 HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
-                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"])
+                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
+                LAYOUT=geo["layout"])
             reduce_down[(triton.cdiv(H, 1024),)](
                 gout_part, gout[:real_tokens], slot_tab, HIDDEN=H,
                 SLOTS_PER_TOKEN=k, BATCH=real_tokens, BLOCK=1024,
@@ -2685,6 +2711,30 @@ class FusedMoE(torch.nn.Module):
         
         return output_gpu
  
+    def lk_moe_arm_w4a4(self):
+        """Hand this checkpoint's calibrated FP4 activation multipliers
+        (1 / input_scale) to the engine driver, for every batch inside the
+        tier's gate. The env + SM120-family factors live in
+        ``is_gpu_prefill_sm120_w4a4_enabled`` (checked by the single caller,
+        ``_init_pool``); the engine answers for itself via w4a4_support().
+        Whether the checkpoint carries calibrated input scales is the
+        operator's choice to arm -- no check here, a scale-less checkpoint
+        fails on its own at boot.
+        """
+        drv = self._gpu_prefill_driver
+        if drv is None or not drv.w4a4_support():
+            return
+        one = torch.ones((), dtype=torch.float32)
+        gs13 = self.w13_weight_scale_2.detach().to(torch.float32)
+        ratio = one
+        if gs13.dim() > 1 and gs13.shape[-1] >= 2:
+            gate, up = gs13[..., 0], gs13[..., 1]
+            ratio = torch.where(gate > 0, up / gate, torch.ones_like(up)).amax()
+        drv.enable_w4a4(
+            one / self.w13_input_scale.detach().to(torch.float32).amax(),
+            one / (ratio * self.w2_input_scale.detach().to(torch.float32).amax()),
+        )
+
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
         ev, gout = self._gpu_prefill_driver.prefill_gpu(
             hidden_states, topk_ids, topk_weights)
@@ -2694,23 +2744,45 @@ class FusedMoE(torch.nn.Module):
             torch.nan_to_num(out, nan=0.0, out=out)
         if _LK_PP_DEBUG:
             # Diagnostic only (LK_PP_DEBUG=1): compare the GPU-tier result to
-            # the CPU tier for the same layer/tokens. First call per layer.
+            # the CPU tier. Keyed by (layer, M) and not just layer: the tier's
+            # cost path depends on M (M > 8192/topk walks the chunk loop), so
+            # logging only the first call -- always a warmup shape -- leaves the
+            # shape the workload actually uses unchecked. `ratio` and `cos`
+            # separate a uniform scale/rounding difference (ratio ~ 1, cos ~ 1
+            # with relmax a few e-3) from a structural one.
             seen = getattr(self, "_ppdbg_seen", None)
             if seen is None:
                 seen = self._ppdbg_seen = set()
-            if self.layer_id not in seen:
-                seen.add(self.layer_id)
+            M_ = hidden_states.size(0)
+            # EVERY>0: compare every Nth call per layer instead of only the
+            # first per shape. Warmup burns every (layer, M) key while the
+            # machine is still idle, so the first-per-key policy is blind to
+            # anything that only bites under live traffic (staging churn,
+            # concurrent copies). A prime N avoids aliasing with the layer or
+            # chunk period.
+            n_ = getattr(self, "_ppdbg_calls", 0) + 1
+            self._ppdbg_calls = n_
+            if _LK_PP_DEBUG_EVERY:
+                fire = n_ % _LK_PP_DEBUG_EVERY == 0
+            else:
+                fire = (self.layer_id, M_) not in seen
+            if fire:
+                seen.add((self.layer_id, M_))
                 try:
                     with torch.inference_mode():
                         ref = self._cpu_prefill(hidden_states, topk_weights, topk_ids)
-                    d = (out.float() - ref.float()).abs()
-                    peak = ref.float().abs().amax().clamp_min(1e-9)
+                    g_, r_ = out.float(), ref.float()
+                    d = (g_ - r_).abs()
+                    peak = r_.abs().amax().clamp_min(1e-9)
                     logger.warning(
-                        "[ppdbg] layer=%s M=%d relmax=%.3e absmax=%.3e "
-                        "gpu_peak=%.3e cpu_peak=%.3e",
-                        self.layer_id, hidden_states.size(0),
+                        "[ppdbg] layer=%s M=%d n=%d relmax=%.3e absmax=%.3e "
+                        "gpu_peak=%.3e cpu_peak=%.3e ratio=%.6f cos=%.8f",
+                        self.layer_id, M_, n_,
                         (d.amax() / peak).item(), d.amax().item(),
-                        out.float().abs().amax().item(), peak.item())
+                        g_.abs().amax().item(), peak.item(),
+                        ((g_ * r_).sum() / (r_ * r_).sum().clamp_min(1e-30)).item(),
+                        ((g_ * r_).sum()
+                         / (g_.norm() * r_.norm()).clamp_min(1e-30)).item())
                 except Exception:
                     logger.exception("[ppdbg] cpu-vs-gpu compare failed layer=%s",
                                      self.layer_id)

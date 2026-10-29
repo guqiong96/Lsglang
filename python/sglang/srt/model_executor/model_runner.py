@@ -732,6 +732,92 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        self.warm_late_triton_modules()
+
+    def warm_late_triton_modules(self, extra_runners=()):
+        """Device-load the spec-decode allocation kernel's SPECIALIZATIONS
+        before serving. A lazy cuModuleLoadData racing a spin-waiting custom
+        allreduce deadlocked boot twice (and triton_load_watch warns the same
+        load can die with OOM once the pools ate the headroom). pool_len and
+        bs_upper are CONSTEXPR args: every power-of-2 batch upper and every
+        offset dtype family is its own cubin, and pool_len pins the pool's
+        FINAL row width - which is why this runs twice: once at init end
+        (headroom while it is still large) and once after cuda-graph init
+        (the authoritative pool). Missing variants are just no-ops: the JIT
+        cache dedups by specialization key.
+        """
+        try:
+            r2t = getattr(self.req_to_token_pool, "req_to_token", None)
+            if r2t is None or not r2t.is_cuda:
+                return
+            from sglang.srt.mem_cache import allocation as _alloc_mod
+
+            # Deterministic deadlock killer, independent of specialization
+            # coverage: the FIRST real launch device-loads its cubin, and a
+            # lazy cuModuleLoadData racing a peer's spinning allreduce is the
+            # deadlock. Wrap the func so the first call synchronizes before
+            # launching: in lockstep TP both ranks have already enqueued the
+            # previous batch's collectives at that point, so the load runs
+            # at a quiet point by construction. The module-attr patch is what
+            # allocation.py's own call sites resolve at call time.
+            _fn = _alloc_mod.assign_req_to_token_pool_func
+            if not getattr(_fn, "_lk_safe", False):
+                # Sync before the first launch of EVERY r2t pool, not just
+                # the first call process-wide: every pool width is its own
+                # constexpr cubin, and the draft pool's first real call was
+                # the one that still lazy-loaded (third deadlocked boot).
+                def _safe_first(*a, __orig=_fn, _seen=set(), **kw):
+                    if len(a) > 1 and torch.is_tensor(a[1]):
+                        key = (a[1].data_ptr(), a[1].shape[1])
+                        if key not in _seen:
+                            _seen.add(key)
+                            torch.cuda.synchronize()
+                    return __orig(*a, **kw)
+
+                _safe_first._lk_safe = True
+                _alloc_mod.assign_req_to_token_pool_func = _safe_first
+                _fn = _safe_first
+            assign_req_to_token_pool_func = _fn
+            for pool in [r2t] + [
+                getattr(getattr(r, "req_to_token_pool", None), "req_to_token", None)
+                for r in extra_runners
+            ]:
+                if pool is None or not pool.is_cuda or pool.data_ptr() == 0:
+                    continue
+                for dt_i in (torch.int64, torch.int32):
+                    for dt_o in (torch.int64, torch.int32):
+                        # idx/out dtypes are part of the cubin key too:
+                        # spec-decode alloc passes req indices and cache
+                        # locs whose width follows the pool size, and the
+                        # boot that missed them deadlocked loading the cubin
+                        # at the FIRST DRAFT STEP (py-spy: both ranks parked
+                        # in cuModuleLoadData). Enumerate the cube.
+                        idx = torch.zeros(128, dtype=dt_i, device=pool.device)
+                        out = torch.zeros(128, dtype=dt_o, device=pool.device)
+                        for dt_s in (torch.int32, torch.int64):
+                            for dt_e in (torch.int32, torch.int64):
+                                off_s = torch.ones(128, dtype=dt_s,
+                                                   device=pool.device)
+                                off_e = torch.ones(128, dtype=dt_e,
+                                                   device=pool.device)
+                                for bs in (1, 2, 4, 8, 16, 32, 64, 128):
+                                    if bs > pool.shape[0]:
+                                        break
+                                    off_s[0] = 0
+                                    # start=0 end=1 on row 0: the pool
+                                    # starts unassigned; first real alloc
+                                    # overwrites row 0.
+                                    assign_req_to_token_pool_func(
+                                        idx[:bs], pool, off_s[:bs],
+                                        off_e[:bs], out[:bs], bs,
+                                    )
+            torch.cuda.synchronize()
+        except Exception:
+            logger.warning(
+                "warm_late_triton_modules failed; serving proceeds with the "
+                "lazy-load deadlock risk it exists to remove.",
+                exc_info=True,
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1068,6 +1154,16 @@ class ModelRunner:
                 self.memory_pool_config.max_running_requests = (
                     resize.capped_max_running_requests
                 )
+        # The third warm point (fix for the third late-load hang): this
+        # resize changes the pool_len / bs_upper CONSTEXPRs of the spec-decode
+        # allocation kernel AFTER both earlier warm points (init end and
+        # cuda-graph init), and it resizes the DRAFT pools too -- whose
+        # widths no earlier warm of this instance ever saw. Without this the
+        # first serve step device-loads brand-new cubins under the ~0.2 GiB
+        # serve headroom: the lazy-load race that wedged this boot. Idempotent
+        # and near-free when nothing moved (JIT dedups by spec key).
+        if not self.is_draft_worker:
+            self.warm_late_triton_modules(extra_runners=tuple(draft_runners))
 
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
@@ -1263,6 +1359,10 @@ class ModelRunner:
             defer_distributed_setup=defer_decode_capture,
         )
         self.eager_runner = capture.eager_runner
+        # Authoritative re-warm: by now the req_to_token row width (a CONSTEXPR
+        # arg of the allocation kernel) is final; the init-time pass may have
+        # compiled an earlier placeholder width. Cache hits make this free.
+        self.warm_late_triton_modules()
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
