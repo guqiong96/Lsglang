@@ -164,8 +164,16 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    # Row count and logits width are only bounds here (masks and store
+    # offsets), never tile geometry: keeping them as constexpr put the batch
+    # size and the live sequence length into the Triton cache key, so every new
+    # prompt length compiled a new kernel mid-serving (42 low-headroom loads in
+    # one boot on the 3090 pair). As runtime scalars they leave the key, and
+    # only Triton's ordinary %16 / ==1 integer buckets remain -- the same key
+    # stabilisation as the lk_moe prefill kernels
+    # (journal/2026-10-17_triton-nrecompile.md).
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -185,7 +193,10 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
-    stride_lm: tl.constexpr,
+    # The logits row stride IS the logits width (the buffer is sized to the
+    # live sequence length), so as a constexpr it put that length back into the
+    # key even after the width itself became a runtime scalar.
+    stride_lm,
     stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
