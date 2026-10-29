@@ -63,6 +63,7 @@ from sglang.srt.utils import (
     require_gathered_buffer,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.triton_preload import token_buckets
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -338,13 +339,20 @@ class BaseRunner(ABC):
             from sglang.srt.speculative.eagle_utils import preload_eagle_sampling
 
             max_bs = max(1, get_schedule().max_running_requests)
+            # Depth of the chain this pre-load reproduces. The tree kernel
+            # wants selected_index as (bs, draft_token_num - 1) and parent_list
+            # as topk*(depth - 1) + 1 wide, so the deepest chain is the one
+            # shape every verify step can reach. Do not take it from
+            # speculative_num_steps: DSpark reports 1 step yet verifies 6 draft
+            # tokens, and a depth-1 chain fails the selected_index matcher.
+            preload_depth = max(1, num_draft_tokens - 1)
             try:
                 preload_eagle_sampling(
                     mr.device,
                     mr.model_config.vocab_size,
                     num_draft_tokens,
                     batch_size=max_bs,
-                    spec_steps=get_spec().speculative_num_steps,
+                    spec_steps=preload_depth,
                     topk=get_spec().speculative_eagle_topk,
                 )
                 logger.info(
@@ -353,7 +361,7 @@ class BaseRunner(ABC):
                     max_bs,
                     num_draft_tokens,
                     mr.model_config.vocab_size,
-                    get_spec().speculative_num_steps,
+                    preload_depth,
                     get_spec().speculative_eagle_topk,
                 )
             except Exception:
@@ -361,51 +369,86 @@ class BaseRunner(ABC):
                     "verify-step renorm sampling pre-load failed", exc_info=True
                 )
 
-        # FLA gated RMS-norm (the fp8 path of the linear-attention layers): its
-        # kernel is keyed by the head count the module quantises, so it is first
-        # touched at serving time for whatever token count and head count the
-        # request produces. Replay the module's own call once per token bucket.
+            # DSpark's accept/sampling arm runs above the model forward
+            # (dspark_worker_v2 -> _forward_decode -> accept_and_finalize), so
+            # the model-level prewarm replay cannot reach it; load it here.
+            if mr.spec_algorithm.is_dspark():
+                from sglang.kernels.ops.speculative.dspark.preload import (
+                    preload_dspark_accept_kernels,
+                )
+
+                try:
+                    preload_dspark_accept_kernels(
+                        mr.device,
+                        max_bs,
+                        mr.model_config.vocab_size,
+                        num_draft_tokens,
+                    )
+                    logger.info(
+                        "pre-loaded the DSpark accept kernels: bs=1..%d, "
+                        "draft_width=%d, vocab=%d",
+                        max_bs,
+                        num_draft_tokens,
+                        mr.model_config.vocab_size,
+                    )
+                except Exception:
+                    logger.warning("DSpark accept pre-load failed", exc_info=True)
+
+        # FLA gated RMS-norm (the linear-attention layers' norm): its Triton
+        # kernel is keyed on the row count, which serving supplies per request,
+        # so the first request of a new size pays the device-load mid-serving.
+        # Replay the module's own CUDA call at the three integer classes Triton
+        # can specialise on (==1, not divisible by 16, divisible by 16).
+        #
+        # Do NOT pass quant_heads here: that argument selects the ROCm aiter
+        # arm that emits per-token fp8 (q, scale), i.e. a float8_e4m3fn tensor
+        # -- whose type does not exist on SM8x -- and its only caller
+        # (_fp8_tuple_input) is aiter-only, so on CUDA serving never reaches it.
         try:
             from sglang.kernels.ops.attention.fla.layernorm_gated import (
                 _layer_norm_fwd,
             )
 
-            attn_tp_size = max(1, get_parallel().attn_tp_size)
+            buckets = token_buckets(1, 3, 64)
             for module in mr.model.modules():
-                heads = getattr(module, "num_v_heads", None)
                 norm = getattr(module, "norm", None)
-                if heads is None or norm is None or not hasattr(norm, "weight"):
+                if norm is None or not hasattr(norm, "weight"):
                     continue
                 n = int(norm.weight.numel())
-                if isinstance(heads, (list, tuple)):
-                    heads = int(sum(heads))
-                quant_heads = max(1, int(heads) // attn_tp_size)
-                # _layer_norm_fwd asserts M % quant_heads == 0, so the replay
-                # has to use token counts that are multiples of the head count.
-                for tokens in (quant_heads, 128 * quant_heads):
+                warmed = True
+                for tokens in buckets:
                     x = torch.zeros(
                         tokens, n, device=mr.device, dtype=torch.bfloat16
                     )
                     z = torch.zeros_like(x)
-                    _layer_norm_fwd(
-                        x,
-                        norm.weight,
-                        None,
-                        float(getattr(norm, "eps", 1e-6)),
-                        z=z,
-                        is_rms_norm=True,
-                        activation=getattr(norm, "activation", "swish"),
-                        quant_heads=quant_heads,
+                    try:
+                        _layer_norm_fwd(
+                            x,
+                            norm.weight,
+                            None,
+                            float(getattr(norm, "eps", 1e-6)),
+                            z=z,
+                            is_rms_norm=True,
+                            activation=getattr(norm, "activation", "swish"),
+                        )
+                    except Exception:
+                        # Per-module: one shape a module cannot take must not
+                        # cost the other modules their warm-up.
+                        logger.warning(
+                            "FLA gated RMS-norm replay failed: tokens=%d hidden=%d",
+                            tokens,
+                            n,
+                            exc_info=True,
+                        )
+                        warmed = False
+                        break
+                if warmed:
+                    logger.info(
+                        "pre-loaded the FLA gated RMS-norm kernel: tokens=%s, hidden=%d",
+                        list(buckets),
+                        n,
                     )
-                logger.info(
-                    "pre-loaded the FLA gated RMS-norm kernel: tokens=(%d, %d), "
-                    "hidden=%d, quant_heads=%d",
-                    quant_heads,
-                    128 * quant_heads,
-                    n,
-                    quant_heads,
-                )
-                break
+                    break
         except Exception:
             logger.warning("FLA gated RMS-norm pre-load failed", exc_info=True)
 
