@@ -410,37 +410,48 @@ class BaseRunner(ABC):
             )
 
             buckets = token_buckets(1, 3, 64)
+            seen = set()
             for module in mr.model.modules():
                 norm = getattr(module, "norm", None)
                 if norm is None or not hasattr(norm, "weight"):
                     continue
                 n = int(norm.weight.numel())
+                # The kernel is keyed on (width, activation dtype): warming only
+                # the first module, and only in bf16, left other widths and the
+                # fp32 arm cold -- both then device-loaded at serving time.
+                key = (n, norm.weight.dtype)
+                if key in seen:
+                    continue
+                seen.add(key)
                 warmed = True
                 for tokens in buckets:
-                    x = torch.zeros(
-                        tokens, n, device=mr.device, dtype=torch.bfloat16
-                    )
-                    z = torch.zeros_like(x)
-                    try:
-                        _layer_norm_fwd(
-                            x,
-                            norm.weight,
-                            None,
-                            float(getattr(norm, "eps", 1e-6)),
-                            z=z,
-                            is_rms_norm=True,
-                            activation=getattr(norm, "activation", "swish"),
-                        )
-                    except Exception:
-                        # Per-module: one shape a module cannot take must not
-                        # cost the other modules their warm-up.
-                        logger.warning(
-                            "FLA gated RMS-norm replay failed: tokens=%d hidden=%d",
-                            tokens,
-                            n,
-                            exc_info=True,
-                        )
-                        warmed = False
+                    for act_dtype in (torch.bfloat16, torch.float32):
+                        x = torch.zeros(tokens, n, device=mr.device, dtype=act_dtype)
+                        z = torch.zeros_like(x)
+                        try:
+                            _layer_norm_fwd(
+                                x,
+                                norm.weight,
+                                None,
+                                float(getattr(norm, "eps", 1e-6)),
+                                z=z,
+                                is_rms_norm=True,
+                                activation=getattr(norm, "activation", "swish"),
+                            )
+                        except Exception:
+                            # Per-module: one shape a module cannot take must
+                            # not cost the other modules their warm-up.
+                            logger.warning(
+                                "FLA gated RMS-norm replay failed: "
+                                "tokens=%d hidden=%d dtype=%s",
+                                tokens,
+                                n,
+                                act_dtype,
+                                exc_info=True,
+                            )
+                            warmed = False
+                            break
+                    if not warmed:
                         break
                 if warmed:
                     logger.info(
@@ -448,7 +459,6 @@ class BaseRunner(ABC):
                         list(buckets),
                         n,
                     )
-                    break
         except Exception:
             logger.warning("FLA gated RMS-norm pre-load failed", exc_info=True)
 
