@@ -254,6 +254,26 @@ def prepare_draft_extend_inputs(accept_lens, predict, num_draft_tokens):
     return correct, select, ids
 
 
+def preload_draft_extend_layout(device, num_draft_tokens):
+    """Device-load both specializations of the draft-extend layout kernel.
+
+    ``prepare_draft_extend_layout`` passes ``MAKE_MROPE=with_mrope`` as a
+    constexpr, so the mrope and non-mrope paths are two separate kernels, and
+    the second one only appears once a batch carries multimodal inputs (a
+    text-only batch is with_mrope=True). The request-driven warmup never sends
+    multimodal input, so that kernel used to be device-loaded from inside the
+    serve path instead of at init; see srt/utils/triton_load_watch.py for why a
+    late ``cuModuleLoadData`` hangs on a post-init engine.
+
+    ``BS`` is ``do_not_specialize``, so one batch shape is enough.
+    """
+    with torch.inference_mode():
+        seq_lens = torch.arange(1, dtype=torch.int64, device=device)
+        for with_mrope in (True, False):
+            prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope)
+    torch.cuda.synchronize(device)
+
+
 @triton.jit(do_not_specialize=["BS"])
 def _prepare_draft_extend_lengths_kernel(
     seq_lens,

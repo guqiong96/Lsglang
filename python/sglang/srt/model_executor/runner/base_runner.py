@@ -52,6 +52,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_parallel,
+    get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
@@ -298,6 +300,114 @@ class BaseRunner(ABC):
             )
 
             pp_parallel_deep_gemm_warmup(self)
+
+        # Speculative-decode kernels that only a particular request shape or
+        # sampling setting reaches. Paid here, at init, because the first use is
+        # otherwise a device-load from inside the serve path: those need driver
+        # bookkeeping (cuModuleLoadData / cuKernelGetFunction) that a post-init
+        # engine has almost no outside-allocator headroom for, and the load
+        # spins there instead of failing (see srt/utils/triton_load_watch.py).
+        if mr.spec_algorithm.is_speculative():
+            num_draft_tokens = get_spec().speculative_num_draft_tokens
+
+            # The draft-extend layout kernel: MAKE_MROPE is a constexpr, so the
+            # mrope and non-mrope paths are two kernels, and the non-mrope one
+            # appears only once a batch carries multimodal inputs. The
+            # request-driven warmup only sends text, i.e. only the mrope one.
+            if mr.model_config.model_is_mrope:
+                from sglang.kernels.ops.speculative.eagle import (
+                    preload_draft_extend_layout,
+                )
+
+                try:
+                    preload_draft_extend_layout(mr.device, num_draft_tokens)
+                    logger.info(
+                        "pre-loaded the draft-extend layout kernel: "
+                        "with_mrope=(True, False), num_draft_tokens=%d",
+                        num_draft_tokens,
+                    )
+                except Exception:
+                    # Pre-loading is an optimisation: never keep the engine from
+                    # starting. A miss only restores the old mid-serving load.
+                    logger.warning(
+                        "draft-extend layout pre-load failed", exc_info=True
+                    )
+
+            # The verify-step renorm sampling: reached only by requests that
+            # enable top-k / top-p, so greedy-only traffic leaves it cold.
+            from sglang.srt.speculative.eagle_utils import preload_eagle_sampling
+
+            max_bs = max(1, get_schedule().max_running_requests)
+            try:
+                preload_eagle_sampling(
+                    mr.device,
+                    mr.model_config.vocab_size,
+                    num_draft_tokens,
+                    batch_size=max_bs,
+                    spec_steps=get_spec().speculative_num_steps,
+                    topk=get_spec().speculative_eagle_topk,
+                )
+                logger.info(
+                    "pre-loaded the verify-step sampling kernels: "
+                    "bs=1..%d, rows/bs=%d, vocab=%d, spec_steps=%d, topk=%d",
+                    max_bs,
+                    num_draft_tokens,
+                    mr.model_config.vocab_size,
+                    get_spec().speculative_num_steps,
+                    get_spec().speculative_eagle_topk,
+                )
+            except Exception:
+                logger.warning(
+                    "verify-step renorm sampling pre-load failed", exc_info=True
+                )
+
+        # FLA gated RMS-norm (the fp8 path of the linear-attention layers): its
+        # kernel is keyed by the head count the module quantises, so it is first
+        # touched at serving time for whatever token count and head count the
+        # request produces. Replay the module's own call once per token bucket.
+        try:
+            from sglang.kernels.ops.attention.fla.layernorm_gated import (
+                _layer_norm_fwd,
+            )
+
+            attn_tp_size = max(1, get_parallel().attn_tp_size)
+            for module in mr.model.modules():
+                heads = getattr(module, "num_v_heads", None)
+                norm = getattr(module, "norm", None)
+                if heads is None or norm is None or not hasattr(norm, "weight"):
+                    continue
+                n = int(norm.weight.numel())
+                if isinstance(heads, (list, tuple)):
+                    heads = int(sum(heads))
+                quant_heads = max(1, int(heads) // attn_tp_size)
+                # _layer_norm_fwd asserts M % quant_heads == 0, so the replay
+                # has to use token counts that are multiples of the head count.
+                for tokens in (quant_heads, 128 * quant_heads):
+                    x = torch.zeros(
+                        tokens, n, device=mr.device, dtype=torch.bfloat16
+                    )
+                    z = torch.zeros_like(x)
+                    _layer_norm_fwd(
+                        x,
+                        norm.weight,
+                        None,
+                        float(getattr(norm, "eps", 1e-6)),
+                        z=z,
+                        is_rms_norm=True,
+                        activation=getattr(norm, "activation", "swish"),
+                        quant_heads=quant_heads,
+                    )
+                logger.info(
+                    "pre-loaded the FLA gated RMS-norm kernel: tokens=(%d, %d), "
+                    "hidden=%d, quant_heads=%d",
+                    quant_heads,
+                    128 * quant_heads,
+                    n,
+                    quant_heads,
+                )
+                break
+        except Exception:
+            logger.warning("FLA gated RMS-norm pre-load failed", exc_info=True)
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Allocate flashinfer allreduce workspaces; must run before CG capture

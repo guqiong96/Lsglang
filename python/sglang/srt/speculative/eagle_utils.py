@@ -738,6 +738,140 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def preload_eagle_sampling(
+    device,
+    vocab_size: int,
+    num_draft_tokens: int,
+    batch_size: int = 1,
+    spec_steps: int = 1,
+    topk: int = 1,
+) -> None:
+    """Device-load the renorm sampling kernels the verify step uses.
+
+    ``eagle_sample`` renormalises the target probabilities with top-k / top-p
+    only when the request enables them, so a server that starts on greedy
+    traffic can serve for hours before the first request that needs them. That
+    first call resolves the kernel inside the driver (``cuKernelGetFunction``
+    followed by ``cudaFuncSetAttribute``) and hangs there on a post-init
+    engine -- the same failure mode Triton device-loads have, see
+    ``srt/utils/triton_load_watch.py``. Pay the load at init, for every batch
+    bucket the scheduler can form (``rows = bs * num_draft_tokens``).
+
+    The tree-sampling JIT module is keyed by the same row count. Its inputs are
+    a real tree, so the tensors come from ``build_tree_kernel_efficient`` -- the
+    same builder the verify step uses -- with a chain parent list, rather than
+    from a hand-made topology (which walks out of bounds inside the kernel).
+    """
+    if _is_hip:
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_k_renorm_probs_triton as top_k_renorm_prob,
+        )
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton as top_p_renorm_prob,
+        )
+    elif _is_cuda:
+        from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+        from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+        from sglang.kernels.ops.speculative.sampling import (
+            tree_speculative_sampling_target_only as tree_sampling,
+        )
+    elif not _is_npu:
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+        from sgl_kernel import (
+            tree_speculative_sampling_target_only as tree_sampling,
+        )
+    else:
+        return
+
+    for bs in range(1, max(1, batch_size) + 1):
+        rows = bs * num_draft_tokens
+        probs = torch.full(
+            (rows, vocab_size), 1.0 / vocab_size, dtype=torch.float32, device=device
+        )
+        top_k = torch.full((rows,), 20, dtype=torch.int32, device=device)
+        top_p = torch.full((rows,), 0.95, dtype=torch.float32, device=device)
+        with torch.inference_mode():
+            top_k_renorm_prob(probs, top_k)
+            top_p_renorm_prob(probs, top_p)
+
+        # Tree verification. The tree tensors must satisfy the builder's
+        # invariants -- retrieve_next_token / retrieve_next_sibling index into
+        # the tree, so a hand-made topology walks out of bounds and poisons the
+        # context -- so take them from the same builder the real verify uses.
+        # Only the topk=1 chain is reproduced here (the shape a chain draft
+        # produces); other top-k values keep their serving-time load.
+        if spec_steps and topk == 1:
+            bonus = torch.randint(
+                0, vocab_size, (bs,), dtype=torch.int64, device=device
+            )
+            draft = torch.randint(
+                0,
+                vocab_size,
+                (bs, max(1, num_draft_tokens - 1)),
+                dtype=torch.int64,
+                device=device,
+            )
+            seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
+            parent_list = torch.arange(
+                -1, spec_steps - 1, dtype=torch.long, device=device
+            ).repeat(bs, 1)
+            top_scores = torch.arange(
+                spec_steps, dtype=torch.long, device=device
+            ).repeat(bs, 1)
+            with torch.inference_mode():
+                tree = build_tree_kernel_efficient(
+                    bonus,
+                    parent_list,
+                    top_scores,
+                    draft,
+                    seq_lens,
+                    bs,
+                    topk,
+                    spec_steps,
+                    num_draft_tokens,
+                )
+            _mask, _positions, retrieve_index, retrieve_next_token, retrieve_next_sibling, tree_tokens = tree
+            candidates = tree_tokens.view(bs, num_draft_tokens)
+            target_probs = torch.zeros(
+                (bs, num_draft_tokens, vocab_size), dtype=torch.float32, device=device
+            )
+            target_probs[..., 0] = 1.0
+            draft_probs = torch.zeros_like(target_probs)
+            draft_probs[..., 0] = 1.0
+            with torch.inference_mode():
+                tree_sampling(
+                    predicts=torch.zeros(
+                        bs * num_draft_tokens, dtype=torch.int32, device=device
+                    ),
+                    accept_index=torch.full(
+                        (bs, num_draft_tokens + 1),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    accept_token_num=torch.empty(
+                        bs, dtype=torch.int32, device=device
+                    ),
+                    candidates=candidates,
+                    retrive_index=retrieve_index,
+                    retrive_next_token=retrieve_next_token,
+                    retrive_next_sibling=retrieve_next_sibling,
+                    uniform_samples=torch.rand(
+                        (bs, num_draft_tokens), dtype=torch.float32, device=device
+                    ),
+                    uniform_samples_for_final_sampling=torch.rand(
+                        (bs,), dtype=torch.float32, device=device
+                    ),
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=get_spec().speculative_accept_threshold_single,
+                    threshold_acc=get_spec().speculative_accept_threshold_acc,
+                    deterministic=True,
+                )
+
+    torch.cuda.synchronize(device)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
