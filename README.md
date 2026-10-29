@@ -97,7 +97,6 @@ LK_MOE_HYBRID_ENABLED=1 \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
 LK_THREAD_BINDING=NUMA_NODE \
-LK_GPU_PREFETCH_WINDOW=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
 LK_GPU_PREFILL_ENGINE=cutlass \
 LK_GPU_PREFILL_SUB_M=65536 \
@@ -145,6 +144,21 @@ sglang serve \
 
 All lk_moe switches use the unified `LK_*` prefix. Legacy `LVLLM_*` names are still accepted: they are auto-renamed at startup with a one-line warning (if both spellings are set, `LK_*` wins). Our knobs never use the `SGLANG_*` prefix.
 
+### New server flag (this fork): `--moe-runner-backend sm12x_nvfp4_bf16`
+
+Adds `sm12x_nvfp4_bf16` to the upstream `--moe-runner-backend` choices (all
+upstream values unchanged). Use it for NVFP4 (modelopt) MoE checkpoints on
+SM120-family GPUs - RTX 5090 / 5060 Ti / RTX PRO 6000: MoE layers whose expert
+weights are GPU-resident run SM120 native FP4 tensor-core grouped GEMMs
+instead of the generic triton fallback.
+
+Scope: layers served by lk_moe (CPU-offloaded, pooled, GPU-prefill tier) never
+route through the sglang runner, so this flag does not affect them - it is
+safe, and recommended, to set it together with any `LK_*` configuration. The
+`launch/` recipes targeting 5060 Ti cards already pin it. It is independent of
+`LK_GPU_PREFILL_SM120_W4A4`: that knob is about the pool tier's prefill
+activations, this one about resident-layer GEMMs.
+
 ### Switch linkage (one master gate)
 
 `LK_MOE_HYBRID_ENABLED` is the single master switch: with it off (the default) `lk_moe` is never imported and **every `LK_*` below is inert** — the server runs the stock sglang MoE path bit-for-bit. Every downstream tier is ANDed with it (switches only — perf knobs never appear in a linkage):
@@ -154,7 +168,9 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ pool on            LK_POOL_SLOTS (e.g. 64)      (dual knob: value itself is the switch, 0 = off)
  │   └─ pool decode    LK_POOL_DECODE=1     (unset = follows pool on; explicit `1`/`0` wins)
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
- │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton (default cutlass; triton = opt-out)
+ │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton|flashinfer (default cutlass; triton = opt-out;
+ │   │                                             flashinfer = SM120/SM121 + NVFP4 checkpoints only)
+ │   ├─ w4a4 level     LK_GPU_PREFILL_SM120_W4A4=1   (NVFP4 activations; SM120-family + flashinfer engine)
  │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
  │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
@@ -195,12 +211,11 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 0 = off | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path; not enabled by default (0 on 16 GB cards) |
-| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | engine selector (does not power the tier): `cutlass` = restored C++ grouped-GEMM (bf16 intermediates, faster on long prompts), or `triton` = staging ring + Triton group-GEMM (fp32 activations, matches the CPU reference) — the opt-out when long-context logits or borderline EOS matter; forwarded via cfg, the C++ library itself does not read this env |
-| `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | CUTLASS wave width only (triton ignores it), applied inside each `SUB_M` pass: `-1` = largest wave that fits the borrow slab (clamped to E), `0` = single-shot, `>0` = explicit cap; waves are bit-exact with single-shot |
-| `LK_GPU_PREFILL_D_SLOTS` | prefill | 0 = off | CUTLASS engine only (triton ignores it): split each prefill into narrower passes so the prefill itself holds less VRAM, at the cost of extra kernel launches; the result is unchanged. The value counts routed entries (tokens × top_k), so to size it by tokens set tokens × top_k; it shows up as the `act=` figure in the `[pool] wave width auto` boot line. 0, or a value wide enough to cover the whole batch, keeps the original single-pass behaviour |
-| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 16384), `0` = per-chunk staging. Bigger values move more of each expert's weights per token (faster) but raise the token budget of a single forward - the `CAP=` in the `Super-chunk prefill wrapper active` boot line - and with it the scratch that scales with that budget, incl. a pre-reserved output buffer of ~ SUB_M × hidden × 4 bytes per rank that is already counted against the KV budget; halving it roughly halves that scratch |
-| `LK_GPU_PREFETCH_WINDOW` | prefill | `1` | staging-ring blocks in flight (triton only; cutlass ignores it); `1` = serialized (default); `2` = ping-pong (copy overlaps gemm, needs fast PCIe to pay off) |
-| `LK_GPU_RESERVE_GB` | prefill | 0 | GB of KV budget reserved for lk_moe device-side staging |
+| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | which GPU prefill path runs above the token gate. `cutlass`: fastest on long prompts, works with every pooled dtype; rounds activations to bf16 — long-context logits can shift and borderline EOS can flip; `triton`: output bit-matches the CPU reference, slightly slower; `flashinfer` (SM120/SM121 + **NVFP4 checkpoints only** — the CuTe kernels are NVFP4-only, an fp8/mxfp4 pool layer fails its init probe and the boot aborts by design): stages the weights as FP4 and runs the FP4 tensor cores — works standalone at W4A16 (CPU-matching) numerics, add `LK_GPU_PREFILL_SM120_W4A4=1` to run activations in FP4 too; forwarded via cfg, the C++ library itself does not read this env |
+| `LK_GPU_PREFILL_SM120_W4A4` | prefill | 0 = off | `0`: prefill activations run as BF16 (W4A16) — numerics equal the CPU path on every GPU; `1`: activations run as FP4 (W4A4) — visibly faster prefill, slightly different numerics. Needs the `flashinfer` engine (the only engine implementing W4A4) *and* an SM120-family card; otherwise a one-time warning is logged and prefill stays W4A16 |
+| `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | tier wave width, ONE geometry for all three engines, frozen at init: `-1`/unset = one wave over all E experts (the gate-tested default), `>0` = W experts per wave - a per-wave gemm loop only the cutlass engine has, so `0 < W < E` on a staging engine (triton/flashinfer) aborts at init; appears as `wave=` in the `[tier]` boot line |
+| `LK_GPU_PREFILL_D_SLOTS` | prefill | 0 = off | tier activation window in slot rows, frozen at init (the `act_rows=` figure in the `[tier]` boot line); **all three engines** pace their prefill passes to hold it, at the cost of extra kernel launches, result unchanged. The two staging engines never walk more than their built-in 8192-slot block, so the knob only *tightens* their walk: a value at or above that block (and `0`) leaves them byte-identical to before, and the triton scratch follows a tighter walk. The staging arena still reports `act 0 B` -- its activations live in the driver buffers, not in the arena. `0` = one window per pass (cutlass) |
+| `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 65536), `0` = per-chunk staging; the super-chunk attention wrapper only arms when SUB_M exceeds `--chunked-prefill-size`. Bigger values move more of each expert's weights per token (faster) but raise the token budget of a single forward - the `CAP=` in the `Super-chunk prefill wrapper active` boot line - and with it the scratch that scales with that budget, incl. a pre-reserved output buffer of ~ SUB_M × hidden × 4 bytes per rank that is already counted against the KV budget; halving it roughly halves that scratch |
 
 ### GPU Pool (expert cache)
 
@@ -225,11 +240,11 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 
 | Knob | Type | Default | Description |
 |------|--------|--------|------|
-| `--ple-offload-backend nvme` | ple (CLI) | pinned | PLE table stays on storage; loader writes it once, RAM never holds the table; gathers via VRAM tag cache + pread |
-| `LK_PLE_BLOCK_MB` | ple | unset | PLE prefill conv temporaries budget in MB (bf16, ~6 B/token/channel); unset = block derived from the chunked-prefill size |
-| `LK_NVME_DIRECT` | nvme | `0` | `1`: row filler switches from page-cache pread to O_DIRECT + pinned direct-mapped cache; **only effective under the feature's master switch** |
-| `LK_NVME_CACHE_MB` | nvme | `1024` | MB of the O_DIRECT pinned tag cache (inert when `LK_NVME_DIRECT` or master is off) |
-| `LK_ENGRAM_NVME` | nvme | `0` | DeepSeek-V4.1 Engram: exact NVMe lookup from the safetensors shard itself (no host table) |
+| `--ple-offload-backend nvme` | ple (CLI) | pinned | The PLE table lives on disk: host RAM never holds it, only a row cache |
+| `LK_PLE_BLOCK_MB` | ple | unset | MB budget for PLE prefill temporaries; unset = derived from the chunked-prefill size |
+| `LK_NVME_DIRECT` | nvme | `0` | `1`: table rows are read straight from disk, so serving them cannot evict model/page cache (host RAM stays flat); `0` reads through the OS page cache |
+| `LK_NVME_CACHE_MB` | nvme | `1024` | MB of hot rows kept for the direct-read path (inert unless `LK_NVME_DIRECT=1` and the feature's backend is on) |
+| `LK_ENGRAM_NVME` | nvme | `0` | DeepSeek-V4.1 Engram served directly from the checkpoint file: zero host RAM for the table |
 | `LK_ENGRAM_NVME_CACHE_MB` / `LK_ENGRAM_NVME_STAGING_MB` | nvme | `1024` / `128` | Engram NVMe store cache / staging budgets |
 
 ### Diagnostics (all default off; no effect on the compute path)
@@ -237,11 +252,11 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Area | Description |
 |--------|------|------|
 | `LK_ROUTE_PROBE` | routing | per-step `[RP]` routing traces for offline calibration (requires the pool on) |
-| `LK_POOL_DET_SPLIT` | pool | deterministic split: publish the claimed batch and make the GPU half stream-wait on that batch's copy fence before reading slots; inert without the pool |
-| `LK_POOL_SPLIT_PROBE` | pool | log the frozen split (claim/ready/snapshot counts) per pool layer for batches of ≤32 routed ids; skipped inside CUDA-graph capture |
-| `LK_SPEC_PROBE` | spec | CUDA-event timed draft/verify stages |
-| `LK_PLE_PROBE` | ple | PLE ngram-row temporal locality + traffic probe (`LK_PLE_PROBE_DUMP=<path>` dumps rows) |
-| `LK_PP_DEBUG` | prefill | extra tracing inside the prefill staging tier |
+| `LK_POOL_DET_SPLIT` | pool | force the GPU/CPU split timing to be identical every step — for reproducing pool bugs; tiny decode slowdown |
+| `LK_POOL_SPLIT_PROBE` | pool | print per-layer split counts for small batches (skipped inside CUDA-graph capture) |
+| `LK_SPEC_PROBE` | spec | print per-step draft/verify stage timings |
+| `LK_PLE_PROBE` | ple | PLE row-locality/traffic probe (`LK_PLE_PROBE_DUMP=<path>` dumps rows) |
+| `LK_PP_DEBUG` | prefill | extra `[prefill]` tracing lines |
 | `LK_DECODE_TS` / `LK_TS_SKIPGEMM` | host decode | decode-path timestamp trace / skip-the-gemm A/B (read by lk_moe) |
 | `LK_MBOX_STOPFILE` | mbox | stop-file for orderly teardown (read by lk_moe) |
 | `LK_DISABLE_QSA_SHARE` | draft | draft worker: disable QSA share (A/B isolation only) |
@@ -259,7 +274,7 @@ All recipes assume `LK_MOE_HYBRID_ENABLED=1` (off = stock sglang).
 | **2 CPU hybrid** | default layer role, no extra parameters; tune the CPU side: `LK_THREADS=(physical cores / #GPUs)`, `LK_THREAD_BINDING=CPU_CORE`; give the saved VRAM to the KV cache (`--mem-fraction-static` as high as it fits) |
 | **4 CPU + GPU Pool** | `LK_POOL_SLOTS=<from spare VRAM>` (e.g. 64; `>0` is itself the pool switch — there is no separate `LK_POOL` flag; membership covers every non-resident layer); check `LK_POOL_LOG=100` and watch `[pool] win hit=` — raise `LK_POOL_SLOTS` or `LK_POOL_WINDOW` if the hit rate is low |
 | **3/5 Speculative decoding** | `--speculative-algorithm NEXTN` (or DSPARK flags) + resident draft: `LK_GPU_RESIDENT_MOE_LAYERS_SPEC`; when combined with GPU Pool, check VRAM and measure first |
-| **Super Mix Prefill** | `LK_GPU_PREFILL_MIN_TOKENS=1024~4096 LK_GPU_PREFILL_SUB_M=16384` + `--chunked-prefill-size 32000`; on cards with fast PCIe try `LK_GPU_PREFETCH_WINDOW=2` (ping-pong, copy overlaps gemm; default `1` = serialized); on 16 GB-class cards: `LK_GPU_PREFILL_MIN_TOKENS=0` + `--chunked-prefill-size 4096` |
+| **Super Mix Prefill** | `LK_GPU_PREFILL_SUB_M=65536` + `--chunked-prefill-size 8192` (SUB_M must EXCEED the chunked size or the super-chunk wrapper never arms; the `[super-chunk]`/`Super-chunk prefill wrapper active` boot line shows CAP/inner); on 16 GB-class cards: `LK_GPU_PREFILL_MIN_TOKENS=0` + `--chunked-prefill-size 4096` |
 
 What is actually active:
 
