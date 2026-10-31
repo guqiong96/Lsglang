@@ -135,6 +135,7 @@ from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     get_lk_ple_probe_dump_path,
     get_lk_pool_layer_set,
     get_model_type_from_layer_name,
+    get_pool_decode_engine,
     get_pool_inflight,
     get_pool_log,
     get_pool_slots,

@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 _LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
 _LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_pool_decode_engine, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -2091,6 +2091,7 @@ class FusedMoE(torch.nn.Module):
         cfg.role_draft = self.model_type != "main"
         cfg.pool_decode = self.pool_decode
         cfg.pool_slots = get_pool_slots()
+        cfg.pool_log = get_pool_log()
         cfg.verify_resident = get_verify_resident()
         cfg.verify_skip_miss = get_verify_skip_miss()
         cfg.hf_mbox = get_hf_mbox()
@@ -2528,6 +2529,14 @@ class FusedMoE(torch.nn.Module):
             H=H, I=I, k=k, NB_GATEUP=NB_GATEUP, NB_DOWN=NB_DOWN,
             NGK=NGK, KS=KS, ITERS=ITERS, **caps,
         )
+        # The resident half's engine. Probed once per layer, kept in geo so the
+        # launch path is a dict lookup; None means the GEMV trio above stands
+        # (and probe already said why, once). Imported lazily: only an SM12x
+        # box with the flashinfer engine ever pulls in flashinfer here.
+        self._pool_layer_info["sm12x"] = None
+        if get_pool_decode_engine() == "sm12x":
+            from lk_moe.decode_sm12x import Sm12xDecode
+            self._pool_layer_info["sm12x"] = Sm12xDecode.probe(self.lk_moe)
         self.lk_moe.pool_gpu_report(True)
 
     def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
@@ -2590,6 +2599,17 @@ class FusedMoE(torch.nn.Module):
             # ONE volatile gather of the mapped snapshot into a device table:
             # per-program host reads (k*NB_GATEUP*NGK PCIe round-trips/layer, queued
             # behind the pump's H2D) were the whole speed regression.
+            drv = geo["sm12x"]
+            if drv is not None:
+                # Resident half in ONE fused SM12x launch over the pool's own
+                # regions. The ids it gets are the slot numbers out of the SAME
+                # frozen snapshot word slot_table_fill reads below, so the
+                # resident/missing split -- and therefore what the CPU half is
+                # still on the hook for -- is bit-for-bit the same choice.
+                drv.launch(hidden_states, gathered_ids, gathered_weights,
+                           gout, n_slots, real_tokens)
+                self.lk_moe.pool_record_aux(side_stream.cuda_stream)
+                return
             slot_table_fill[(1,)](
                 gathered_ids, geo["snapshot_addr"], slot_tab, n_slots,
                 BLOCK=triton.next_power_of_2(n_slots))

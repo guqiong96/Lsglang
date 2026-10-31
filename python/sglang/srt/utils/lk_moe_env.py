@@ -352,6 +352,23 @@ def is_lk_pool_decode_enabled() -> bool:
     return get_bool_env_var("LK_POOL_DECODE",
                             "true" if is_lk_pool_enabled() else "false")
 
+def get_pool_decode_engine() -> str:
+    # Pure selector switch (same doctrine as get_gpu_prefill_engine): the pool
+    # decode tier is powered by LK_POOL_DECODE, this only picks the
+    # implementation of its RESIDENT half (the CPU half and the paired-skip
+    # split are identical either way):
+    #   "gemv"   (default) = the three Triton GEMV launches + two reduces
+    #   "sm12x"            = SM120/SM121 only: one fused flashinfer W4A16 call
+    #                        on the pool's canonical regions (zero copy). Needs
+    #                        the canonical slot layout, i.e. the flashinfer
+    #                        prefill engine and intermediate % 128 == 0; logs
+    #                        the reason and stays on "gemv" when unavailable.
+    # The kernel's intermediate is FP16 (measured 3e-3 against an fp32 oracle
+    # where the GEMV path is 2e-7), so this is a numerics CLASS, not a free
+    # speed switch -- see journal 2026-10-30.
+    val = get_str_env_var("LK_POOL_DECODE_ENGINE", "gemv").strip().lower()
+    return val if val in ("gemv", "sm12x") else "gemv"
+
 def enabled_layerwise_load() -> bool:
     return get_bool_env_var("LK_MOE_LAYERWISE_LOAD")
 
