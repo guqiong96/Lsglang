@@ -80,7 +80,11 @@ def _assert_nonneg_and_invalidate(
 ) -> None:
     """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
     Compiled so the reduction + assert + scatter run as one kernel launch."""
-    torch._assert_async((values >= 0).all())
+    torch._assert_async(
+        (values >= 0).all(),
+        "overlap: an input id was still the unresolved -1 sentinel when the "
+        "forward started (FutureMap stash did not cover this batch)",
+    )
     buf[indices] = -1
 
 

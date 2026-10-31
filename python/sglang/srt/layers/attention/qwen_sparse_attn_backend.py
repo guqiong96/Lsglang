@@ -500,7 +500,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
         torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all(),
+            f"qsa write plan: block range exceeds the token slot table width "
+            f"(table_width={token_slot_table.shape[1]}, compress_ratio={compress_ratio})",
         )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
@@ -558,7 +560,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # Named: with the message empty this fired twice as
+        # "_assert_async_cuda_kernel: Assertion `` failed", which says nothing
+        # about which of the three async asserts tripped. The assumption below
+        # is that a radix-matched prefix is ratio-aligned; that only follows
+        # from page alignment when page_size is a multiple of the compression
+        # ratio, so keep both numbers in the message. Nothing device-side may
+        # appear here: the message arguments are built on the host every call
+        # and a .tolist() would turn this assert into a per-batch sync.
+        _pool = getattr(self, "token_to_kv_pool", None)
+        torch._assert_async(
+            (prefix_lens % ratio == 0).all(),
+            f"qsa extend: matched prefix not a multiple of the compression ratio "
+            f"(ratio={ratio}, page_size={getattr(_pool, 'page_size', None)})",
+        )
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
