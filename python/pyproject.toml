@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsglang"
-version = "1.7.0"
+version = "1.7.1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -79,7 +79,7 @@ dependencies = [
   "sgl-deep-ep==0.1.2.post1",
   "sgl-deep-gemm==0.2.2",
   "sglang-kernel==0.4.10",
-  "lk_moe==2.8.0",
+  "lk_moe==2.8.1",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",

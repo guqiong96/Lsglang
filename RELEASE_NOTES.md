@@ -1,3 +1,31 @@
+# lsglang 1.7.1 (from 1.7.0)
+
+Needs lk_moe 2.8.1.
+
+## MoE on consumer Blackwell (SM120: RTX 5090 / 5060 Ti / RTX PRO 6000)
+
+- **`LK_POOL_DECODE_ENGINE`** (new; default `gemv`, unchanged). With a GPU expert
+  pool, chooses the kernel the decode GPU half uses. `sm12x` runs the FP4 kernel:
+  +5.4% per step at one row and +3.3% at two rows (2x5060 Ti, same build), and
+  keeps its intermediates in FP16, so it is a numerics class rather than a free
+  speed switch - output differs in the third decimal. Needs
+  `LK_GPU_PREFILL_ENGINE=flashinfer` and an intermediate size divisible by 128;
+  otherwise it logs the reason and stays on `gemv`.
+- **`LK_POOL_MBOX_SPLIT`** (new; code default off, `1` in the `launch/`
+  recipes). Starts the decode GPU half before the CPU half is joined. Nothing
+  measured at one or two rows per step, so it is a knob rather than a win, and
+  the shipped recipes run with it on.
+
+## Stability
+
+- A long prompt is no longer an abort risk when another request joins it in
+  mid-prefill; the server used to die on an assertion in that path. No parameter
+  change.
+- When a sparse-attention check does fire, the log line names what it was
+  guarding instead of printing an empty assertion message.
+
+---
+
 # lsglang 1.7.0 (from 1.6.6)
 
 ## MoE on consumer Blackwell (SM120: RTX 5090 / 5060 Ti / RTX PRO 6000)
