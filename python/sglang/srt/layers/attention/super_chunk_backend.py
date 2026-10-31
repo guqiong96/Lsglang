@@ -45,7 +45,10 @@ if TYPE_CHECKING:
 
 
 def _super_chunk_unsupported_reason(
-    fb: ForwardBatch, inner_size: int, allow_spec_info_extend: bool = False
+    fb: ForwardBatch,
+    inner_size: int,
+    allow_spec_info_extend: bool = False,
+    cut_align: int = 1,
 ) -> Optional[str]:
     if inner_size <= 0:
         return "disabled (super_chunk_inner_size=0)"
@@ -108,14 +111,34 @@ def _super_chunk_unsupported_reason(
         if any(
             lo < b < hi
             for b in boundaries
-            for lo, hi in compute_super_chunk_token_bounds(fb, inner_size)
+            for lo, hi in compute_super_chunk_token_bounds(
+                fb, inner_size, cut_align=cut_align
+            )
         ):
             return "child would straddle a sequence boundary"
     return None
 
 
+def _child_cut_align(primary: AttentionBackend) -> int:
+    """Token alignment a child's cut must keep, measured from its own sequence.
+
+    A backend that compresses ``ratio`` tokens into one index entry can only
+    start a sub-chunk where its own block grid can land, and it reads that
+    starting point straight out of the cut (build_super_chunk_children sets
+    ``prefix = pref + (cut - seq_start)``), so an offset that is not a multiple
+    of the ratio means "a group is half written". QSA is the only one with such
+    a grid; backends without it impose nothing (align 1).
+    """
+    pool = getattr(primary, "token_to_kv_pool", None)
+    ratio = getattr(pool, "qsa_compress_ratio", 1)
+    try:
+        return max(1, int(ratio or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def compute_super_chunk_token_bounds(
-    fb: ForwardBatch, inner_size: int
+    fb: ForwardBatch, inner_size: int, cut_align: int = 1
 ) -> List[Tuple[int, int]]:
     """Token-axis [lo, hi) bounds, cut at multiples of inner_size AND at every
     sequence boundary (cumulative extend_seq_lens_cpu).
@@ -130,6 +153,20 @@ def compute_super_chunk_token_bounds(
     length). When extend_seq_lens_cpu is unavailable the grid-only cut is
     kept (no allocation here); the gate in _super_chunk_unsupported_reason is
     what disables the wrapper for batches whose children would straddle.
+
+    ``cut_align`` (the child's compression ratio, see _child_cut_align) fixes the
+    other half of the same mistake. A grid cut is a multiple of the BATCH grid,
+    but what a child needs is an offset that is a multiple of its ratio measured
+    from its OWN sequence start, and those differ by cum[r] % cut_align: a packed
+    batch whose earlier requests contribute a token count that is not a multiple
+    of the ratio hands the later request's mid-sequence child a prefix with a
+    nonzero residue. Sequence-boundary cuts need no snapping (their child's
+    prefix is the request's own prefix, which the paging already aligns), so a
+    single long request never hit this - which is why months of 65536-row
+    single-sequence prefills were clean and only a long-tail-plus-short-ride
+    batch did (the 02:53 crash: qsa extend assert, empty message pre-naming).
+    Snapping down keeps the cut inside the same sequence, so a child grows by at
+    most cut_align - 1 rows and still covers exactly one sequence.
     """
     total = fb.extend_num_tokens
     cuts = {0, total}
@@ -140,10 +177,24 @@ def compute_super_chunk_token_bounds(
     ext_lens = getattr(fb, "extend_seq_lens_cpu", None)
     if ext_lens is not None and sum(int(el) for el in ext_lens) == total:
         cum = 0
+        starts = []
+        lengths = []
         for el in ext_lens:
-            cum += int(el)
+            starts.append(cum)
+            lengths.append(int(el))
+            cum += lengths[-1]
             if 0 < cum < total:
                 cuts.add(cum)
+        if cut_align > 1:
+            import bisect
+
+            for c in [c for c in cuts if 0 < c < total]:
+                r = bisect.bisect_right(starts, c) - 1
+                if starts[r] < c < starts[r] + lengths[r]:  # strictly inside seq r
+                    off = c - starts[r]
+                    if off % cut_align:
+                        cuts.discard(c)
+                        cuts.add(starts[r] + (off // cut_align) * cut_align)
     pts = sorted(cuts)
     return list(zip(pts, pts[1:]))
 
@@ -328,6 +379,10 @@ class SuperChunkAttnBackend(AttentionBackend):
         super().__init__()
         self.primary = primary
         self.inner_size = inner_size
+        # What a cut inside a sequence must be a multiple of, measured from that
+        # sequence's start (02:53 crash: a grid cut is aligned to the batch grid,
+        # not to the sequence; see compute_super_chunk_token_bounds).
+        self._cut_align = _child_cut_align(primary)
         self._creator = creator
         self._allow_spec_info_extend = allow_spec_info_extend
         self._mtp_shared_state = None
@@ -422,7 +477,10 @@ class SuperChunkAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         reason = _super_chunk_unsupported_reason(
-            forward_batch, self.inner_size, self._allow_spec_info_extend
+            forward_batch,
+            self.inner_size,
+            self._allow_spec_info_extend,
+            cut_align=self._cut_align,
         )
         if reason is not None:
             self._active = False
@@ -439,7 +497,9 @@ class SuperChunkAttnBackend(AttentionBackend):
             self.primary.init_forward_metadata(forward_batch=forward_batch)
             return
 
-        bounds = compute_super_chunk_token_bounds(forward_batch, self.inner_size)
+        bounds = compute_super_chunk_token_bounds(
+            forward_batch, self.inner_size, cut_align=self._cut_align
+        )
         self._child_bounds = bounds
         self._child_batches = build_super_chunk_children(forward_batch, bounds)
         for i, child_fb in enumerate(self._child_batches):
