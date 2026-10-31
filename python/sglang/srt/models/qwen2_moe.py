@@ -541,9 +541,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
                 else:
-                    shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
+                    # The generic path paid three kernels for five kilobytes of
+                    # math: an N=1 cuBLAS gemv (so launch-latency bound, ~10us
+                    # whatever the shape), a sigmoid, and a broadcast mul. The
+                    # fused form keeps the gate in fp32 (the gemv used to round
+                    # it through bf16), reduces the row inside one CTA so the
+                    # result stays replay-deterministic, and is what the
+                    # deferred-finalize path already uses below.
+                    shared_output = self._gate_shared_output_out_of_place(
+                        hidden_states, shared_output
                     )
 
         return shared_output
