@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 _LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
 _LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_pool_decode_engine, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_pool_decode_engine, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -133,6 +133,10 @@ else:
 _LK_POOL_DET_SPLIT = bool(
     is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_DET_SPLIT")
 )
+# Doorbell/join split of the mailbox early-start path (see lk_moe_env); the two
+# call sites are in _pool_decode_launch (mode=1) and _cpu_decode (mode=2) and must
+# agree, so the decision is made once per step and passed down.
+_LK_POOL_MBOX_SPLIT = is_pool_mbox_split()
 _LK_POOL_SPLIT_PROBE = bool(
     is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_SPLIT_PROBE")
 )
@@ -382,6 +386,12 @@ class FusedMoE(torch.nn.Module):
     # Verify-batch row multiplier (NEXTN draft rows per real token) agreed
     # across pool layers at init; single source of truth for decode sizing.
     _pool_verify_rows_mult = 1
+
+    # Stream-order event for the mailbox doorbell/join split (see _cpu_decode).
+    # Per layer, not shared: one graph records it once per pool layer, and a single
+    # handle reused across layers is a question nobody needs to answer. It stays
+    # None for a layer first seen inside capture, which keeps that layer unsplit.
+    _pool_join_ev = None
 
     def __init__(
         self,
@@ -2540,7 +2550,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe.pool_gpu_report(True)
 
     def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
-                         real_tokens=None, rows_per_token=1):
+                         real_tokens=None, rows_per_token=1, mbox_split=False):
         global _LK_POOL_PROBE_N
         geo = self._pool_layer_info
         if (_LK_POOL_SPLIT_PROBE and not get_is_capture_mode()
@@ -2591,6 +2601,22 @@ class FusedMoE(torch.nn.Module):
             # failing wait must kill the step, not slip past an `except: pass`.
             lk_moe.pool_wait_fence(geo["layer"], side_stream.cuda_stream)
         with torch.cuda.stream(side_stream):
+            if mbox_split:
+                # Start the CPU half HERE, ahead of every kernel the resident half
+                # launches, and on THIS stream. Two reasons it belongs here: the
+                # doorbell must be ordered after the router (which ran on the main
+                # stream, and this stream already waited on it above), and every
+                # us the worker starts earlier is a us the main stream does not
+                # spend spinning in the join's host node -- hf_wait p50 was 14us,
+                # hf_dec p50 12us, i.e. the CPU half was entirely exposed. The
+                # routing cannot be known before the router, so this is all the
+                # head start that exists.
+                self.lk_moe.cpu_decode(
+                    side_stream.cuda_stream, hidden_states.size(0), self.top_k,
+                    hidden_states.data_ptr(), topk_ids.data_ptr(),
+                    topk_weights.data_ptr(), 0,
+                    real_tokens=-1 if real_tokens is None else real_tokens,
+                    rows_per_token=rows_per_token, mode=1)
             if rows_per_token > 1:
                 gather_rows[(triton.cdiv(n_slots, 128),)](
                     topk_ids, topk_weights, gathered_ids, gathered_weights,
@@ -2662,17 +2688,35 @@ class FusedMoE(torch.nn.Module):
         covered = (self._pool_layer_info is not None
                  and real_tokens <= FusedMoE._pool_decode_cap)
 
+        # The doorbell half of the mailbox path can go on the pool stream only if
+        # the join below will be moved to after the GPU half; the two halves of the
+        # split are one decision, made here and passed down. An event object is not
+        # something to allocate mid-capture, so a layer that is captured before it
+        # ever ran eagerly simply stays on the unsplit path.
+        split = _LK_POOL_MBOX_SPLIT and covered
+        if split and self._pool_join_ev is None and not get_is_capture_mode():
+            self._pool_join_ev = torch.cuda.Event()
+        split = split and self._pool_join_ev is not None
+
         if covered:
             self.lk_moe.pool_gpu_report(True)
             self._pool_decode_launch(hidden_states, topk_ids, topk_weights,
                                   real_tokens=real_tokens,
-                                  rows_per_token=rows_per_token)
+                                  rows_per_token=rows_per_token,
+                                  mbox_split=split)
         else:
             # Sticky flag: an uncovered batch must clear it or the C++ side keeps
             # skipping the resident experts it believes the GPU half covered,
             # while this batch's GPU half never ran -> silently dropped experts.
             self.lk_moe.pool_gpu_report(False)
         stream_ptr = torch.cuda.current_stream().cuda_stream
+        if split:
+            # The resident half is queued on the pool stream behind the doorbell;
+            # joining after it is the whole point of the split -- the CPU half's
+            # compute overlaps the GPU half's kernels instead of the main stream
+            # standing in front of a host node while both run.
+            self._pool_join_ev.record(FusedMoE.pool_stream)
+            torch.cuda.current_stream().wait_event(self._pool_join_ev)
         self.lk_moe.cpu_decode(
             stream_ptr,
             bs,
@@ -2683,6 +2727,7 @@ class FusedMoE(torch.nn.Module):
             FusedMoE.output_gpu.data_ptr(),
             real_tokens=real_tokens,
             rows_per_token=rows_per_token,
+            mode=2 if split else 0,
         )
 
         if covered:

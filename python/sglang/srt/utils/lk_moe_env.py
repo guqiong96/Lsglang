@@ -352,6 +352,28 @@ def is_lk_pool_decode_enabled() -> bool:
     return get_bool_env_var("LK_POOL_DECODE",
                             "true" if is_lk_pool_enabled() else "false")
 
+def is_pool_mbox_split() -> bool:
+    # Split the mailbox early-start path into "ring the doorbell" (on the pool
+    # stream, before the GPU half's kernels) and "join" (on the main stream,
+    # after them), so the CPU half's compute overlaps the resident half's kernels
+    # instead of the main stream standing in a host node: hf_wait p50 was 14us and
+    # hf_dec p50 12us, i.e. the CPU work was fully exposed.
+    #
+    # Default OFF, because it measured as nothing and the reason is worth keeping
+    # next to the code: q36/2x5060Ti, same build, 128 slots, 7300-step stream --
+    # 7.43 vs 7.07-7.35 ms/step at one row (no better), 9.70 at two rows (same),
+    # while hf_dec p50 went 12us -> 47-52us. The dependency did not move: the
+    # layer cannot consume the expert output before the CPU half is done, so
+    # reordering changes which wait the stall is *counted as*, and the CPU work
+    # costs more when it runs beside the GPU work it was meant to hide. What the
+    # block is really bounded by is max(CPU compute, resident-half kernels), so
+    # shortening it means making one of those two smaller, not rearranging them.
+    # Correctness of the split was checked while it was on: cmiss=cdup=0 (every
+    # routed occurrence still owned by exactly one side) and no
+    # "join without doorbell" fallback fired.
+    return is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_MBOX_SPLIT")
+
+
 def get_pool_decode_engine() -> str:
     # Pure selector switch (same doctrine as get_gpu_prefill_engine): the pool
     # decode tier is powered by LK_POOL_DECODE, this only picks the
@@ -365,7 +387,22 @@ def get_pool_decode_engine() -> str:
     #                        the reason and stays on "gemv" when unavailable.
     # The kernel's intermediate is FP16 (measured 3e-3 against an fp32 oracle
     # where the GEMV path is 2e-7), so this is a numerics CLASS, not a free
-    # speed switch -- see journal 2026-10-30.
+    # speed switch -- see journal 2026-10-30. Gate that class with the unit test
+    # against an fp32 oracle, NOT with model-level statistics: here the SAME
+    # engine run twice disagreed on 8 of 50 gsm8k questions and differed by 3
+    # questions of accuracy (43 vs 46), so nothing measured at that level can see
+    # a 3e-3 kernel difference -- greedy drift and per-token logprobs are buried
+    # the same way, because which half of the model produced a logit moves with
+    # the resident set.
+    #
+    # What it buys, measured on q36/2x5060Ti with the same build and one long
+    # stream per configuration: the resident half's kernels cost 2.1x less GPU
+    # time (0.71 vs 1.51 ms/step) and the STEP moves +5.4% at one row per step
+    # (7.21 ms mean of six runs against 7.60) and +3.3% at two rows (9.70 against
+    # 10.03). It is not a bs=1 lever: at one row per step most of that
+    # GPU saving was already being hidden by the attention projections, the
+    # all-reduces and the CPU half, which is why a kernel-only benchmark
+    # overpromises by ~2.5x.
     val = get_str_env_var("LK_POOL_DECODE_ENGINE", "gemv").strip().lower()
     return val if val in ("gemv", "sm12x") else "gemv"
 
