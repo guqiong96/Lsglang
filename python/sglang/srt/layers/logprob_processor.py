@@ -489,8 +489,11 @@ class InputLogprobProcessor:
         self.chunking_group = chunking_group
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
-        # chunk size for logprobs processing
+        # chunk size for logprobs processing. The env is an OVERRIDE: the
+        # default granularity is the prefill that produced the rows, see
+        # _chunk_size(). One number for every component is the point.
         self.logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        self._prefill_inner = None
         # Compute input logprobs from logits + logsumexp, skipping the
         # full-vocab log-softmax materialization. Deterministic inference
         # keeps the exact log_softmax path: the fused logsumexp reduces in a
@@ -512,16 +515,17 @@ class InputLogprobProcessor:
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
+        cut = self._chunk_size()
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
         if (
             not self.enable_logprobs_chunk
-            or pruned_states.shape[0] <= self.logprobs_chunk_size
+            or pruned_states.shape[0] <= cut
             or skip_chunking_for_dp_attn
         ):
             chunk_size = max(pruned_states.shape[0], 1)
         else:
-            chunk_size = self.logprobs_chunk_size
+            chunk_size = cut
 
         borrow_logprob_memory = False
         if pruned_states.is_cuda:
@@ -544,6 +548,33 @@ class InputLogprobProcessor:
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
             ),
         )
+
+    def _prefill_inner_size(self) -> int:
+        """Rows one prefill forward can carry, i.e. the super-chunk inner size.
+
+        The super-chunk wrapper cuts a long prefill at
+        ``chunked_prefill_size`` and hands each child to the model; the logprob
+        stage then materializes ``[rows, vocab]`` in fp32, so its chunk must be
+        the same cut. A second, independent default (2048 rows) made the peak
+        follow the logprob knob instead: 2048 x 129280 x 4 B ~ 1.9 GiB for one
+        buffer, which OOMs a 0.95 mem-fraction engine on a 12k-character prompt
+        while the same engine prefills 32k fine (no logprobs requested).
+        """
+        if self._prefill_inner is None:
+            n = 0
+            try:
+                from sglang.srt.runtime_context import get_schedule
+
+                n = int(get_schedule().chunked_prefill_size or 0)
+            except Exception:
+                n = 0
+            self._prefill_inner = max(0, n)
+        return self._prefill_inner
+
+    def _chunk_size(self) -> int:
+        inner = self._prefill_inner_size()
+        # inner == 0: chunked prefill off, nothing to follow; keep the env.
+        return min(self.logprobs_chunk_size, inner) if inner > 0 else self.logprobs_chunk_size
 
     def _can_borrow_logprob_memory(
         self,
