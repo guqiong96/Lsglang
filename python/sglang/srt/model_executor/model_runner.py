@@ -1964,7 +1964,11 @@ class ModelRunner:
                 is_lk_pool_enabled,
             )
 
-            if is_lk_gpu_prefill_enabled() and is_lk_pool_enabled():
+            # The freeze window belongs to the PREFILL TIER, not to the expert
+            # cache: LK_POOL_SLOTS only sizes the decode cache, so a cache of
+            # zero rows must still bracket the chunk (otherwise the staging
+            # engine finds no window and refuses the layer).
+            if is_lk_gpu_prefill_enabled():
                 # lk_moe >= 2.7.0 dropped this helper (the freeze window is
                 # handled inside the staging path); keep working with builds
                 # that still expose it.
@@ -2036,7 +2040,6 @@ class ModelRunner:
             # skipping spec verify can never hide a needed freeze.
             if (
                 is_lk_gpu_prefill_enabled()
-                and is_lk_pool_enabled()
                 and forward_batch.input_ids.numel() >= get_gpu_prefill_min_tokens()
             ):
                 # lk_moe >= 2.7.0 dropped this helper (the freeze window is
