@@ -26,6 +26,7 @@ plain primary-forward, i.e. today's behaviour (safe side).
 from __future__ import annotations
 
 import copy
+import os
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
@@ -199,6 +200,10 @@ def compute_super_chunk_token_bounds(
     return list(zip(pts, pts[1:]))
 
 
+
+
+_SC_DUMPED = set()
+
 def build_super_chunk_children(
     fb: ForwardBatch, bounds: List[Tuple[int, int]]
 ) -> List[ForwardBatch]:
@@ -337,6 +342,25 @@ def build_super_chunk_children(
         r0 = r1
 
     return children
+
+
+_SC_VERIFY_FIELDS = (
+    "raw_out_loc",
+    "seq_lens_casual",
+    "positions_casual",
+    "c4_out_loc",
+    "c128_out_loc",
+    "c1_out_loc",
+    "c2_out_loc",
+    "swa_page_indices",
+    "swa_topk_lengths",
+    "c4_topk_lengths_raw",
+    "c4_topk_lengths_clamp1",
+    "c128_topk_lengths_clamp1",
+    "c128_page_indices",
+)
+
+
 
 
 class SuperChunkAttnBackend(AttentionBackend):
@@ -762,7 +786,22 @@ def super_chunk_in_late_tail(forward_batch) -> bool:
     return md is not None and md is tail
 
 
-def super_chunk_token_plan(forward_batch: ForwardBatch):
+def _loop_disabled(name: str) -> bool:
+    """Diagnostic gates for the model-side per-sub-chunk loops.
+
+    LK_SC_NO_LOOPS turns every one of them off at once -- the attention wrapper
+    still sub-chunks, so this isolates "wrapper child path" from "model-side
+    projection/compressor loop". LK_SC_NO_<NAME> turns a single loop off. Both
+    are diagnosis-only and go away with the fix.
+    """
+    if not name:
+        return False
+    if os.environ.get("LK_SC_NO_LOOPS", "0") not in ("", "0"):
+        return True
+    return os.environ.get(f"LK_SC_NO_{name.upper()}", "0") not in ("", "0")
+
+
+def super_chunk_token_plan(forward_batch: ForwardBatch, name: str = ""):
     """Model-layer entry point: the active sub-chunk plan or None.
 
     None means "run today's whole-forward path" (no wrapper, wrapper
@@ -771,6 +810,8 @@ def super_chunk_token_plan(forward_batch: ForwardBatch):
     with a child view route back through SuperChunkAttnBackend.forward to the
     matching child backend without any further slicing.
     """
+    if _loop_disabled(name):
+        return None
     backend = _super_chunk_backend(forward_batch)
     plan_fn = getattr(backend, "super_chunk_plan", None)
     return plan_fn() if plan_fn is not None else None

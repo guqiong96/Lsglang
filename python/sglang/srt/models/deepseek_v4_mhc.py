@@ -429,7 +429,7 @@ def _combine(
         )
 
         if not super_chunk_in_late_tail(None):
-            plan = super_chunk_token_plan(None)
+            plan = super_chunk_token_plan(None, "mhc")
             if plan is not None and (len(plan) < 2 or plan[-1][1] != x.shape[0]):
                 plan = None
     if plan is not None:
@@ -526,7 +526,7 @@ def post(
 
     plan = None
     if not super_chunk_in_late_tail(None):
-        plan = super_chunk_token_plan(None)
+        plan = super_chunk_token_plan(None, "mhc")
     if plan is not None and (len(plan) < 2 or plan[-1][1] != x.shape[0]):
         plan = None
     if plan is not None:

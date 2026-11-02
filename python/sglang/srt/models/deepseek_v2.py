@@ -1781,7 +1781,7 @@ class DeepseekV2MoE(nn.Module):
             super_chunk_token_plan,
         )
 
-        plan = super_chunk_token_plan(None)
+        plan = super_chunk_token_plan(None, "shexp")
         if plan is None or len(plan) < 2 or plan[-1][1] != hidden_states.shape[0]:
             return None
         if not getattr(self, "_shared_super_chunk_logged", False):

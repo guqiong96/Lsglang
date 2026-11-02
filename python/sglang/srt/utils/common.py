@@ -145,7 +145,6 @@ from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     get_prefill_d_slots,
     get_super_chunk_size,
     get_verify_resident,
-    get_verify_skip_miss,
     is_gpu_prefill_sm120_w4a4_enabled,
     is_lk_gpu_prefill_enabled,
     is_lk_moe_feature_enabled,

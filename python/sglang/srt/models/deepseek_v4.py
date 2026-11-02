@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -303,7 +304,7 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
         # Decoder SWA bounded replay late layers: rows are the tail gather,
         # not the plan's full extend (expected, not a fallback).
         return None
-    plan = super_chunk_token_plan(forward_batch)
+    plan = super_chunk_token_plan(forward_batch, "hc")
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
         if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
             _super_chunk_hc_bounds._dbg = True
@@ -338,6 +339,11 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
         return None
     if is_in_breakable_cuda_graph():
         return None
+    if os.environ.get("LK_SC_NO_PLAN", "0") not in ("", "0"):
+        # Diagnostic: keep the attention wrapper's own sub-chunk loop but run
+        # this model's projection/compressor loops monolithically, to tell the
+        # two layers apart.
+        return None
     from sglang.srt.layers.attention.super_chunk_backend import (
         super_chunk_in_late_tail,
         super_chunk_token_plan,
@@ -346,7 +352,7 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
     if super_chunk_in_late_tail(forward_batch):
         # Decoder SWA bounded replay late layers (see _super_chunk_hc_bounds).
         return None
-    plan = super_chunk_token_plan(forward_batch)
+    plan = super_chunk_token_plan(forward_batch, "attn")
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
         if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
             _super_chunk_attn_plan._dbg = True
@@ -2682,6 +2688,7 @@ class MQALayer(MqaAttentionBase):
             # loop. Output writes stream through one preallocated buffer
             # (peak = stream + one chunk).
             out = None
+            deferred = defer_all_reduce
             pos_is_2d = positions.ndim == 2
             for lo, hi, child_fb in plan:
                 tok = slice(lo, hi)
@@ -2690,7 +2697,21 @@ class MQALayer(MqaAttentionBase):
                     positions[:, tok] if pos_is_2d else positions[tok],
                     child_fb,
                     x_quant=_super_chunk_slice_token_arg(x_quant, tok),
+                    # Hand the TP reduction over exactly as the caller asked:
+                    # the decoder layer passes True and its post runs the fused
+                    # all-reduce. Dropping it here made every sub-chunk reduce
+                    # eagerly and the layer take the non-collective post, i.e.
+                    # the whole model ran a different reduction path whenever
+                    # the batch was cut (measured: mean |dlogprob| 2.28 vs 0.17
+                    # on the same 1861-token text at chunked-prefill 1024).
+                    defer_all_reduce=defer_all_reduce,
                 )
+                # The attention may decline the handover even when asked (its
+                # own gate), and the type is the ground truth for the post.
+                if isinstance(o_seg, mhc.AttnOutput):
+                    o_seg = o_seg.partial
+                else:
+                    deferred = False
                 if out is None:
                     out = torch.empty(
                         (plan[-1][1], *o_seg.shape[1:]),
@@ -2698,7 +2719,7 @@ class MQALayer(MqaAttentionBase):
                         device=o_seg.device,
                     )
                 out[lo:hi] = o_seg
-            return out
+            return mhc.AttnOutput(out) if deferred else out
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -3880,6 +3901,11 @@ DeepseekV4DecoderLayer = (
 )
 
 
+
+
+
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4660,7 +4686,7 @@ class DeepseekV4Model(nn.Module):
 
         plan = None
         if not super_chunk_in_late_tail(forward_batch):
-            plan = super_chunk_token_plan(forward_batch)
+            plan = super_chunk_token_plan(forward_batch, "hc")
         if plan is not None and (len(plan) < 2 or plan[-1][1] != pre_hc_head.shape[0]):
             plan = None
         if self.hc_pre_from_prev_sublayer:
