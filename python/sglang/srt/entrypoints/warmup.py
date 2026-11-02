@@ -200,3 +200,44 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         )
         async for _ in tokenizer_manager.generate_request(single, None):
             pass
+
+    # Prefix-cache chunk arm (2026-11-03, 0731 @3090): everything above warms a
+    # *fresh* prefill of `size` tokens, so the extend shape the scheduler emits
+    # after a radix-cache hit -- a handful of new tokens behind a long prefix --
+    # is never compiled. The extend kernels are keyed on the query-token count,
+    # not on seq_len, so a mid-serving request with 6 new tokens behind a 1024
+    # token prefix device-loads a fresh cubin while the peer rank spins in
+    # all-reduce: py-spy showed both TP mains parked in cuModuleLoadData with the
+    # GPUs at 100% and the detokenizer heartbeat 2 minutes stale. Pay the compile
+    # here instead of in the first real batch of a prefix-cached conversation.
+    if disaggregation_mode == "null":
+        prefix_pool = np.random.randint(2**16, size=[4096])
+
+        async def _drain(ids):
+            # .tolist() -- a bare list() leaves numpy scalars in place and
+            # normalize_batch_and_arguments reads that as a batch request.
+            req = GenerateReqInput(
+                input_ids=np.asarray(ids).tolist(),
+                sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            )
+            async for _ in tokenizer_manager.generate_request(req, None):
+                pass
+
+        try:
+            for prefix_len in (1024, 2048):
+                # Fill the prefix once; the following requests then hit the
+                # radix cache and extend by a few tokens only.
+                await _drain(prefix_pool[:prefix_len])
+                for new_tokens in (1, 2, 4, 8, 16, 32, 64):
+                    await _drain(
+                        np.concatenate(
+                            [
+                                prefix_pool[:prefix_len],
+                                prefix_pool[prefix_len : prefix_len + new_tokens],
+                            ]
+                        )
+                    )
+        except Exception:
+            # A warmup arm must never take the server down: the shapes it
+            # covers are a latency win, not a correctness requirement.
+            logger.exception("prefix-cache warmup arm failed; serving anyway")
