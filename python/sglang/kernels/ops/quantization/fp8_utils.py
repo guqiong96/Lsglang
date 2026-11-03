@@ -13,8 +13,13 @@ from sglang.kernels.jit.utils import (
 
 
 def cuda_capability_uses_fp8_e4b15(cuda_capability: Tuple[int, int]) -> bool:
-    """Triton names E4M3 as fp8e4b15 on CUDA architectures before SM89."""
-    return cuda_capability < (8, 9)
+    """Triton names E4M3 as fp8e4b15 before SM89 -- and on SM89 itself.
+
+    Ada is grouped with Ampere on purpose: 8.9 is the one capability whose fp8
+    kernels nothing here has validated, and a 4x4090 deployment only reached
+    them because of the ``>= (8, 9)`` split.
+    """
+    return cuda_capability < (8, 9) or cuda_capability == (8, 9)
 
 
 def use_fp8_e4b15_for_e4m3fn(

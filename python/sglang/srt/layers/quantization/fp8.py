@@ -557,9 +557,14 @@ class Fp8LinearMethod(LinearMethodBase):
             if _is_cuda
             else (0, 0)
         )
+        # Ada (8.9) is included on purpose: the group-32 Marlin W8A16 path is
+        # the one the 8.0/8.6 cards run, and a field report has 4x4090 producing
+        # garbage through the alternative it used to take (the Triton
+        # block-fp8 / fp8-dot split by M). Correctness first: give 8.9 the same
+        # kernel; it costs the fp8-dot prefill speed on Ada.
         self.use_marlin_group32 = (
             _is_cuda
-            and 80 <= _marlin_group32_cap[0] * 10 + _marlin_group32_cap[1] < 89
+            and 80 <= _marlin_group32_cap[0] * 10 + _marlin_group32_cap[1] <= 89
             and self.quant_config.weight_block_size is not None
             and len(self.quant_config.weight_block_size) == 2
             and self.quant_config.weight_block_size[1] == 32

@@ -752,12 +752,15 @@ if get_platform().is_sm90 and is_flashinfer_available():
 
 @lru_cache(maxsize=1)
 def _is_ada_sm89() -> bool:
-    """Ada (SM89) only: has fp8 tl.dot support but no split-K tuned configs."""
-    return (
-        _is_cuda
-        and torch.cuda.is_available()
-        and (torch.cuda.get_device_capability() == (8, 9))
-    )
+    """Retired: Ada is routed through the Ampere path.
+
+    The split this used to gate (fp8-dot at prefill M, split-K w8a16 at decode M)
+    is the only block-fp8 path a 4080/4090 takes differently from a 30-series
+    card, and it is the one a 4x4090 field report shows garbling
+    DeepSeek-V4.1-Flash-1017. Keep the name so callers read as harmless, but
+    never select the Ada-only route.
+    """
+    return False
 
 
 def dispatch_w8a8_block_fp8_linear(

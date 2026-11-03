@@ -54,7 +54,13 @@ def fp8_dot_supported() -> bool:
     """
     if not _is_cuda or not torch.cuda.is_available():
         return True
-    return torch.cuda.get_device_capability() >= (8, 9)
+    cap = torch.cuda.get_device_capability()
+    # Ada (8.9) is deliberately treated like Ampere here. Its fp8-dot / split-K
+    # Triton route is the only one a 4080/4090 ever takes differently from a
+    # 30-series card, and a 4x4090 field report has that route producing garbage
+    # on DeepSeek-V4.1-Flash-1017 (block 32x32 fp8 + ue8m0). The Ampere kernel
+    # (in-register bf16 upcast) is the one that is validated here.
+    return cap >= (8, 9) and cap != (8, 9)
 
 if _is_cuda:
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
