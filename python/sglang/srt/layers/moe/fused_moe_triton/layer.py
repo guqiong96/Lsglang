@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 _LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
 _LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_pool_decode_engine, get_verify_resident, get_verify_skip_miss, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -386,6 +386,7 @@ class FusedMoE(torch.nn.Module):
     # Verify-batch row multiplier (NEXTN draft rows per real token) agreed
     # across pool layers at init; single source of truth for decode sizing.
     _pool_verify_rows_mult = 1
+    _pool_verify_all_rows = False
 
     # Stream-order event for the mailbox doorbell/join split (see _cpu_decode).
     # Per layer, not shared: one graph records it once per pool layer, and a single
@@ -1996,6 +1997,26 @@ class FusedMoE(torch.nn.Module):
                 and self._gpu_prefill_driver is not None
                 and hidden_states.size(0) >= self.gpu_prefill_min_tokens)
              
+    def _draft_tokens_per_req(self) -> int:
+        """Verify rows one request carries (1 = no spec).
+
+        ``server_args.speculative_num_draft_tokens`` is read into the attribute
+        at __init__, but the DSPARK block size is only resolved later: every
+        layer built before that caches None, which made a verify batch look like
+        bs real tokens, overshoot the decode cap, and drop the pool for good.
+        The runtime spec object is the live value -- the attention backends
+        already read it that way.
+        """
+        n = self.speculative_num_draft_tokens
+        if not n:
+            try:
+                from sglang.srt.runtime_context import get_spec
+
+                n = get_spec().speculative_num_draft_tokens
+            except Exception:
+                n = None
+        return n or 1
+
     def _zero_tensor(self, tensor: torch.Tensor):
         if tensor is not None:
             tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
@@ -2099,11 +2120,15 @@ class FusedMoE(torch.nn.Module):
         cfg.gpu_prefill_engine = (get_gpu_prefill_engine()
                                   if self.is_gpu_prefill_layer else "")
         cfg.role_draft = self.model_type != "main"
+        # Ride-share: draft verify rows may read the residency the real tokens
+        # built, but they never feed the admission ledger (a cache sized for
+        # real-token working sets cannot hold a verify batch, and pumping it
+        # would evict what it just brought in).
+        cfg.verify_pump = get_bool_env_var("LK_VERIFY_PUMP", "false")
         cfg.pool_decode = self.pool_decode
         cfg.pool_slots = get_pool_slots()
         cfg.pool_log = get_pool_log()
         cfg.verify_resident = get_verify_resident()
-        cfg.verify_skip_miss = get_verify_skip_miss()
         cfg.hf_mbox = get_hf_mbox()
         num_processes, process_id, gpu_id = self._get_processes_info()
         cfg.num_processes = num_processes
@@ -2487,13 +2512,27 @@ class FusedMoE(torch.nn.Module):
         # Sized ONCE from the concurrency limit: every decode batch is
         # covered by construction, no runtime growth path.
         cap = max(1, self.max_running_requests)
-        # LK_VERIFY_RESIDENT: verify batches cover the DRAFT rows' resident
-        # experts on the GPU too (row-major slot space of bs*k), so the CPU
-        # side computes only misses on every row, not just real rows.
-        rpt0 = self.speculative_num_draft_tokens or 1
-        mult = rpt0 if (get_verify_resident()
-                        and rpt0 > 1) else 1
+        # Two different questions, two different inputs -- they used to share
+        # one, which made the buffer size decide whether verify was "covered" at
+        # all: with LK_VERIFY_RESIDENT=0 the (correct) sizing mult was 1, so
+        # real_tokens = bs (6 for DSPARK block 5) exceeded the decode cap, the
+        # pool refused the batch, and a spec step ran every expert on the CPU.
+        #
+        #   sizing:  rows = cap * k * rpt0 -- a verify batch really does carry
+        #            bs = cap * rpt0 rows, whether or not we cover the draft ones;
+        #   coverage: LK_VERIFY_RESIDENT decides whether the DRAFT rows' resident
+        #            experts also run on the GPU (a fidelity tradeoff); the real
+        #            row is covered either way.
+        rpt0 = self._draft_tokens_per_req()
+        mult = rpt0 if rpt0 > 1 else 1
+        # This runs at model init, when the DSPARK width may still read as 1, and
+        # the buffers are also needed during graph capture (where nothing may be
+        # allocated). Size them for a fixed 8-draft headroom: it costs ~2 MB of
+        # pinned scratch and keeps ride-share (draft rows reading slots) inside
+        # the allocation for any block size we run.
+        mult = max(mult, 8)
         FusedMoE._pool_verify_rows_mult = max(FusedMoE._pool_verify_rows_mult, mult)
+        FusedMoE._pool_verify_all_rows = bool(get_verify_resident())
         rows = cap * k * FusedMoE._pool_verify_rows_mult
         dev = torch.cuda.current_device()
         if not hasattr(FusedMoE, "pool_hbuf"):
@@ -2513,25 +2552,31 @@ class FusedMoE(torch.nn.Module):
                 or FusedMoE.pool_hpart.shape != (NGK, rows, 2 * I)):
             FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
             FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
-        # fix-4a canonical pool slots: the plane bases carry the set's row
-        # offset inside the shared region (row_base % 128 == 0 by the C++
-        # guard, so the SF swizzle splits exactly); the strides already are
-        # the region strides. Native pools bake nothing and flag native.
+        # fix-4a canonical pool slots: gate and up share ONE merged w13 region,
+        # so each set carries a row offset. Weights are linear in that offset
+        # (row_base * kp); scale rows are not -- a canonical scale row is placed
+        # by its ABSOLUTE row inside the plane, so the up half has to swizzle
+        # row_base + row, which is what RB_UP carries below. A per-set 128
+        # alignment is NOT required (setup_canonical only requires the merged
+        # 2*I rows to fill whole 128-row blocks). Native pools bake nothing and
+        # flag native.
         canon = bool(int(info.get("canonical") or 0))
         if canon:
             rb = [int(v) for v in info["canon_row_base"]]
             ckp = [int(v) for v in info["canon_kp"]]
-            ckpp = [int(v) for v in info["canon_kpp"]]
             wa = [int(info["weight_addr"][i]) + rb[i] * ckp[i] for i in range(3)]
-            sa = [int(info["scale_addr"][i]) + rb[i] * ckpp[i] for i in range(3)]
+            sa = [int(v) for v in info["scale_addr"]]
+            rb_up = rb[1]
         else:
             wa = [int(v) for v in info["weight_addr"]]
             sa = [int(v) for v in info["scale_addr"]]
+            rb_up = 0
         self._pool_layer_info = dict(
             layer=info["layer"],
             snapshot_addr=info["snapshot_addr"],
             weight_addr=wa, scale_addr=sa,
             layout="canonical" if canon else "native",
+            rb_up=rb_up,
             slot_bytes=info["slot_weight_bytes"],
             slot_scale_bytes=info["slot_scale_bytes"],
             gateup_gds=gds["gateup_global_scale_addr"],
@@ -2539,14 +2584,8 @@ class FusedMoE(torch.nn.Module):
             H=H, I=I, k=k, NB_GATEUP=NB_GATEUP, NB_DOWN=NB_DOWN,
             NGK=NGK, KS=KS, ITERS=ITERS, **caps,
         )
-        # The resident half's engine. Probed once per layer, kept in geo so the
-        # launch path is a dict lookup; None means the GEMV trio above stands
-        # (and probe already said why, once). Imported lazily: only an SM12x
-        # box with the flashinfer engine ever pulls in flashinfer here.
-        self._pool_layer_info["sm12x"] = None
-        if get_pool_decode_engine() == "sm12x":
-            from lk_moe.decode_sm12x import Sm12xDecode
-            self._pool_layer_info["sm12x"] = Sm12xDecode.probe(self.lk_moe)
+        # The resident half is the GEMV trio (the SM12x alternative measured no
+        # better than it and cost a fill-time CPU repack, so it is gone).
         self.lk_moe.pool_gpu_report(True)
 
     def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
@@ -2579,9 +2618,20 @@ class FusedMoE(torch.nn.Module):
         hpart, hbuf, gout = FusedMoE.pool_hpart, FusedMoE.pool_hbuf, FusedMoE.pool_gout
         gout_part = FusedMoE.pool_gout_part
         slot_tab = FusedMoE.pool_slot_tab
-        side_stream = FusedMoE.pool_stream
+        # Ride-share safety: the draft rows read slots the ledger does not track
+        # (only the real rows' ids were pumped), so an eviction must never race
+        # them. The worker serialises a landing copy against wait_main(stream_),
+        # which only covers the MAIN stream -- queue the resident half there when
+        # draft rows participate instead of on the pool's side stream.
         all_rows = (rows_per_token > 1
-                    and FusedMoE._pool_verify_rows_mult > 1)
+                    and FusedMoE._pool_verify_all_rows)
+        # The resident half stays on the pool's side stream even when draft rows
+        # ride the residency: the CPU half must run beside it, not behind it.
+        # Safety comes from ordering, not from serialising the streams -- the
+        # step ends with main.wait_stream(pool_stream), and the pump gates any
+        # landing copy on wait_main(main); together that means a slot read by
+        # this step's resident half has retired before a victim can be reused.
+        side_stream = FusedMoE.pool_stream
         if rows_per_token > 1 and not all_rows:
             gathered_ids = FusedMoE.pool_gathered_ids[:n_slots]
             gathered_weights = FusedMoE.pool_gathered_weights[:n_slots]
@@ -2594,7 +2644,8 @@ class FusedMoE(torch.nn.Module):
             rows_per_token = 1
         else:
             gathered_ids, gathered_weights = topk_ids, topk_weights
-        side_stream.wait_stream(torch.cuda.current_stream())
+        if side_stream is not torch.cuda.current_stream():
+            side_stream.wait_stream(torch.cuda.current_stream())
         if _LK_POOL_DET_SPLIT:
             # No guard: a fence we fail to wait on silently voids the very
             # determinism this knob exists for, so a missing geo["layer"] or a
@@ -2625,17 +2676,6 @@ class FusedMoE(torch.nn.Module):
             # ONE volatile gather of the mapped snapshot into a device table:
             # per-program host reads (k*NB_GATEUP*NGK PCIe round-trips/layer, queued
             # behind the pump's H2D) were the whole speed regression.
-            drv = geo["sm12x"]
-            if drv is not None:
-                # Resident half in ONE fused SM12x launch over the pool's own
-                # regions. The ids it gets are the slot numbers out of the SAME
-                # frozen snapshot word slot_table_fill reads below, so the
-                # resident/missing split -- and therefore what the CPU half is
-                # still on the hook for -- is bit-for-bit the same choice.
-                drv.launch(hidden_states, gathered_ids, gathered_weights,
-                           gout, n_slots, real_tokens)
-                self.lk_moe.pool_record_aux(side_stream.cuda_stream)
-                return
             slot_table_fill[(1,)](
                 gathered_ids, geo["snapshot_addr"], slot_tab, n_slots,
                 BLOCK=triton.next_power_of_2(n_slots))
@@ -2653,7 +2693,8 @@ class FusedMoE(torch.nn.Module):
                 FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
                 HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
                 ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
-                KS=geo["KS"], NGK=geo["NGK"], LAYOUT=geo["layout"])
+                KS=geo["KS"], NGK=geo["NGK"], LAYOUT=geo["layout"],
+                RB_UP=geo["rb_up"])
             reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
                 hpart, hbuf, n_slots * 2 * I, NGK=geo["NGK"], BLOCK=1024)
             moe_down[(n_slots, geo["NB_DOWN"])](
@@ -2680,7 +2721,7 @@ class FusedMoE(torch.nn.Module):
     def _cpu_decode(self, hidden_states, topk_weights, topk_ids):
         bs = hidden_states.size(0)
 
-        draft_tokens = self.speculative_num_draft_tokens or 1
+        draft_tokens = self._draft_tokens_per_req()
         mult = draft_tokens if draft_tokens > 1 else 1
         rows_per_token = mult if (mult > 1 and bs % mult == 0) else 1
         real_tokens = bs // rows_per_token
@@ -2731,11 +2772,18 @@ class FusedMoE(torch.nn.Module):
         )
 
         if covered:
+            # The resident half lives on the pool's side stream only when the
+            # draft rows stay CPU (all_rows False). Ride-share queues it on the
+            # current stream, and during capture waiting on a stream with no
+            # captured work is illegal (cudaErrorStreamCaptureIsolation).
             torch.cuda.current_stream().wait_stream(FusedMoE.pool_stream)
             if rows_per_token == 1:
                 FusedMoE.output_gpu[:real_tokens].add_(
                     FusedMoE.pool_gout[:real_tokens])
-            elif FusedMoE._pool_verify_rows_mult > 1:
+            elif FusedMoE._pool_verify_all_rows:
+                # Only the all-rows (LK_VERIFY_RESIDENT) mode writes gout for
+                # every row; the sizing mult is now always rpt0, so testing it
+                # here would add rows the GPU half never computed.
                 n_rows = real_tokens * rows_per_token
                 FusedMoE.output_gpu[:n_rows].add_(FusedMoE.pool_gout[:n_rows])
             else:

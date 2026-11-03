@@ -1,3 +1,5 @@
+import logging
+import os
 """lk_moe configuration surface: env parsing, layer predicates and the
 expert-pool pump park helper.
 
@@ -37,6 +39,7 @@ class LkMoeConfig:
     gpu_prefill_engine: str
     prefill_debug: bool
     layerwise_load: bool
+
 
 
 def get_lk_moe_config() -> LkMoeConfig:
@@ -181,14 +184,13 @@ def get_pool_inflight() -> int:
     return get_int_env_var("LK_POOL_INFLIGHT", 16)
 
 def get_verify_resident() -> int:
-    # VR: draft-row pool-resident experts computed GPU-side; has an acceptance
-    # fidelity tradeoff -> python-owned cfg value (LK_* env is the script UI).
-    return get_int_env_var("LK_VERIFY_RESIDENT", 0)
-
-
-def get_verify_skip_miss() -> int:
-    # verify rows drop CPU-side misses (distribution declaration, not bitwise).
-    return get_int_env_var("LK_VERIFY_SKIP_MISS", 0)
+    # VR: draft-row pool-resident experts computed GPU-side. Default ON since the
+    # ride-share split (verify_pump stays off, so the draft rows only read the
+    # residency the real tokens built): measured on 0731/DSPARK at accept 4.25 vs
+    # 4.29 without it -- the fidelity cost the old comment warned about did not
+    # materialise there -- while the pooled hit rate (48%) took the step from
+    # 130 ms to 109 ms. LK_VERIFY_RESIDENT=0 keeps the old CPU-only behaviour.
+    return get_int_env_var("LK_VERIFY_RESIDENT", 1)
 
 
 def get_hf_mbox() -> int:
@@ -373,38 +375,6 @@ def is_pool_mbox_split() -> bool:
     # "join without doorbell" fallback fired.
     return is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_MBOX_SPLIT")
 
-
-def get_pool_decode_engine() -> str:
-    # Pure selector switch (same doctrine as get_gpu_prefill_engine): the pool
-    # decode tier is powered by LK_POOL_DECODE, this only picks the
-    # implementation of its RESIDENT half (the CPU half and the paired-skip
-    # split are identical either way):
-    #   "gemv"   (default) = the three Triton GEMV launches + two reduces
-    #   "sm12x"            = SM120/SM121 only: one fused flashinfer W4A16 call
-    #                        on the pool's canonical regions (zero copy). Needs
-    #                        the canonical slot layout, i.e. the flashinfer
-    #                        prefill engine and intermediate % 128 == 0; logs
-    #                        the reason and stays on "gemv" when unavailable.
-    # The kernel's intermediate is FP16 (measured 3e-3 against an fp32 oracle
-    # where the GEMV path is 2e-7), so this is a numerics CLASS, not a free
-    # speed switch -- see journal 2026-10-30. Gate that class with the unit test
-    # against an fp32 oracle, NOT with model-level statistics: here the SAME
-    # engine run twice disagreed on 8 of 50 gsm8k questions and differed by 3
-    # questions of accuracy (43 vs 46), so nothing measured at that level can see
-    # a 3e-3 kernel difference -- greedy drift and per-token logprobs are buried
-    # the same way, because which half of the model produced a logit moves with
-    # the resident set.
-    #
-    # What it buys, measured on q36/2x5060Ti with the same build and one long
-    # stream per configuration: the resident half's kernels cost 2.1x less GPU
-    # time (0.71 vs 1.51 ms/step) and the STEP moves +5.4% at one row per step
-    # (7.21 ms mean of six runs against 7.60) and +3.3% at two rows (9.70 against
-    # 10.03). It is not a bs=1 lever: at one row per step most of that
-    # GPU saving was already being hidden by the attention projections, the
-    # all-reduces and the CPU half, which is why a kernel-only benchmark
-    # overpromises by ~2.5x.
-    val = get_str_env_var("LK_POOL_DECODE_ENGINE", "gemv").strip().lower()
-    return val if val in ("gemv", "sm12x") else "gemv"
 
 def enabled_layerwise_load() -> bool:
     return get_bool_env_var("LK_MOE_LAYERWISE_LOAD")
