@@ -26,6 +26,72 @@ def warmup(name: str):
     return decorator
 
 
+# Warmup prompt source: a fixed passage, tokenized once and repeated to the
+# requested shape. Real ids, NOT np.random.randint -- a random sweep is the
+# worst access pattern a model with off-device embedding tables can be handed.
+# The DSV41 engram table is read from NVMe by token id and the N1 path keeps no
+# RAM cache ("stores nothing but the pinned stage"), so a random 12K-token
+# shape touches tens of thousands of cold rows. Measured on dsv41-1017 TP2/3090
+# (2026-11-03): the 3072/6144/12288-token shapes took 76/82/161 s with the GPU
+# gates spinning at 155 W while the filler chased the disk, against 10/14 s for
+# the neighbouring power-of-2 shapes. Text repeats its n-grams, so the same M
+# coverage costs seconds instead of a cold-table sweep.
+_WARMUP_TEXT = (
+    "The expert cache keeps the rows a decode step is about to read, so the "
+    "step itself does not wait for a disk. A prefill batch is different: it "
+    "touches every layer at once and the routing table changes shape with the "
+    "token count. 1024 tokens, 2048 tokens, 3072 tokens, 4096 tokens, 8192 "
+    "tokens, 16384 tokens, 32768 tokens -- each bucket compiles its own "
+    "specialisation, and a bucket that is first seen mid-serving pays the "
+    "compile while a peer rank spins in the all-reduce.\n"
+    "def plan(rows, chunk_max):\n"
+    "    bounds, lo = [], 0\n"
+    "    while lo < rows:\n"
+    "        hi = min(lo + chunk_max, rows)\n"
+    "        bounds.append((lo, hi))\n"
+    "        lo = hi\n"
+    "    return bounds\n"
+    "The reduction is handed over exactly as the caller asked: a sub-chunk that "
+    "reduces eagerly changes the arithmetic of every layer behind it. Attention "
+    "reads a page table of 64 rows, the compressor reads 4, and the narrow "
+    "128-row window reads one; the same prompt must score the same logprobs no "
+    "matter how the batch was cut. 3.14159 2.71828 1.61803 0.57721 42 1729 "
+    "65536 262144.\n"
+    "The hit rate follows the residency set, and the residency set follows what "
+    "the previous step happened to read: a cache sized for the real tokens, not "
+    "for the verify batch, is the difference between 33 and 39 tokens a second."
+)
+
+_warmup_ids_cache: List[int] = []
+
+
+def _warmup_ids(size: int, tokenizer_manager: TokenizerManager) -> List[int]:
+    """``size`` token ids of the fixed passage, repeated to cover the shape.
+
+    Falls back to the old random sweep only when there is no tokenizer to
+    encode with (``--skip-tokenizer-init``) or the encode yields nothing: a
+    warmup arm must never take the server down.
+    """
+    global _warmup_ids_cache
+    if not _warmup_ids_cache:
+        tok = getattr(tokenizer_manager, "tokenizer", None)
+        ids: List[int] = []
+        try:
+            if tok is not None:
+                ids = [int(i) for i in tok.encode(_WARMUP_TEXT, add_special_tokens=False)]
+        except Exception:
+            logger.warning(
+                "warmup: tokenizer encode failed, keeping random ids", exc_info=True
+            )
+            ids = []
+        _warmup_ids_cache = [i for i in ids if i >= 0]
+    pool = _warmup_ids_cache
+    if len(pool) < 32:
+        return np.random.randint(2**16, size=[size]).tolist()
+    reps = (size + len(pool) - 1) // len(pool)
+    return (pool * reps)[:size]
+
+
 async def execute_warmups(
     disaggregation_mode: str,
     warmup_names: List[str],
@@ -113,7 +179,7 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=_warmup_ids(size, tokenizer_manager),
             sampling_params={
                 "max_new_tokens": 30,
                 "temperature": 0.8,
@@ -155,7 +221,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=_warmup_ids(size, tokenizer_manager),
             sampling_params={
                 "max_new_tokens": 1,
                 "temperature": 0.0,
@@ -175,11 +241,11 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     # lockstep deadlock. Cover them here so the cost is boot time, not a
     # hang in the first batched request.
     pair_a = GenerateReqInput(
-        input_ids=(np.random.randint(2**16, size=[300])).tolist(),
+        input_ids=_warmup_ids(300, tokenizer_manager),
         sampling_params={"max_new_tokens": 16, "temperature": 0.0},
     )
     pair_b = GenerateReqInput(
-        input_ids=(np.random.randint(2**16, size=[130])).tolist(),
+        input_ids=_warmup_ids(130, tokenizer_manager),
         sampling_params={"max_new_tokens": 16, "temperature": 0.0},
     )
     if disaggregation_mode == "null":
@@ -195,7 +261,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
         # in _init_handles (seen on GLM-5.3/3090). Drain a 2-token generation
         # so one bs=1 decode step is paid here.
         single = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[64])).tolist(),
+            input_ids=_warmup_ids(64, tokenizer_manager),
             sampling_params={"max_new_tokens": 2, "temperature": 0.0},
         )
         async for _ in tokenizer_manager.generate_request(single, None):
@@ -211,7 +277,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     # GPUs at 100% and the detokenizer heartbeat 2 minutes stale. Pay the compile
     # here instead of in the first real batch of a prefix-cached conversation.
     if disaggregation_mode == "null":
-        prefix_pool = np.random.randint(2**16, size=[4096])
+        prefix_pool = np.asarray(_warmup_ids(4096, tokenizer_manager))
 
         async def _drain(ids):
             # .tolist() -- a bare list() leaves numpy scalars in place and
