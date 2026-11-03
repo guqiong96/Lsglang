@@ -38,6 +38,10 @@ from sglang.srt.utils import logger
 
 # One line per process, not per wrapper instance: the wrapper is built per
 # layer, so a per-instance guard prints the same line once per layer per rank.
+# One-shot diagnostics (which plan was taken, why the wrapper declined). Off
+# by default: they are useful while chasing a layout bug and pure noise in a
+# production boot log.
+_SC_DEBUG = os.environ.get("LK_SC_DEBUG", "0") not in ("", "0")
 _SC_ACTIVE_LOGGED = False
 _SC_WARNED_REASONS = set()
 
@@ -510,7 +514,7 @@ class SuperChunkAttnBackend(AttentionBackend):
             self._active = False
             self._child_batches = None
             self._child_bounds = None
-            if reason not in _SC_WARNED_REASONS:
+            if _SC_DEBUG and reason not in _SC_WARNED_REASONS:
                 _SC_WARNED_REASONS.add(reason)
                 logger.warning(
                     "[sc-dbg] disabled reason=%s rows=%s inner=%s",
@@ -539,7 +543,7 @@ class SuperChunkAttnBackend(AttentionBackend):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         self._active = True
         global _SC_ACTIVE_LOGGED
-        if not _SC_ACTIVE_LOGGED:
+        if _SC_DEBUG and not _SC_ACTIVE_LOGGED:
             _SC_ACTIVE_LOGGED = True
             logger.info(
                 "[sc-dbg] wrapper active rows=%s chunks=%d inner=%s",

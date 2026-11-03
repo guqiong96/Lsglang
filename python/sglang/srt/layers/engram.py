@@ -63,6 +63,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+_SC_DEBUG = os.environ.get("LK_SC_DEBUG", "0") not in ("", "0")
 _SC_LOGGED = False
 
 
@@ -1273,7 +1274,7 @@ class Engram(nn.Module):
         # per-instance guard prints the same line once per layer per rank (45 x
         # 2 on this model) which floods the boot log without adding information.
         global _SC_LOGGED
-        if not _SC_LOGGED:
+        if _SC_DEBUG and not _SC_LOGGED:
             _SC_LOGGED = True
             logger.info(
                 "[sc-dbg] engram LOOP active plan=%d rows=%d chunk_max=%d",

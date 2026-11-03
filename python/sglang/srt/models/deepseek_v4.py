@@ -264,6 +264,10 @@ def get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+# One-shot super-chunk diagnostics (which plan the hc path took). Off by
+# default: noise in a production boot log, useful while chasing a layout bug.
+_SC_DEBUG = os.environ.get("LK_SC_DEBUG", "0") not in ("", "0")
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
@@ -306,7 +310,7 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
         return None
     plan = super_chunk_token_plan(forward_batch, "hc")
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
-        if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
+        if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
             _super_chunk_hc_bounds._dbg = True
             logger.info(
                 "[sc-dbg] hc FALLBACK plan=%s rows=%d",
@@ -314,7 +318,7 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
                 rows,
             )
         return None
-    if rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
+    if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
         _super_chunk_hc_bounds._dbg = True
         logger.info("[sc-dbg] hc LOOP active plan=%d rows=%d", len(plan), rows)
     return [(lo, hi) for lo, hi, _ in plan]
