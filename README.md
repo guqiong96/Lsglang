@@ -39,7 +39,7 @@ the roadmap).
 | 2 | **CPU** (hybrid) | MoE on CPU (NUMA host weights), attention on GPU | MoE on CPU, chunk by chunk | default layer role when `LK_MOE_HYBRID_ENABLED=1` | **Recommended for high-performance CPU subsystems** (many cores + high memory bandwidth); zero extra VRAM |
 | 3 | **CPU + Speculative decoding** | speculative verification × CPU MoE | same | `LK_MOE_HYBRID_ENABLED=1` + `--speculative-algorithm NEXTN` / `DSPARK` | **Recommended for high-performance CPU subsystems** |
 | 4 | **CPU + GPU Pool** (expert cache) | pool-resident experts on GPU, the rest on CPU | same split | `LK_POOL_SLOTS` (e.g. 64) | **Recommended for low-power CPU subsystems + high-performance GPUs** (spare GPU compute + high-bandwidth PCIe) |
-| 5 | **CPU + GPU Pool + Speculative decoding** | speculative verification × pool's GPU/CPU halves | same split | `LK_POOL_SLOTS` (e.g. 64) + `--speculative-algorithm NEXTN` / `DSPARK` | Optional depending on task type — gains do not stack fully (best for latency-bound, high single-stream workloads) |
+| 5 | **CPU + GPU Pool + Speculative decoding** | speculative verification × pool's GPU/CPU halves | same split | `LK_POOL_SLOTS` (e.g. 64) + `--speculative-algorithm NEXTN` / `DSPARK` | **Recommended**: the draft rows ride the residency the real tokens build (`LK_VERIFY_RESIDENT`, default on) — measured +17.6% over the CPU-only path on DeepSeek-V4-Flash-0731 / DSPARK, acceptance unchanged |
 
 **Overlay — Super Mix Prefill**: GPU prefill with super-chunk sizing (decoupled from the
 token budget), runs in parallel with CPU-side decode at near-100% GPU utilization;
@@ -194,7 +194,7 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | `LK_THREAD_BINDING` | perf | `CPU_CORE` | `CPU_CORE` bind by core, `NUMA_NODE` bind by node |
 | `LK_NUMA_INTERLEAVE` | perf | 1 | `1`: interleave host weights across NUMA nodes (avoids node OOM; required for the pump's per-node copy streams); `0` off |
 | `LK_NUMA_HUGE` | perf | `0` | `1`: opt-in 2M THP-aligned host slabs (single-node / THP-friendly boxes); NUMA-interleave, not page size, is the usual win |
-| `LK_POWER_SAVING` | power | 0 | `1`: CPU power-saving mode on the decode path |
+| `LK_POWER_SAVING` | power | 0 | `1`: an idle worker `yield()`s instead of spinning (and sleeps 4 s instead of 2 s after 120 s idle) — **standby only**, hands CPU back while the server waits for work; nothing in the compute path reads it, so it does not lower power while inferring |
 | `LK_HF_MBOX` | perf | `1` | mailbox early-start of host-side decode (non-`0` on, `0` off) |
 | `OMP_NUM_THREADS` | perf | - | set to 1 to avoid slow model loading |
 
@@ -223,13 +223,25 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 |--------|------|--------|------|
 | `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND expert-cache capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer. It sizes the CACHE only: the domain's total VRAM is `max(cache, prefill working set)` — see [VRAM sizing](#vram-sizing-pool--gpu-prefill). Must be `>= top_k` when non-zero |
 | `LK_POOL_DECODE` | pool | follow pool | decode GPU half: pool-resident experts go to the GPU resident-gemv half. `1` on / `0` off explicitly; unset follows `LK_POOL_SLOTS` > 0 |
-| `LK_POOL_DECODE_ENGINE` | pool | `gemv` | Which kernel the decode GPU half uses. `gemv`: the default path, output bit-matches previous releases; `sm12x` (SM120/SM121 only): the FP4 kernel, +5.4% per step at one row and +3.3% at two rows, intermediates in FP16 so output differs in the third decimal. Needs `LK_GPU_PREFILL_ENGINE=flashinfer` and an intermediate size divisible by 128; otherwise it logs the reason and stays on `gemv` |
-| `LK_POOL_MBOX_SPLIT` | pool | 0 = off | Start the decode GPU half before joining the CPU half instead of in one step. Nothing measured at one or two rows per step; the `launch/` recipes set it to `1` |
+| `LK_POOL_MBOX_SPLIT` | pool | 0 = off | Start the decode GPU half before joining the CPU half instead of in one step. Nothing measured at one or two rows per step (7.43 vs 7.07-7.35 ms/step at one row), so the `launch/` recipes no longer set it |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
 | `LK_POOL_INFLIGHT` | pool | `16` | in-flight DMA jobs / event-ring depth (backpressure cap = 8x; lower values false-positive under small batches) |
 | `LK_POOL_LAYERS` | pool | -- | RETIRED: pool membership is global (`LK_POOL_SLOTS` > 0); the parser is dead code and per-layer mixing with GPU prefill is not supported |
-| `LK_POOL_STAGE` | pool | 1 | coalesced H2D staging ring (read by lk_moe) |
-| `LK_POOL_LOG` | pool | 0 | windowed `[pool]` stats line every N decode steps (0 = silent) |
+| `LK_POOL_NO_STAGE` | pool | 1 | Fill path for an admitted expert. `1` (default): each NUMA fragment is DMA'd straight from the pinned host pages into its slot -- on an 8-node host that is ~16 async copies and no host copy (1.1 ms -> 0.13 ms per admission here). `0`: the coalesced staging ring (`LK_POOL_STAGE`), which memcpys the whole expert into pinned scratch first. **Which one wins depends on what the step waits on**: 0731/DSPARK prefers the default, dsv4.1/3090 the slab -- see [fill path](#gpu-pool-expert-cache) |
+| `LK_VERIFY_RESIDENT` | spec | 1 | Ride-share for verify batches: the draft rows read the residency the real tokens built (resident expert -> GPU half, miss -> CPU). Their ids never enter the admission ledger unless `LK_VERIFY_PUMP` is set. `0` = draft rows always run on the CPU |
+
+**Fill path (`LK_POOL_NO_STAGE`).** Both paths are correctness-equivalent; the winner follows what the step waits on. Measured here on the same build: DeepSeek-V4-Flash-0731 / DSPARK prefers the default per-fragment DMA (an admission's host memcpy was the cost: 1.1 ms -> 0.13 ms, gather 1669-2494 -> 0 us); DeepSeek-V4.1-Flash-1017 TP2/3090 prefers the slab -- decode median **27.0 -> 21.1 tok/s** with the per-fragment default, **26.0** back with `LK_POOL_NO_STAGE=0` (same recipe, same log, 284 vs 11 samples). The three `launch/sglang_serve_dsv41_*.sh` recipes therefore pin `LK_POOL_NO_STAGE=0`; leave it unset (default `1`) everywhere else.
+
+### Debug / diagnostics
+
+Knobs in this section change what the engine *prints* or are only meaningful when debugging a specific regression; none of them is needed to run the engine.
+
+| Env var | Type | Default | Description |
+|--------|------|--------|------|
+| `LK_POOL_LOG` | debug | 0 | windowed `[pool]` stats line every N decode steps (0 = silent) |
+| `LK_VERIFY_PUMP` | debug | 0 | `1` also feeds the draft rows' ids to the admission ledger. Only sensible when the cache can hold a whole verify batch; on a small cache it evicts what it just brought in |
+| `LK_POOL_DET_SPLIT` | debug | 0 | deterministic split: publish the claimed batch and make the GPU half wait on that batch's copy fence before reading slots |
+| `LK_POOL_SPLIT_PROBE` | debug | 0 | log the frozen split (claim/ready/snapshot counts) per pool layer for batches of <=32 routed ids; skipped inside capture |
 
 ### VRAM sizing (pool + GPU prefill)
 
@@ -252,10 +264,11 @@ knob), the shipped per-recipe budgets and the pitfalls are in
 
 ### Speculative decode
 
-| Env var | Type | Default | Description |
-|--------|------|--------|------|
-| `LK_VERIFY_RESIDENT` | spec | 0 | verify batches cover draft rows' pool-resident experts; requires pool + NEXTN/DSPARK draft rows |
-| `LK_VERIFY_SKIP_MISS` | spec | 0 | skip verification for rows whose experts missed residency (`1`: trust CPU path) |
+The pool and speculative decoding now compose: `LK_VERIFY_RESIDENT` (default
+`1`) lets the draft rows read the residency the real tokens built, while their
+ids stay out of the admission ledger (see `LK_VERIFY_PUMP` under
+[Debug / diagnostics](#debug--diagnostics)). Requires a pool
+(`LK_POOL_SLOTS > 0`) and a NEXTN/DSPARK draft.
 
 ### PLE / NVMe offload
 
@@ -267,6 +280,8 @@ knob), the shipped per-recipe budgets and the pitfalls are in
 | `LK_NVME_CACHE_MB` | nvme | `1024` | MB of hot rows kept for the direct-read path (inert unless `LK_NVME_DIRECT=1` and the feature's backend is on) |
 | `LK_ENGRAM_NVME` | nvme | `0` | DeepSeek-V4.1 Engram served directly from the checkpoint file: zero host RAM for the table |
 | `LK_ENGRAM_NVME_CACHE_MB` / `LK_ENGRAM_NVME_STAGING_MB` | nvme | `1024` / `128` | Engram NVMe store cache / staging budgets |
+
+**Engram backend: prefer the host table when RAM allows.** Same build, DeepSeek-V4.1-Flash-1017 TP2/3090, real text, exclusive run: cold prefill 5.2K / 16.9K / 31.9K = **524 / 688 / 766 tok/s on NVMe** against **666 / 967 / 1091 with `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`** (+27 / +41 / +42%), decode 26 vs 28 tok/s at 4K. The NVMe path is **latency-bound, not bandwidth-bound**: during a 32K prefill the disks carried at most 14.7 MB/s (median 0), so bandwidth counters say nothing. The table is ~48 GB in host RAM; use `LK_ENGRAM_NVME=1` only when that RAM is not available.
 
 ### Diagnostics (all default off; no effect on the compute path)
 
@@ -282,8 +297,6 @@ knob), the shipped per-recipe budgets and the pitfalls are in
 | `LK_MBOX_STOPFILE` | mbox | stop-file for orderly teardown (read by lk_moe) |
 | `LK_DISABLE_QSA_SHARE` | draft | draft worker: disable QSA share (A/B isolation only) |
 | `SGLANG_RS_DEBUG` | upstream | rejection-sampling traces; upstream sglang knob, kept as-is |
-
-
 
 ## Tuning recipes
 
@@ -306,7 +319,7 @@ Machine-level notes:
 
 - **BIOS NUMA**: AMD EPYC NPS4 / Intel XEON SNC4; use 2,4,8 nodes (multiple of GPU count is best), up to 32.
 - **Thread count**: HT on -> physical cores / GPUs; HT off -> (physical cores-2) / GPUs.
-- **CPU power saving**: `LK_POWER_SAVING=1`.
+- **CPU power saving**: `LK_POWER_SAVING=1` — standby only, cuts the CPU time the idle workers hold while waiting for requests; no effect on decode power at load, and it costs wake-up latency.
 
 ---
 
