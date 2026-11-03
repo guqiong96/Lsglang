@@ -552,11 +552,14 @@ class Fp8LinearMethod(LinearMethodBase):
         # are repacked; the rest stay on the w8a16 Triton path.
         # Device-aware gate: can_auto_enable_marlin_fp8() reads device_id=0,
         # so on a heterogeneous TP group every rank would see GPU0's SM86.
-        _marlin_group32_cap = (
-            torch.cuda.get_device_capability(torch.cuda.current_device())
-            if _is_cuda
-            else (0, 0)
-        )
+        if _is_cuda:
+            from sglang.kernels.ops.quantization.cap_override import (
+                device_capability,
+            )
+
+            _marlin_group32_cap = device_capability()
+        else:
+            _marlin_group32_cap = (0, 0)
         # Ada (8.9) is included on purpose: the group-32 Marlin W8A16 path is
         # the one the 8.0/8.6 cards run, and a field report has 4x4090 producing
         # garbage through the alternative it used to take (the Triton

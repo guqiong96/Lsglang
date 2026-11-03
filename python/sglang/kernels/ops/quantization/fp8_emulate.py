@@ -24,7 +24,9 @@ def fp8_native_supported() -> bool:
     (SM89 / Ada and newer)."""
     if not torch.cuda.is_available():
         return True
-    cap = torch.cuda.get_device_capability()
+    from sglang.kernels.ops.quantization.cap_override import device_capability
+
+    cap = device_capability()
     # Ada joins the emulated path (see fp8_kernel.fp8_dot_supported): the fork
     # that only a 40-series card takes is the one under suspicion.
     return cap >= (8, 9) and cap != (8, 9)
