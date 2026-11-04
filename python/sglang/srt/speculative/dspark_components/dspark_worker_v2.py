@@ -493,6 +493,40 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         if not self._hosts_draft:
             return
+
+        # Warm the SWA page-free kernel for both allocators and both index
+        # dtypes.  prewarm_get_and_clear_swa_pages() defaults to int32
+        # representatives while the request-release path passes int64, so the
+        # prewarmed specialisation is never used and the first real release
+        # still does a cold cuModuleLoadData inside the event loop (the GSP RPC
+        # wedge the helper's docstring warns about).  The draft owns its own
+        # SWATokenToKVPoolAllocator, which the model runner never warms.
+        try:
+            import torch as _torch
+
+            from sglang.kernels.ops.memory.allocator import (
+                prewarm_get_and_clear_swa_pages as _prewarm_swa,
+            )
+
+            for _name, _runner in (
+                ("draft", self.draft_model_runner),
+                ("target", self.model_runner),
+            ):
+                _alloc = getattr(_runner, "token_to_kv_pool_allocator", None)
+                _mapping = getattr(_alloc, "full_to_swa_index_mapping", None)
+                _page_size = int(getattr(_alloc, "page_size", 0) or 0)
+                if _mapping is None or _page_size <= 0:
+                    continue
+                for _dtype in (_torch.int32, _torch.int64):
+                    _prewarm_swa(_mapping, _page_size, reps_dtype=_dtype)
+                    logger.info(
+                        "Prewarmed %s SWA page-free kernel (page_size=%d, dtype=%s)",
+                        _name,
+                        _page_size,
+                        _dtype,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SWA page-free prewarm failed: %r", exc)
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
