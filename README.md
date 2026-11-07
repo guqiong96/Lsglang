@@ -297,15 +297,16 @@ Machine-level notes:
 | Qwen3.8-Flash-Next | 5060Ti x2 | **2189 t/s** | **2066 t/s** | — | — | 40-49 t/s | 46-76 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
 | Qwen3.8-Flash-Next | 3090 x2 + 5060Ti x2 (TP4) | **1249 t/s** | — | **1247 t/s** | — | — | 63-83 t/s | [NEXTN](launch/sglang_serve_qwen38_mtp_tp4.sh) |
 | Qwen3.8-Flash-Next | 3090 x2 + 5060Ti x2, PLE on NVMe | **1166 t/s** | — | — | — | — | 66.6 t/s | [NVMe](launch/sglang_serve_qwen38_mtp_tp4_nvme.sh) |
-| GLM-5.3-Flash-NVFP4 | 3090 x2 | **892 t/s** | — | — | — | 24 t/s | — | [plain](launch/sglang_serve_glm53_tp2_3090.sh) |
-| Qwen3.6-35B-A3B | 3090 x2 | **6026 t/s** | — | — | — | 162-172 t/s | — | [plain](launch/sglang_serve_qwen36_tp2_3090.sh) |
+| GLM-5.3-Flash-NVFP4 | 3090 x2 | **892 t/s** | — | — | — | 29-42 t/s | — | [plain](launch/sglang_serve_glm53_tp2_3090.sh) |
+| Qwen3.6-35B-A3B | 3090 x2 | **6026 t/s** | — | — | — | 160-258 t/s | — | [plain](launch/sglang_serve_qwen36_tp2_3090.sh) |
 
 All rows measured on one machine with **lsglang 1.7.3 + lk_moe 2.8.4**: 2x AMD EPYC 7642
 (96 cores / 192 threads, AVX2 only), 16-channel DDR4-3200, 1 TB, CUDA 13.0 / torch 2.14.1 /
 driver 610.57.04. **Prefill** = client wall time of one request at that input length (bracketed
 figure = wall time); **Decode** / **Spec. decode** = steady state throughput of the decode steps as the server
 reports it per step, over the runs of one day, given as `median-max`; **Spec. decode** is
-DSPARK (DeepSeek) or NEXTN (Qwen3.8). A short client-side window (a few hundred tokens)
+DSPARK (DeepSeek) or NEXTN (Qwen3.8); a recipe without `--speculative-*` never prints an
+`accept len` line, which is how the plain rows were confirmed. A short client-side window (a few hundred tokens)
 reads 20-30% lower because it also pays the first token. `—` = not measured for that
 configuration, not a failure. A DSPARK run's prefill is within ~3% of its plain twin.
 
