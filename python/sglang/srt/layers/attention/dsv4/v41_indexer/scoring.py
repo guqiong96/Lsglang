@@ -516,3 +516,156 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
     inputs.out_page_indices[: d.bs, :k] = torch.where(
         reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
     ).to(torch.int32)
+
+# ---------------------------------------------------------------------------
+# fp4 block path: block ids + the fine top-k, both inside a bounded window.
+#
+# The torch path above dequantizes every visible candidate and scores
+# ``[rows, lc]``; the packed fp4 payload is 68 bytes per candidate, so the
+# block maxima can come from a Triton kernel and only the selected blocks are
+# ever decoded. Same math, no ``rows x lc`` tensor.
+# ---------------------------------------------------------------------------
+
+_FP4_MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _fp4_dequant_rows(payload_u8: torch.Tensor, scales_u8: torch.Tensor) -> torch.Tensor:
+    """``(*, 64)`` uint8 + ``(*, 4)`` uint8 -> ``(*, 128)`` fp32, reference math.
+
+    Decoded arithmetically from uint8 nibbles: a table indexed through int64
+    codes costs 8x the bytes of the payload tile and was itself an OOM source.
+    """
+    lo = payload_u8 & 0x0F
+    hi = (payload_u8 >> 4) & 0x0F
+    codes = torch.stack([lo, hi], dim=-1).flatten(-2)          # uint8, 2 per byte
+    m = (codes & 0x7).to(torch.float32)
+    mag = torch.where(
+        m < 2,
+        m * 0.5,
+        torch.exp2(torch.floor(m * 0.5) - 1.0) * (1.0 + 0.5 * (m - 2.0 * torch.floor(m * 0.5))),
+    )
+    val = torch.where((codes & 0x8) != 0, -mag, mag)
+    scale = torch.exp2(scales_u8.to(torch.float32) - 127.0)
+    return val * scale.repeat_interleave(32, dim=-1)
+
+
+def _score_rows_against(q, k, w):
+    """``sum_h relu(q[n,h,:] . k[n,c,:]) * w[n,h]`` -> ``[n, c]`` fp32."""
+    s = torch.einsum("nhd,ncd->nhc", q.float(), k)
+    return (s.clamp_min(0) * w[:, :, None]).sum(1)
+
+
+def prefill_fp4_block_select(
+    *,
+    inputs,
+    token_to_kv_pool,
+    req_to_token,
+    block_size: int,
+    topk_blocks: int,
+    rows_per_chunk: int = 128,
+    blocks: Optional[torch.Tensor] = None,
+):
+    """Per request-row chunk: candidate block ids + the fine top-k indices.
+
+    Yields ``(request, tok, lens, block_ids, fine_idx)``; ``block_ids`` is
+    ``[rows, min(topk_blocks, n_blocks)]`` int32 with ``-1`` padding, ``fine_idx``
+    is ``[rows, k]`` int32 candidate indices (already remapped, sorted by the
+    caller's ``write_prefill``).
+
+    With ``blocks`` the block selection is already published (a consumer layer
+    reusing the source layer's metadata): the O(rows x lc) block scoring is
+    skipped and only the fine top-k inside those blocks runs.
+    """
+    from sglang.kernels.ops.attention.dsv4.triton_fp4_block_scores import (
+        triton_fp4_block_scores,
+    )
+
+    pool = token_to_kv_pool
+    ratio = inputs.compress_ratio
+    indexer = inputs.indexer
+    req, pos = inputs.req_rows, inputs.positions
+    assert req is not None, "the fp4 indexer needs the batch's rows"
+    inputs.reset_outputs()
+    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+    weights = indexer.head_weights(inputs.x)
+    compress_lens = (pos + 1) // ratio
+    topk = indexer.index_topk
+    for r in torch.unique_consecutive(req).tolist():
+        tok = (req == r).nonzero().squeeze(1)
+        lens = compress_lens[tok]
+        lc = int(lens.max().item())
+        if lc == 0:
+            continue
+        j = torch.arange(lc, device=pos.device)
+        slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
+        payload, scales = pool.get_low_ratio_index_k_fp4(inputs.layer_id, slots)
+        pay_u8 = payload.view(torch.uint8).reshape(lc, 64)
+        sca_u8 = scales.view(torch.uint8).reshape(lc, 4)
+        n_blocks = (lc + block_size - 1) // block_size
+        kk = min(topk_blocks, n_blocks) if blocks is None else int(blocks.shape[1])
+        request = RequestScores(
+            lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
+        )
+        for start in range(0, tok.numel(), rows_per_chunk):
+            rows = slice(start, min(start + rows_per_chunk, tok.numel()))
+            tok_c, lens_c = request.tok[rows], request.lens[rows]
+            n = int(tok_c.numel())
+            if n == 0:
+                continue
+            if blocks is None:
+                starts = torch.zeros(n, dtype=torch.int32, device=pos.device)
+                ends = lens_c.to(torch.int32)
+                blk = triton_fp4_block_scores(
+                    q[tok_c], pay_u8, sca_u8, weights[tok_c], starts, ends,
+                    n_blocks, block_size,
+                )
+                last = ((lens_c - 1) // block_size).to(torch.int64)
+                blk = blk.masked_fill(
+                    torch.arange(n_blocks, device=blk.device)[None, :] == last[:, None],
+                    torch.inf,
+                )
+                top = blk.topk(kk, dim=-1)
+                block_ids = top.indices.to(torch.int32).masked_fill_(
+                    ~(top.values > -torch.inf), -1
+                )
+            else:
+                block_ids = blocks[tok_c]
+            # Exact top-k inside *every* published block -- the same candidate
+            # set the dense path scores, so the selection cannot drift from it.
+            # A trimmed tile (ceil(k/block) + 2 blocks) is tempting but wrong:
+            # at k=512 a 6-block tile disagreed with the dense top-k on roughly
+            # half the rows (measured with LK_INDEX_SELFTEST). What bounds the
+            # tile here is the row slicing below, not a block trim.
+            take = min(request.k, lc)
+            if kk <= 0:
+                continue
+            sel_ids = block_ids
+            sel = sel_ids.clamp_min(0).to(torch.int64)
+            cand = sel.unsqueeze(-1) * block_size + torch.arange(
+                block_size, device=pos.device
+            )[None, None, :]
+            flat = cand.reshape(n, kk * block_size)
+            in_win = flat < lens_c[:, None]
+            # A -1 block is padding, not block 0: drop its lanes so they cannot
+            # take slots that a real candidate should own.
+            in_win &= (sel_ids >= 0).repeat_interleave(block_size, dim=1)
+            per_row = max(1, kk * block_size * q.shape[-1] * 4)
+            step = max(1, min(n, 32_000_000 // per_row))
+            for r0 in range(0, n, step):
+                sl = slice(r0, min(r0 + step, n))
+                # The tail block runs past `lc`; those lanes are masked out of
+                # the scores, but the gather itself must stay in range.
+                gather_idx = flat[sl].clamp_max(lc - 1)
+                k_rows = _fp4_dequant_rows(pay_u8[gather_idx], sca_u8[gather_idx])
+                fine = _score_rows_against(q[tok_c[sl]], k_rows, weights[tok_c[sl]])
+                fine = fine.masked_fill(~in_win[sl], -torch.inf)
+                top = fine.topk(min(take, fine.shape[-1]), dim=-1, sorted=False)
+                # A row whose window holds fewer than k candidates must leave
+                # the extra slots empty (write_prefill maps anything >= lens to
+                # -1); repeating a candidate would reweight it in the attention.
+                picked = flat[sl].gather(1, top.indices)
+                picked = picked.masked_fill(top.values == -torch.inf, lc)
+                yield (
+                    request, tok_c[sl], lens_c[sl], block_ids[sl],
+                    picked.to(torch.int32),
+                )

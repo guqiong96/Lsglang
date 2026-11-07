@@ -527,6 +527,11 @@ def finish_materialized_sparse_mla_scores_with_sink(
         output[:, active_heads:].zero_()
 
 
+# Budget for the fp32 KV copy the score bmm needs; the candidate axis is walked
+# in slices of at most this many bytes so a long context cannot decide the peak.
+SCORE_KV_BYTES = 16 << 20
+
+
 def matmul_sparse_mla_attention_with_sink(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -580,11 +585,21 @@ def matmul_sparse_mla_attention_with_sink(
     assert score_buffer.dtype in (torch.float32, torch.bfloat16)
     if score_buffer.dtype == torch.float32:
         q_score = q_active.float()
-        kv_score = kv.float()
+        # Upcasting the whole candidate window doubles the KV bytes for the bmm.
+        # At a 256K context that copy is 160 MiB and the KV pool leaves ~130 MiB,
+        # so the decode step OOM'd there while every other buffer fit. Chunk the
+        # candidates: the transient is bounded by SCORE_KV_BYTES regardless of
+        # how long the context is, and the arithmetic stays fp32.
+        step = max(1, SCORE_KV_BYTES // max(1, num_tokens * kv.shape[-1] * 4))
+        for c0 in range(0, num_candidates, step):
+            c1 = min(c0 + step, num_candidates)
+            score_buffer[:, :, c0:c1].copy_(
+                torch.bmm(q_score, kv[:, c0:c1].float().transpose(1, 2))
+            )
     else:
         q_score = q_active.to(score_buffer.dtype)
         kv_score = kv.to(score_buffer.dtype)
-    torch.bmm(q_score, kv_score.transpose(1, 2), out=score_buffer)
+        torch.bmm(q_score, kv_score.transpose(1, 2), out=score_buffer)
     score_buffer.mul_(scale)
     finish_materialized_sparse_mla_scores_with_sink(
         score_buffer,

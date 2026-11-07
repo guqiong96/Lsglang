@@ -1102,6 +1102,23 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def _prompt_rows_requested(fb) -> bool:
+    """True when the batch must produce outputs for its prompt rows.
+
+    Decoder SWA bounded replay runs the late layers over each request's last
+    SWA_WINDOW extend tokens only, which is exact for generation (only the last
+    position is read) but drops the earlier rows' values. A request that asks
+    for prompt logprobs reads every row, so it must run the whole extend.
+    """
+    if not getattr(fb, "return_logprob", False):
+        return False
+    starts = getattr(fb, "extend_logprob_start_lens_cpu", None)
+    lens = getattr(fb, "extend_seq_lens_cpu", None)
+    if not starts or not lens:
+        return False
+    return any(s < n for s, n in zip(starts, lens))
+
+
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
     # backend onto the tail metadata of the *live* batch (the captured args hold
@@ -4205,6 +4222,7 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and not _prompt_rows_requested(forward_batch)
         ):
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail

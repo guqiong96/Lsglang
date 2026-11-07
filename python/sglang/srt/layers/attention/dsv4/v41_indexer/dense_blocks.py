@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
+from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
@@ -21,12 +22,12 @@ from .scoring import (
     PagedDecodeScores,
     decode_scores,
     get_deep_gemm_prefill_data,
-    prefill_requests,
     score_tiles,
     select_decode,
     topk_ragged,
     write_decode,
     write_prefill,
+    prefill_fp4_block_select,
 )
 from .types import (
     CandidateMetadata,
@@ -186,25 +187,18 @@ class DenseBlocksBackend:
 
     def _torch_publish_prefill(self, inputs: PrefillInputs):
         picked = []  # (query rows, their block ids) per scored chunk
-        for request, chunks in prefill_requests(
+        # Packed fp4 path: block maxima from a Triton kernel, the fine top-k
+        # scored only inside the selected blocks. The dense torch scores this
+        # replaces are [rows, lc] (~1 GiB at a 250K-token prefill).
+        for request, tok, lens, block_ids, idx in prefill_fp4_block_select(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            block_size=self.block_size,
+            topk_blocks=self.topk_blocks,
         ):
-            for chunk in chunks:
-                picked.append(
-                    (
-                        chunk.tok,
-                        select_candidate_block_ids(
-                            chunk.scores,
-                            chunk.lens[:, None],
-                            topk_blocks=self.topk_blocks,
-                            block_size=self.block_size,
-                        ),
-                    )
-                )
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(inputs, request, chunk, idx)
+            picked.append((tok, block_ids))
+            write_prefill(inputs, request, SimpleNamespace(tok=tok, lens=lens), idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
             (inputs.positions.shape[0], width),
@@ -222,22 +216,18 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
     ) -> None:
         assert published is not None
-        for request, chunks in prefill_requests(
+        # Consumer layers reuse the source layer's blocks: only the fine top-k
+        # inside those blocks is scored, so the dense [rows, lc] matrix (and its
+        # 216 MiB dequant) is gone from this path too.
+        for request, tok, lens, _, idx in prefill_fp4_block_select(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            block_size=self.block_size,
+            topk_blocks=self.topk_blocks,
+            blocks=published.blocks,
         ):
-            for chunk in chunks:
-                idx = topk_among_blocks(
-                    chunk.scores,
-                    chunk.lens,
-                    published.blocks[chunk.tok],
-                    request.k,
-                    block_size=self.block_size,
-                )
-                write_prefill(
-                    inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
-                )
+            write_prefill(inputs, request, SimpleNamespace(tok=tok, lens=lens), idx)
 
 
 def _publish_prefill_blocks(

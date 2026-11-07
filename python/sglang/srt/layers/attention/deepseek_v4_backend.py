@@ -163,6 +163,11 @@ def _is_sm8() -> bool:
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
+# Byte budget for the gathered KV buffer of the sm8 attention path. The gather
+# is (rows, topk, 576) bf16, so it grows with the batch: 1024 rows at
+# topk=2176 is 2.5 GiB, which does not fit next to the KV pool. Shard the
+# batch until one block fits this budget.
+_SM8_ATTN_BYTES_BUDGET = 128 * 2**20
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
@@ -1278,6 +1283,7 @@ class DeepseekV4AttnBackend(
         if self._c128_decode_max_topk not in self._c128_topk_buckets:
             self._c128_topk_buckets.append(self._c128_decode_max_topk)
         self._c128_topk_buckets.sort()
+        self._sm8_tiled_arange: dict = {}
         self._sm8_attn_buffers: Dict[
             Tuple[int, int, int, torch.dtype], Tuple[torch.Tensor, ...]
         ] = {}
@@ -4301,6 +4307,26 @@ class DeepseekV4AttnBackend(
         assert n_swa % 64 == 0, f"swa width {n_swa} not a multiple of 64"
         n_extra = extra_indices.shape[-1] if compress_ratio != 0 else 0
         topk = n_swa + n_extra
+        row_bytes = topk * (DIM_NOPE + DIM_ROPE) * 2
+        block = max(1, _SM8_ATTN_BYTES_BUDGET // max(1, row_bytes))
+        if b > block:
+            parts = [
+                self._forward_decode_sm8_tilelang(
+                    q=q[lo:hi],
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    token_to_kv_pool=token_to_kv_pool,
+                    swa_page_indices=swa_page_indices[lo:hi],
+                    swa_topk_lengths=swa_topk_lengths[lo:hi],
+                    extra_indices=None if extra_indices is None else extra_indices[lo:hi],
+                    extra_topk_lengths=(
+                        None if extra_topk_lengths is None else extra_topk_lengths[lo:hi]
+                    ),
+                    attn_sink=attn_sink,
+                )
+                for lo, hi in ((lo, min(lo + block, b)) for lo in range(0, b, block))
+            ]
+            return torch.cat(parts, dim=0)
 
         # Reuse cached buffers across steps (CUDA-graph friendly: torch.empty
         # during capture allocates from the graph memory pool). The cache is
@@ -4314,8 +4340,13 @@ class DeepseekV4AttnBackend(
             if envs.SGLANG_SM8X_SCORES_BF16.get()
             else torch.float32
         )
+        # ONE buffer set, replaced when the shape changes: the old dict kept an
+        # entry per (topk, b, h) and a long session accumulated them until the
+        # engine (mem-fraction 0.78) had nothing left. Reallocating per shape
+        # change costs one torch.empty; the sharded block bounds the size.
         key = (topk, b, h, score_dtype)
-        buf = self._sm8_attn_buffers.get(key)
+        cached = self._sm8_attn_buffers.get("current")
+        buf = cached[1] if cached is not None and cached[0] == key else None
         if buf is None:
             combined_kv = torch.empty(
                 (b, topk, DIM_NOPE + DIM_ROPE),
@@ -4330,7 +4361,7 @@ class DeepseekV4AttnBackend(
             )
             valid_buf = torch.empty((b, topk), dtype=torch.bool, device=device)
             buf = (combined_kv, out, score_buffer, valid_buf)
-            self._sm8_attn_buffers[key] = buf
+            self._sm8_attn_buffers = {"current": (key, buf)}
         combined_kv, out, score_buffer, valid_buf = buf
 
         dequantize_combined_kv_paged(
@@ -4457,34 +4488,31 @@ class DeepseekV4AttnBackend(
             # maker JIT-compiles once per bucket instead of once per distinct
             # seq-len. Pad entries are -1 (masked inside the kernel, same as
             # the combine kernel's own -1 tail).
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-                tilelang_sparse_fwd,
+            #
+            # The tiled Triton kernel replaces that TileLang v1 wrapper: v1
+            # fills two replicated CTAs on SM86, so a long prefill ran it at a
+            # small fraction of the card. Each program here owns one query x
+            # HEAD_BLOCK heads (one KV row read per head block instead of per
+            # (query, head)) and no score matrix is materialized. topk width
+            # and token count are RUNTIME arguments, so a different sub-M cut
+            # (LK_GPU_PREFILL_SUB_M) or a different c128 combine width is the
+            # same cubin -- the power-of-two padding above is gone with it.
+            from sglang.kernels.ops.attention.dsv4.sparse_mla_prefill_tiled import (
+                sparse_mla_prefill_tiled,
             )
 
-            idx = combined_indices
-            width = idx.shape[-1]
-            bucket = 128
-            while bucket < width:
-                bucket *= 2
-            if bucket != width:
-                idx = torch.nn.functional.pad(
-                    idx, (0, bucket - width), mode="constant", value=-1
-                )
             # attn_sink may be zero-padded to the FlashMLA decode head count
             # (64) under TP; the kernel's Sink tensor is exactly q's heads.
             sink = attn_sink[: q_flat.shape[1]] if attn_sink.dim() == 1 else attn_sink
-            o = tilelang_sparse_fwd(
+            return sparse_mla_prefill_tiled(
                 q=q_flat,
-                kv=kv,
-                indices=idx.unsqueeze(1),
-                sm_scale=self.softmax_scale,
+                kv_flat=kv,
+                indices=combined_indices,
+                lens=combined_lens,
+                scale=self.softmax_scale,
+                attn_sink=sink,
                 d_v=self.head_dim_v,
-                sink=sink,
             )
-            # (1, num_qo, h, d_v) -> (num_qo, h, d_v)
-            o_attn = o.squeeze(0)
-            return o_attn
-            return o_attn
         if cos_sin_cache is not None:
             return self._forward_mega_prefill(
                 q=q_flat,
