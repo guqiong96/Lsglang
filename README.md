@@ -291,21 +291,22 @@ Machine-level notes:
 
 | Model | GPU | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Decode | Spec. decode | Command |
 |-------|-----|-------------|-------------|--------------|--------------|--------|--------------|---------|
-| DeepSeek-V4.1-Flash-1017 | 3090 x2 | **1499 t/s** (22.0 s) | **1461 t/s** (44.9 s) | **1454 t/s** (90.3 s) | **1109 t/s** (228 s) | 30.9 t/s | 48.5-52.8 t/s | [plain](launch/sglang_serve_dsv41_tp2_3090.sh) · [DSPARK](launch/sglang_serve_dsv41_tp2_3090_dspark.sh) |
-| DeepSeek-V4-Flash-0731 | 3090 x2 | **1148 t/s** (28.7 s) | **1103 t/s** (59.4 s) | — | — | — | 43.9-46.5 t/s | [DSPARK](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
-| Qwen3.8-Flash-Next | 3090 x2 | **2214 t/s** | **2524 t/s** | — | **2333 t/s** | 54.8 t/s | 72.2-74.3 t/s | [plain](launch/sglang_serve_qwen38_tp2_3090.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) |
-| Qwen3.8-Flash-Next | 5060Ti x2 | **2189 t/s** | **2066 t/s** | — | — | 37.2 t/s | 46.2-49.5 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
-| Qwen3.8-Flash-Next | 3090 x2 + 5060Ti x2 (TP4) | **1249 t/s** | — | **1247 t/s** | — | — | 64.0 t/s | [NEXTN](launch/sglang_serve_qwen38_mtp_tp4.sh) |
+| DeepSeek-V4.1-Flash-1017 | 3090 x2 | **1499 t/s** (22.0 s) | **1461 t/s** (44.9 s) | **1454 t/s** (90.3 s) | **1109 t/s** (228 s) | 29-36 t/s | 41-52 t/s | [plain](launch/sglang_serve_dsv41_tp2_3090.sh) · [DSPARK](launch/sglang_serve_dsv41_tp2_3090_dspark.sh) |
+| DeepSeek-V4-Flash-0731 | 3090 x2 | **1148 t/s** (28.7 s) | **1103 t/s** (59.4 s) | — | — | — | 42-52 t/s | [DSPARK](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
+| Qwen3.8-Flash-Next | 3090 x2 | **2214 t/s** | **2524 t/s** | — | **2333 t/s** | 59-70 t/s | **96-118 t/s** | [plain](launch/sglang_serve_qwen38_tp2_3090.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) |
+| Qwen3.8-Flash-Next | 5060Ti x2 | **2189 t/s** | **2066 t/s** | — | — | 40-49 t/s | 46-76 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
+| Qwen3.8-Flash-Next | 3090 x2 + 5060Ti x2 (TP4) | **1249 t/s** | — | **1247 t/s** | — | — | 63-83 t/s | [NEXTN](launch/sglang_serve_qwen38_mtp_tp4.sh) |
 | Qwen3.8-Flash-Next | 3090 x2 + 5060Ti x2, PLE on NVMe | **1166 t/s** | — | — | — | — | 66.6 t/s | [NVMe](launch/sglang_serve_qwen38_mtp_tp4_nvme.sh) |
-| GLM-5.3-Flash-NVFP4 | 3090 x2 | **892 t/s** | — | — | — | 20.6 t/s | — | [plain](launch/sglang_serve_glm53_tp2_3090.sh) |
-| Qwen3.6-35B-A3B | 3090 x2 | **6026 t/s** | — | — | — | 126.7 t/s | — | [plain](launch/sglang_serve_qwen36_tp2_3090.sh) |
+| GLM-5.3-Flash-NVFP4 | 3090 x2 | **892 t/s** | — | — | — | 24 t/s | — | [plain](launch/sglang_serve_glm53_tp2_3090.sh) |
+| Qwen3.6-35B-A3B | 3090 x2 | **6026 t/s** | — | — | — | 162-172 t/s | — | [plain](launch/sglang_serve_qwen36_tp2_3090.sh) |
 
 All rows measured on one machine with **lsglang 1.7.3 + lk_moe 2.8.4**: 2x AMD EPYC 7642
 (96 cores / 192 threads, AVX2 only), 16-channel DDR4-3200, 1 TB, CUDA 13.0 / torch 2.14.1 /
 driver 610.57.04. **Prefill** = client wall time of one request at that input length (bracketed
-figure = wall time); **Decode** = 256 output tokens after a short prompt; **Spec. decode** =
-DSPARK (DeepSeek) or NEXTN (Qwen3.8) on the same recipe, as the range over repeated
-runs (low-median to best). `—` = not measured for that
+figure = wall time); **Decode** / **Spec. decode** = steady state throughput of the decode steps as the server
+reports it per step, over the runs of one day, given as `median-max`; **Spec. decode** is
+DSPARK (DeepSeek) or NEXTN (Qwen3.8). A short client-side window (a few hundred tokens)
+reads 20-30% lower because it also pays the first token. `—` = not measured for that
 configuration, not a failure. A DSPARK run's prefill is within ~3% of its plain twin.
 
 Experimental DeepSeek-V4.1 storage option: exact NVMe Engram lookup (`LK_ENGRAM_NVME=1`; host-table fallback `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`; budgets `LK_ENGRAM_NVME_CACHE_MB` (default 1024) / `LK_ENGRAM_NVME_STAGING_MB` (default 128)).
