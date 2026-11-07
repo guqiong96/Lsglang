@@ -272,26 +272,24 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = _e4m3_uint8_to_f32(
-                tl.load(
-                    q_ptr
-                    + batch * stride_qb
-                    + q_pos * stride_qn
-                    + heads[:, None] * stride_qh
-                    + d[None, :] * stride_qd,
-                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
-                    other=0,
-                )
+            # Keep the raw E4M3 bytes: the fp8 MMA path feeds them straight to
+            # the tensor cores, and only the bf16 fallback decodes to f32.
+            q_bytes = tl.load(
+                q_ptr
+                + batch * stride_qb
+                + q_pos * stride_qn
+                + heads[:, None] * stride_qh
+                + d[None, :] * stride_qd,
+                mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                other=0,
             )
-            k = _e4m3_uint8_to_f32(
-                tl.load(
-                    kv_ptr
-                    + block_idx[None, :] * stride_kvb
-                    + block_offset[None, :] * stride_kvs
-                    + d[:, None] * stride_kvd,
-                    mask=context_mask[None, :] & (d[:, None] < head_dim),
-                    other=0,
-                )
+            k_bytes = tl.load(
+                kv_ptr
+                + block_idx[None, :] * stride_kvb
+                + block_offset[None, :] * stride_kvs
+                + d[:, None] * stride_kvd,
+                mask=context_mask[None, :] & (d[:, None] < head_dim),
+                other=0,
             )
             # bf16 tensor cores instead of tf32: on Ampere tf32 runs at half
             # the bf16 rate, and this dot loses nothing here -- q and k are
@@ -302,16 +300,19 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
             # not a new one.
             if IS_FP8_MMA:
                 # Hardware E4M3 MMA (SM89+/SM120). The cached bytes ARE the
-                # operands, so this bitcasts instead of decoding: the products
-                # are the same numbers the bf16 path forms (fp8 e4m3 is exact
-                # in both), only the fp32 accumulation order can differ. 2x the
-                # dot rate on parts that have fp8 tensor cores.
+                # operands, so this bitcasts the uint8 loads instead of
+                # decoding: the products are the same numbers the bf16 path
+                # forms (fp8 e4m3 is exact in both), only the fp32
+                # accumulation order can differ. 2x the dot rate on parts that
+                # have fp8 tensor cores.
                 scores += tl.dot(
-                    q.to(tl.float8e4nv, bitcast=True),
-                    k.to(tl.float8e4nv, bitcast=True),
+                    q_bytes.to(tl.float8e4nv, bitcast=True),
+                    k_bytes.to(tl.float8e4nv, bitcast=True),
                     out_dtype=tl.float32,
                 )
             else:
+                q = _e4m3_uint8_to_f32(q_bytes)
+                k = _e4m3_uint8_to_f32(k_bytes)
                 scores += tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16))
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
