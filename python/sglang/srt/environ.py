@@ -1759,6 +1759,9 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Hardware E4M3 MMA in the SM8x/SM120 paged-MQA indexer (SM89+ only; SM86
+    # has no fp8 tensor cores and keeps the bf16 dot). 0 forces bf16 for A/B.
+    SGLANG_DSV4_INDEXER_FP8_MMA = EnvBool(True)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # SM8x bmm+finish decode attention: heads fused per finish-kernel CTA
     # (single pass, KV tile shared). 0 = legacy two-pass per-head kernel.

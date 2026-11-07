@@ -112,10 +112,12 @@ def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LK_NUMA_INTERLEAVE", default="true")
 
 def get_gpu_prefill_min_tokens() -> int:
-    # Dual knob (designs/lk_switch_doctrine.md rule 2): default 0 = tier off,
-    # pure CPU prefill; >0 both enables the tier and sets the batch gate.
+    # Dual knob (designs/lk_switch_doctrine.md rule 2): >0 both enables the GPU
+    # prefill tier and sets its batch gate. Default 1024 (2026-11-07): the tier
+    # is on out of the box -- a recipe no longer has to opt in, and 1024 tokens
+    # is the smallest prompt where the GPU engine wins over the CPU path.
     # Forwarded to lk_moe via cfg; lk_moe itself never reads the env.
-    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 0)
+    return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 1024)
 
 def get_gpu_prefill_engine() -> str:
     # Pure selector switch (lk_switch_doctrine: a selector never flips the

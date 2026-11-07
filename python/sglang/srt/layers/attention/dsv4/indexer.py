@@ -154,7 +154,14 @@ def fp8_paged_mqa_logits_torch(
     return scores
 
 
-@triton.jit
+@triton.jit(
+    # Size-like scalars must not enter the specialization key. Triton otherwise
+    # recompiles for every ``%16`` / ``==1`` bucket of ``num_rows`` and
+    # ``logits_width``, and a chunked 32K prefill hits 8 of them in one request
+    # (measured 2026-11-07: 8 late compiles, ~2 s each, on the first request).
+    do_not_specialize=["token_start", "num_rows", "logits_width", "stride_lm",
+                       "stride_btb"],
+)
 def _fp8_paged_mqa_logits_rowwise_kernel(
     q_ptr,
     kv_ptr,
@@ -191,7 +198,11 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_wh: tl.constexpr,
     stride_clb: tl.constexpr,
     stride_cln: tl.constexpr,
-    stride_btb: tl.constexpr,
+    # Runtime, not constexpr: the page table is sized to the live sequence, so
+    # as a constexpr its width recompiled the kernel once per prefill chunk
+    # (measured 2026-11-07: 8 late compiles, ~2 s each, on the first 32K
+    # request -- %row * 129 vs %row * 125 in the two TTIR dumps).
+    stride_btb,
     stride_btk: tl.constexpr,
     # The logits row stride IS the logits width (the buffer is sized to the
     # live sequence length), so as a constexpr it put that length back into the
@@ -201,6 +212,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    IS_FP8_MMA: tl.constexpr,
 ):
     """Per-row paged-MQA logits kernel (SM80/SM86 Ampere).
 
@@ -281,7 +293,26 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
                     other=0,
                 )
             )
-            scores += tl.dot(q, k, input_precision="tf32")
+            # bf16 tensor cores instead of tf32: on Ampere tf32 runs at half
+            # the bf16 rate, and this dot loses nothing here -- q and k are
+            # FP8 E4M3 values (3 mantissa bits) held to bf16 (8 bits) exactly,
+            # and the per-token scale is applied after the dot. The torch
+            # reference above (`fp8_paged_mqa_logits_torch`) already computes
+            # this product in bf16, so this is the reference's own precision,
+            # not a new one.
+            if IS_FP8_MMA:
+                # Hardware E4M3 MMA (SM89+/SM120). The cached bytes ARE the
+                # operands, so this bitcasts instead of decoding: the products
+                # are the same numbers the bf16 path forms (fp8 e4m3 is exact
+                # in both), only the fp32 accumulation order can differ. 2x the
+                # dot rate on parts that have fp8 tensor cores.
+                scores += tl.dot(
+                    q.to(tl.float8e4nv, bitcast=True),
+                    k.to(tl.float8e4nv, bitcast=True),
+                    out_dtype=tl.float32,
+                )
+            else:
+                scores += tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16))
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
         weight = tl.load(
@@ -358,6 +389,22 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     )
     return kv_values, kv_scale
 
+
+
+def _indexer_fp8_mma() -> bool:
+    """True when this device has E4M3 tensor cores (SM89+/SM120) and tests allow.
+
+    SM86 (RTX 3090) has no fp8 MMA at all, so it must keep the decode+bf16 dot.
+    ``SGLANG_DSV4_INDEXER_FP8_MMA=0`` forces the bf16 path (A/B and rollback).
+    """
+    from sglang.srt.environ import envs as _envs
+
+    if not _envs.SGLANG_DSV4_INDEXER_FP8_MMA.get():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major >= 9 or (major == 8 and minor >= 9)
 
 def fp8_paged_mqa_logits_rowwise_triton(
     q_fp8: torch.Tensor,
@@ -439,9 +486,16 @@ def fp8_paged_mqa_logits_rowwise_triton(
         page_table.stride(1),
         logits.stride(0),
         logits.stride(1),
+        # K-decode reuse is set by the M dimension: with BLOCK_H=16 a program
+        # decodes the same K tile 4x (once per head block) to cover 64 heads.
+        # BLOCK_H=64 decodes it once. Measured on a 3090 at rows=1024/ctx=32K:
+        # H16/N128 52.4 ms, H32/N128 36.4, H64/N128 warps8 44.0, H64/N64 52.7,
+        # H64/N128 warps4 28.3 (1.85x). N stays 128: shrinking it to 32 keeps the
+        # score tile small but multiplies the q traffic 4x, which loses.
         BLOCK_N=block_n,
         BLOCK_D=64,
-        BLOCK_H=8,
+        BLOCK_H=64,
+        IS_FP8_MMA=_indexer_fp8_mma(),
         num_warps=4,
     )
     return logits
