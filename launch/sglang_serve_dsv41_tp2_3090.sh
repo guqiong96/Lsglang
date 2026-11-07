@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# The CLI lives in the project environment: a tool/harness launch has no conda
+# activation, and relying on the caller's PATH fails as
+# "sglang: command not found" before the first token (2026-11-06, official gate).
+export PATH="/home/guqiong/.conda/envs/Lsglang/bin:$PATH"
 LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_dsv41_tp2_3090.log}"
 mkdir -p /tmp/opencode/serve_logs
 echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
@@ -34,6 +39,7 @@ LK_POOL_SLOTS=12 \
 LK_POOL_NO_STAGE=0 \
 LK_POOL_LOG=0 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_LOGPROB_CHUNK_SIZE=256 \
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_SM8X_MARLIN_GROUP32=1 \
@@ -53,7 +59,7 @@ sglang serve --sleep-on-idle \
   --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 294912 \
+  --max-total-tokens 262144 \
   --mem-fraction-static 0.78 \
   --warmups prefill_shapes \
   --cuda-graph-backend-prefill disabled

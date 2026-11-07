@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# The CLI lives in the project environment: a tool/harness launch has no conda
+# activation, and relying on the caller's PATH fails as
+# "sglang: command not found" before the first token (2026-11-06, official gate).
+export PATH="/home/guqiong/.conda/envs/Lsglang/bin:$PATH"
 LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_qwen38_mtp_tp2_5060ti.log}"
 mkdir -p /tmp/opencode/serve_logs
 echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
@@ -32,7 +37,7 @@ LK_NUMA_INTERLEAVE=1 \
 LK_POWER_SAVING=1 \
 LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
-LK_POOL_SLOTS=32 \
+LK_POOL_SLOTS=16 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 sglang serve --sleep-on-idle \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \

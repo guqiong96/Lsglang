@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+# The CLI lives in the project environment: a tool/harness launch has no conda
+# activation, and relying on the caller's PATH fails as
+# "sglang: command not found" before the first token (2026-11-06, official gate).
+export PATH="/home/guqiong/.conda/envs/Lsglang/bin:$PATH"
+LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_0731_dspark_tp2_5060ti.log}"
+mkdir -p /tmp/opencode/serve_logs
+echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
+if [ -t 1 ]; then
+    # interactive terminal: console and log both live (closing the
+    # terminal is a deliberate stop)
+    exec > >(tee -a "$LOG") 2>&1
+else
+    # detached/tool launch: plain file append, no coprocess that a
+    # session teardown could kill (EPIPE would take the engine down)
+    exec >> "$LOG" 2>&1
+fi
+# DeepSeek-V4-Flash-0731 · 2× RTX 5060 Ti (SM120), TP2, DSPARK speculative decode.
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
+GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
+CUDA_VISIBLE_DEVICES=1,2 \
+LK_MOE_HYBRID_ENABLED=1 \
+LK_THREADS=48 \
+OMP_NUM_THREADS=1 \
+LK_THREAD_BINDING=NUMA_NODE \
+LK_GPU_PREFILL_MIN_TOKENS=1024 \
+LK_GPU_PREFILL_ENGINE=cutlass \
+LK_GPU_PREFILL_SUB_M=16384 \
+LK_GPU_PREFILL_D_SLOTS=16384 \
+LK_GPU_PREFILL_WAVE_EXPERTS=128 \
+LK_NUMA_INTERLEAVE=1 \
+LK_POWER_SAVING=1 \
+LK_GPU_RESIDENT_MOE_LAYERS="" \
+LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
+LK_POOL_SLOTS=12 \
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
+SGLANG_SKIP_P2P_CHECK=1 \
+FLASHINFER_USE_CUDA_NORM=1 \
+FLASHINFER_DISABLE_VERSION_CHECK=1 \
+sglang serve --sleep-on-idle \
+  --model ~/Downloads/DeepSeek-V4-Flash-0731 \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --host 0.0.0.0 \
+  --port 8072 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --max-running-requests 2 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --disable-shared-experts-fusion \
+  --disable-custom-all-reduce \
+  --chunked-prefill-size 8192 \
+  --max-total-tokens 262144 \
+  --mem-fraction-static 0.92 \
+  --warmups prefill_shapes \
+  --cuda-graph-backend-prefill disabled \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --speculative-attention-mode decode
