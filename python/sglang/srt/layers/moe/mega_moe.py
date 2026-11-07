@@ -385,6 +385,17 @@ def run_mega_routed_experts(
     if routed_scaling_factor != 1.0:
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
+    # The fp4 mega variants pre-dispatch through DeepGEMM; upstream builds
+    # (nv_dev lineage) do not ship mega_moe_pre_dispatch, so fail here with a
+    # clear message instead of an AttributeError deep in the MoE forward.
+    if mma_type in ("nvfp4xnvfp4", "mxf4xmxf4") and not hasattr(
+        deep_gemm, "mega_moe_pre_dispatch"
+    ):
+        raise RuntimeError(
+            f"mega MoE mma_type={mma_type} needs deep_gemm.mega_moe_pre_dispatch, "
+            f"which deep_gemm {getattr(deep_gemm, '__version__', '?')} does not ship"
+        )
+
     mega_kwargs = {"recipe": (1, 1, 32)}
     if mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with

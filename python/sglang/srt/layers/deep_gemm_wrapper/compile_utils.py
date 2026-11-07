@@ -21,6 +21,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
+    resolve_grouped_fp8_gemm_nt_masked,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
@@ -471,7 +472,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.fp8_m_grouped_gemm_nt_masked(
+        resolve_grouped_fp8_gemm_nt_masked()(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,

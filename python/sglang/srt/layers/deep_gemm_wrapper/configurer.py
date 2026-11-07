@@ -102,6 +102,28 @@ def _supports_paged_sparse_mqa_logits() -> bool:
     return ok
 
 
+def resolve_grouped_fp8_gemm_nt_masked():
+    """The masked grouped FP8 GEMM of the installed DeepGEMM build.
+
+    Upstream DeepGEMM (nv_dev lineage, PR #447+) exports only
+    ``m_grouped_fp8_gemm_nt_masked`` (the unified fp8/fp4 kernel alias);
+    sgl-deep-gemm shipped the legacy ``fp8_m_grouped_gemm_nt_masked``
+    spelling. Resolved at call time so a swapped build takes effect without
+    a re-import; loud failure when neither name exists.
+    """
+    import deep_gemm
+
+    fn = getattr(deep_gemm, "fp8_m_grouped_gemm_nt_masked", None) or getattr(
+        deep_gemm, "m_grouped_fp8_gemm_nt_masked", None
+    )
+    if fn is None:
+        raise RuntimeError(
+            f"deep_gemm {getattr(deep_gemm, '__version__', '?')} exports neither "
+            "fp8_m_grouped_gemm_nt_masked nor m_grouped_fp8_gemm_nt_masked"
+        )
+    return fn
+
+
 def __getattr__(name):
     # PEP 562: compute on EVERY access, never cache into module globals.
     # Caching (even post-init) poisons heterogeneous TP: the import storm can
