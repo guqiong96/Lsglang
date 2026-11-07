@@ -210,7 +210,7 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
-| `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 0 = off | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path; not enabled by default (0 on 16 GB cards) |
+| `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 1024 (on) | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path. On by default; set `0` for pure CPU prefill (16 GB cards) |
 | `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | which GPU prefill path runs above the token gate. `cutlass`: fastest on long prompts, works with every pooled dtype; rounds activations to bf16 — long-context logits can shift and borderline EOS can flip; `triton`: output bit-matches the CPU reference, slightly slower; `flashinfer` (SM120/SM121 + **NVFP4 checkpoints only** — the CuTe kernels are NVFP4-only, an fp8/mxfp4 pool layer fails its init probe and the boot aborts by design): stages the weights as FP4 and runs the FP4 tensor cores — works standalone at W4A16 (CPU-matching) numerics, add `LK_GPU_PREFILL_SM120_W4A4=1` to run activations in FP4 too; forwarded via cfg, the C++ library itself does not read this env |
 | `LK_GPU_PREFILL_SM120_W4A4` | prefill | 0 = off | `0`: prefill activations run as BF16 (W4A16) — numerics equal the CPU path on every GPU; `1`: activations run as FP4 (W4A4) — visibly faster prefill, slightly different numerics. Needs the `flashinfer` engine (the only engine implementing W4A4) *and* an SM120-family card; otherwise a one-time warning is logged and prefill stays W4A16 |
 | `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | tier wave width, ONE geometry for all three engines, frozen at init: `-1`/unset = one wave over all E experts (the gate-tested default), `>0` = W experts per wave - a per-wave gemm loop only the cutlass engine has, so `0 < W < E` on a staging engine (triton/flashinfer) aborts at init; appears as `wave=` in the `[tier]` boot line |
@@ -221,7 +221,7 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
-| `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND expert-cache capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer. It sizes the CACHE only: the domain's total VRAM is `max(cache, prefill working set)` — see [VRAM sizing](#vram-sizing-pool--gpu-prefill). Must be `>= top_k` when non-zero |
+| `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND expert-cache capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer. If it is below what one prefill pass needs it is **auto-extended** at boot (free: those rows sit in the same allocation) and the log prints `auto extended LK_POOL_SLOTS X to Y`; a larger value is never shrunk. It sizes the CACHE only: the domain's total VRAM is `max(cache, prefill working set)` — see [VRAM sizing](#vram-sizing-pool--gpu-prefill). Must be `>= top_k` when non-zero |
 | `LK_POOL_DECODE` | pool | follow pool | decode GPU half: pool-resident experts go to the GPU resident-gemv half. `1` on / `0` off explicitly; unset follows `LK_POOL_SLOTS` > 0 |
 | `LK_POOL_MBOX_SPLIT` | pool | 0 = off | Start the decode GPU half before joining the CPU half instead of in one step. Nothing measured at one or two rows per step (7.43 vs 7.07-7.35 ms/step at one row), so the `launch/` recipes no longer set it |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
@@ -383,9 +383,11 @@ all other layers run on the original sglang GPU path.
 
 ## Integration & development
 
-lk_moe integrates into any inference framework as a drop-in MOE backend — the integration guide
-(layer roles, feature gates, config fields, weight placement) lives in
-**[docs/integration.md](./docs/integration.md)**.
+lk_moe integrates into any inference framework as a drop-in MOE backend. The integration surface
+(layer roles, feature gates, config fields, weight placement) is spread over the model, pool and
+scheduler code paths and moves with them, so this repository no longer ships a single guide for it:
+read the launch recipes under `launch/` for the supported configurations, and `lk_moe`'s README for
+the knobs.
 
 ---
 
