@@ -594,16 +594,63 @@ def drop_checkpoint_page_cache() -> tuple[int, int]:
     return files, nbytes
 
 
+def _mem_available_bytes() -> int:
+    """MemAvailable from /proc/meminfo; 0 when it cannot be read."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _checkpoint_bytes(model_path: str) -> int:
+    total = 0
+    for f in glob.glob(os.path.join(model_path, "*.safetensors")):
+        try:
+            total += os.stat(f).st_size
+        except OSError:
+            pass
+    return total
+
+
 def _drop_page_cache_once(reason: str) -> None:
+    """Free the checkpoint's page cache after the host table is faulted in.
+
+    The table itself is shared memory; the pages read to populate it are pure
+    cache. Dropping them is only worth it when RAM is tight: on a host with
+    room to spare the pages are what makes the NEXT boot fast (measured here:
+    475 GiB of checkpoint cache, 8 min boot without it, and 517 GiB still
+    available). So skip the drop when MemAvailable already covers the
+    checkpoint plus a 16 GiB margin; drop when it does not.
+    """
     global _page_cache_dropped
     if _page_cache_dropped:
         return
     _page_cache_dropped = True
-    files, nbytes = drop_checkpoint_page_cache()
+    try:
+        model_path = get_model().model_path
+    except (ValueError, AttributeError):
+        return
+    nbytes = _checkpoint_bytes(model_path)
+    avail = _mem_available_bytes()
+    if avail and nbytes and avail > nbytes + 16 * 2**30:
+        logger.info(
+            "engram host table: keeping %.0f GiB of checkpoint page cache %s "
+            "(%.0f GiB available, %.0f GiB checkpoint)",
+            nbytes / 2**30,
+            reason,
+            avail / 2**30,
+            nbytes / 2**30,
+        )
+        return
+    files, dropped = drop_checkpoint_page_cache()
     logger.info(
         "engram host table: dropped the page cache of %d checkpoint files (%.0f GiB) %s",
         files,
-        nbytes / 2**30,
+        dropped / 2**30,
         reason,
     )
 
