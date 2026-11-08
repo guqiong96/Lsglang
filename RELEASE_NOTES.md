@@ -1,30 +1,33 @@
 # lsglang 1.7.4 (from 1.7.3)
 
-Needs lk_moe 2.8.4.
+Needs lk_moe 2.8.4 and deep_gemm 2.8.0 with the SM120 kernels (the wheel is
+attached to this release).
 
-## 2x RTX 5060 Ti (SM120)
+## Faster decode on SM120
 
-DeepSeek-V4.1 now serves on the 5060 Ti pair with the card's own paths: the sparse
-indexer, the FP8 decode GEMMs and wo_a all stay on the GPU instead of falling back,
-and a 256K context fits in 16 GB per card. New recipe:
-`launch/sglang_serve_dsv41_tp2_5060ti.sh`.
+DeepSeek-V4.1 decode now runs the card's own FP8 paths end to end — the dense
+GEMMs, the wo_a absorb and the sparse indexer — instead of portable fallbacks.
+The published 32x32 block-scale checkpoints are used as they are, and keeping
+wo_a in FP8 leaves room for a 256K context on 16 GB cards.
 
-New debug variable, default off: `SGLANG_SWA_REPLAY_REBUILD_WINDOW` (see the
-environment-variable reference).
+## Prefix cache works with the default SWA replay
 
-## Long prompts and cache reuse
+Long conversations reuse their prefix again instead of re-prefilling it. Reuse is
+only enabled where the model can restore its state; where it cannot, the previous
+behaviour is kept, so answers stay correct.
 
-- Long prefills no longer run out of memory as the KV pool fills.
-- Prefix reuse stays available with the default decoder SWA replay mode; reuse of a
-  state-less tombstone is limited to models whose state can be restored.
+## 2x RTX 5060 Ti recipe
+
+New: `launch/sglang_serve_dsv41_tp2_5060ti.sh` — DeepSeek-V4.1 on the 5060 Ti pair
+with 256K context.
 
 ## Notes
 
 - Retaining the SWA window behind the replay boundary is back-ported from
-  sgl-project/sglang#46008, which is still open upstream.
-- Perplexity on the frozen corpus reads 5.49 on this build; the 1.7.3 note of 5.19 was
-  measured on an earlier build, so treat it as a build-to-build difference rather than a
-  regression from these changes.
+  sgl-project/sglang#46008, still open upstream.
+- `SGLANG_SWA_REPLAY_REBUILD_WINDOW` is a debug switch, off by default.
+- Perplexity 5.49 here against 5.19 in the 1.7.3 note: those were different builds,
+  not a regression from these changes.
 
 # lsglang 1.7.3 (from 1.7.2)
 
