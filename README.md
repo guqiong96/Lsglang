@@ -66,6 +66,20 @@ sudo apt-get install libnuma-dev      # Ubuntu  /  sudo dnf install numactl-deve
 pip install lsglang                   # or build from source below
 ```
 
+`lsglang` pulls the deep_gemm build with the SM120 kernels (Python 3.12, linux
+x86_64). It can also be installed by hand:
+
+```bash
+pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
+```
+
+If the environment already has `sgl-deep-gemm` from an older release, remove it
+first — both provide the `deep_gemm` module:
+
+```bash
+pip uninstall -y sgl-deep-gemm
+```
+
 From source:
 
 ```bash
@@ -293,7 +307,7 @@ Machine-level notes:
 | Model | GPU | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Decode | Spec. decode | Command |
 |-------|-----|-------------|-------------|--------------|--------------|--------|--------------|---------|
 | DeepSeek-V4.1-Flash-1017 | 3090 x2 | **1499 t/s** (22.0 s) | **1461 t/s** (44.9 s) | **1454 t/s** (90.3 s) | **1109 t/s** (228 s) | 29-36 t/s | 41-52 t/s | [plain](launch/sglang_serve_dsv41_tp2_3090.sh) · [DSPARK](launch/sglang_serve_dsv41_tp2_3090_dspark.sh) |
-| DeepSeek-V4.1-Flash-1017 | 5060Ti x2 | **799 t/s** (41.3 s) | — | — | **798 t/s** (314 s, 250K) | 20-22 t/s | — | [plain](launch/sglang_serve_dsv41_tp2_5060ti.sh) |
+| DeepSeek-V4.1-Flash-1017 | 5060Ti x2 | **799 t/s** (41.3 s) | — | — | **798 t/s** (314 s, 250K) | 28 t/s | — | [plain](launch/sglang_serve_dsv41_tp2_5060ti.sh) |
 | DeepSeek-V4-Flash-0731 | 3090 x2 | **1148 t/s** (28.7 s) | **1103 t/s** (59.4 s) | — | — | — | 42-52 t/s | [DSPARK](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
 | Qwen3.8-Flash-Next | 3090 x2 | **2214 t/s** | **2524 t/s** | — | **2333 t/s** | 59-70 t/s | **96-118 t/s** | [plain](launch/sglang_serve_qwen38_tp2_3090.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) |
 | Qwen3.8-Flash-Next | 5060Ti x2 | **2189 t/s** | **2066 t/s** | — | — | 40-49 t/s | 46-76 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
@@ -302,7 +316,7 @@ Machine-level notes:
 | GLM-5.3-Flash-NVFP4 | 3090 x2 | **892 t/s** | — | — | — | 29-42 t/s | — | [plain](launch/sglang_serve_glm53_tp2_3090.sh) |
 | Qwen3.6-35B-A3B | 3090 x2 | **6026 t/s** | — | — | — | 160-258 t/s | — | [plain](launch/sglang_serve_qwen36_tp2_3090.sh) |
 
-All rows measured on one machine with **lsglang 1.7.3 + lk_moe 2.8.4**: 2x AMD EPYC 7642
+All rows measured on one machine with **lsglang 1.7.3-1.7.4 + lk_moe 2.8.4**: 2x AMD EPYC 7642
 (96 cores / 192 threads, AVX2 only), 16-channel DDR4-3200, 1 TB, CUDA 13.0 / torch 2.14.1 /
 driver 610.57.04. **Prefill** = client wall time of one request at that input length (bracketed
 figure = wall time); **Decode** / **Spec. decode** = steady state throughput of the decode steps as the server

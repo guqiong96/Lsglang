@@ -519,7 +519,10 @@ def handle_model_specific_adjustments(server_args: Any):
                     "transform_sf_into_required_layout), but the installed "
                     "deep_gemm does not provide them.\n"
                     "Install the wheel attached to this release:\n"
-                    "  pip install ./deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl\n"
+                    "  pip install "
+                    "https://github.com/guqiong96/Lsglang/releases/download/"
+                    "lsglang-v1.7.4/"
+                    "deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl\n"
                     "(or set SGLANG_ENABLE_JIT_DEEPGEMM=0 to accept the slow "
                     "portable path)."
                 )

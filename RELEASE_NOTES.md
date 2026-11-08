@@ -1,7 +1,24 @@
 # lsglang 1.7.4 (from 1.7.3)
 
-Needs lk_moe 2.8.4 and deep_gemm 2.8.0 with the SM120 kernels (the wheel is
-attached to this release).
+Needs lk_moe 2.8.4.
+
+```
+pip install lsglang==1.7.4
+```
+
+The deep_gemm build with the SM120 kernels comes with the package (Python 3.12,
+linux x86_64), and can also be installed by hand:
+
+```
+pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
+```
+
+On an environment that still has `sgl-deep-gemm` from an older release, remove it
+first — both provide the `deep_gemm` module:
+
+```
+pip uninstall -y sgl-deep-gemm
+```
 
 ## Faster decode on SM120
 
@@ -14,7 +31,8 @@ wo_a in FP8 leaves room for a 256K context on 16 GB cards.
 
 Long conversations reuse their prefix again instead of re-prefilling it. Reuse is
 only enabled where the model can restore its state; where it cannot, the previous
-behaviour is kept, so answers stay correct.
+behaviour is kept, so answers stay correct. Thanks to @Orange4483 (PR #33) for the
+report and the first fix.
 
 ## 2x RTX 5060 Ti recipe
 
