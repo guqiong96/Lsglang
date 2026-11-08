@@ -44,6 +44,14 @@ def _compute_enable_deep_gemm():
     # probe every API used by the SM120 DSV4 paths since installed builds may
     # expose fp8_einsum but still predate the SM120 kernels.
     if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
+        logger.warning(
+            "deep_gemm on SM120 is missing its SM120 kernels (looked for "
+            "fp8_einsum, m_grouped_fp8_fp4_gemm_nt_contiguous and "
+            "transform_sf_into_required_layout). DeepSeek-V4.1 will run the "
+            "portable kernels instead: correct, but noticeably slower. Install "
+            "the deep_gemm build shipped with this release (2.8.0 with SM120 "
+            "support) to get the fast path."
+        )
         return False
 
     try:

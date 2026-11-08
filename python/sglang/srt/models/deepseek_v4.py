@@ -75,7 +75,10 @@ from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     is_cp_active,
 )
-from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_SCALE_UE8M0,
+    _sm120_deep_gemm_apis_available,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
@@ -284,6 +287,14 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     path, so this only widens SM120.
     """
     if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
+        return False
+    # The SM120 path needs the installed deep_gemm to carry the SM120 kernels;
+    # without them the einsum would fail on the first forward, so stay on bf16.
+    # Call-time probe: this runs after set_device, the import-time value does not.
+    if get_platform().is_sm120 and (
+        not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
+        or not _sm120_deep_gemm_apis_available()
+    ):
         return False
     block = quant_config.weight_block_size
     if block == [128, 128]:

@@ -500,6 +500,29 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_cp(server_args)
 
         if get_platform().is_sm120:
+            # DeepSeek-V4.1's SM120 recipe runs every dense GEMM, the wo_a
+            # absorb and the sparse indexer through deep_gemm. Without a build
+            # that carries the SM120 kernels the engine would silently fall
+            # back to portable kernels (correct but much slower), so fail with
+            # the fix instead of shipping a slow server.
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                _sm120_deep_gemm_apis_available,
+            )
+
+            if (
+                not envs.SGLANG_ENABLE_JIT_DEEPGEMM.is_set()
+                or envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
+            ) and not _sm120_deep_gemm_apis_available():
+                raise RuntimeError(
+                    "DeepSeek-V4.1 on SM120 needs deep_gemm 2.8.0 with the SM120 "
+                    "kernels (fp8_einsum / m_grouped_fp8_fp4_gemm_nt_contiguous / "
+                    "transform_sf_into_required_layout), but the installed "
+                    "deep_gemm does not provide them.\n"
+                    "Install the wheel attached to this release:\n"
+                    "  pip install ./deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl\n"
+                    "(or set SGLANG_ENABLE_JIT_DEEPGEMM=0 to accept the slow "
+                    "portable path)."
+                )
             # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
             # the SM120 kernels, and deep_gemm_wrapper.configurer validates them.
             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
