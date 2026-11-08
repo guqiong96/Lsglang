@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
@@ -211,6 +212,15 @@ def _compile_deep_gemm_one_type_all(
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+        elif (
+            kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+            and get_platform().is_sm120
+        ):
+            # SM120 serves the 1x32x32 recipe for decode-sized batches only
+            # (fp8_utils._deepgemm_block_fp8_supported gates it to M<=8 and lets
+            # larger M stay on triton), so compiling every M up to 16K here
+            # only makes startup minutes longer.
+            m_list = [m for m in m_list if m <= 8]
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(
