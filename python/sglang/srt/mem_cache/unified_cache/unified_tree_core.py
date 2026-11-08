@@ -28,6 +28,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1053,6 +1054,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
+        # Decoder SWA bounded replay keeps no SWA KV for a cached prefix: the
+        # request's SWA eviction cursor sits at the end of the prompt, so the
+        # node is stored as a Full-only tombstone. The component-based length
+        # below only counts nodes where every component has a device value,
+        # which collapses to 0 for such a node even though the Full KV is fully
+        # resident; the scheduler then re-prefills the whole prompt and the next
+        # insert matches the same tombstone again, so a cold first request turns
+        # its conversation into a permanently zero-hit one. Expose the
+        # Full-device prefix instead and let prefill replay the SWA window.
+        if (
+            result.device_prefix_len == 0
+            and result.full_kv_hit_length > 0
+            and get_exec().features.enable_decoder_swa_bounded_replay
+        ):
+            matched_len, node_id, _pinned_len = self.match_full_device_prefix(
+                params.key
+            )
+            aligned_len = matched_len // self.page_size * self.page_size
+            if aligned_len > 0:
+                result = result._replace(
+                    device_prefix_len=aligned_len,
+                    last_device_node=self.node_by_id(node_id),
+                )
+
         # Expose only NodeIds outside TreeCore.
         return result._replace(
             last_device_node=result.last_device_node.id,
