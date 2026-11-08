@@ -133,6 +133,12 @@ def sparse_logits(
     ``build_sparse_indexer_schedule`` of the ``topk_blocks`` published blocks."""
     import deep_gemm
 
+    # The sparse kernel takes bf16 head weights (attention.hpp:451), while the
+    # dense fp4 logits it is paired with are fp32-only off SM100; the indexer
+    # packer produces one fp32 tensor for both. Cast here; [rows, heads] is tiny.
+    if weights.dtype != torch.bfloat16:
+        weights = weights.to(torch.bfloat16)
+
     return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
         (q_fp4, q_sf),
         k_cache,

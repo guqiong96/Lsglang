@@ -192,23 +192,14 @@ class SparseTableBackend:
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        if logits.dtype == torch.bfloat16:
-            topk_transform_paged_bf16(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-            )
-        else:
-            topk_transform_paged_v2(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-                metadata.topk_metadata,
-            )
+        # Follow the dense path's routing (metadata.use_topk_v2): SM120 runs with
+        # topk-v2 disabled, where the v2 call would see a 1-D placeholder plan and
+        # the bf16 DeepSelect flavor exceeds the SM's shared-memory budget.
+        topk_transform_paged_from_metadata(
+            logits,
+            metadata,
+            inputs.out_page_indices,
+        )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
