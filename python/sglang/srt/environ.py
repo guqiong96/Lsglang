@@ -492,6 +492,12 @@ class Envs:
 
     # ===================================================================
     # Debugging and invariant checks
+    # Debug: keep one compression window (>=128 tokens, page-aligned) of a
+    # tombstone-reused prefix out of the reuse so prefill rebuilds the low-ratio
+    # compression state at the boundary. Only the tombstone path reaches it, and
+    # models on that path already restore state from a checkpoint grid, so this
+    # only shortens the reuse by one window. Opt-in for experiments.
+    SGLANG_SWA_REPLAY_REBUILD_WINDOW = EnvBool(False)
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)

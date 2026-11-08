@@ -28,6 +28,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -411,6 +412,12 @@ class _InsertWalkState(msgspec.Struct):
     target_node: Optional[UnifiedTreeNode] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
+
+
+# The widest compression window that a reused prefix has to replay: the online
+# c128 layer keeps one (max, sum, kv) state over a 128-token window, the c4 ring
+# only 8 tokens. Kept here so the reuse boundary arithmetic stays in one place.
+_COMPRESS_REBUILD_TOKENS = 128
 
 
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -1053,6 +1060,69 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value_chunks=value,
                 best_value_len=best_match_device_value_len,
             )
+        # Decoder SWA bounded replay keeps no SWA KV for a cached prefix: the
+        # request's SWA eviction cursor sits at the end of the prompt, so the
+        # node is stored as a Full-only tombstone. The component-based length
+        # above only counts nodes where every component has a device value,
+        # which collapses to 0 for such a node even though the Full KV is fully
+        # resident; the scheduler then re-prefills the whole prompt and the next
+        # insert matches the same tombstone again, so a cold first request turns
+        # its conversation into a permanently zero-hit one. Expose the
+        # Full-device prefix instead and let prefill replay the SWA window.
+        if (
+            result.device_prefix_len == 0
+            and result.full_kv_hit_length > 0
+            and get_exec().features.enable_decoder_swa_bounded_replay
+            # Only restore reuse when a component can actually put its state
+            # back: a Mamba checkpoint grid restored into a per-request slot.
+            # DSV4.1's low-ratio (c4/c128) KV rows and indexer keys live in
+            # per-request state slots too, but nothing restores them, so reusing
+            # the Full-only tombstone feeds those layers nothing (measured:
+            # cached=6400 -> repetition). Keep upstream's no-reuse behaviour
+            # there instead of returning wrong answers.
+            and any(
+                c.reuse_alignment() > self.page_size
+                for c in self.components
+                if hasattr(c, "reuse_alignment")
+            )
+        ):
+            matched_len, node_id, pinned_len = self.match_full_device_prefix(
+                params.key
+            )
+            aligned_len = matched_len // self.page_size * self.page_size
+            if aligned_len > 0:
+                # The compression state (c4 ring / online c128 (max,sum,kv)) is
+                # allocated per request slot (deepseek_v4_memory_pool.
+                # num_req_slots), NOT stored in the KV tree, so a request reusing
+                # a Full-only tombstone would start from an empty state and
+                # compress its new rows from nothing. Leave at least one
+                # compression window out of the reuse (page-aligned down) so
+                # prefill rebuilds that state before the boundary. Note: long
+                # prefix reuse on realistic text goes through the normal
+                # component match (SWA retention, see free_swa_out_of_window_slots)
+                # and never reaches this branch.
+                if envs.SGLANG_SWA_REPLAY_REBUILD_WINDOW.get():
+                    rebuild = max(self.page_size, _COMPRESS_REBUILD_TOKENS)
+                    aligned_len = max(0, aligned_len - rebuild)
+                # The boundary has to land on the grid every stateful component
+                # can restore from (Mamba's checkpoint grid, a compression
+                # window, or just the page when everything is stateless). One
+                # clamp here; new stateful components only implement
+                # reuse_alignment().
+                align = max(
+                    [self.page_size]
+                    + [
+                        c.reuse_alignment()
+                        for c in self.components
+                        if hasattr(c, "reuse_alignment")
+                    ]
+                )
+                aligned_len = aligned_len // align * align
+            if aligned_len > 0:
+                result = result._replace(
+                    device_prefix_len=aligned_len,
+                    last_device_node=self.node_by_id(node_id),
+                )
         # Expose only NodeIds outside TreeCore.
         return result._replace(
             last_device_node=result.last_device_node.id,

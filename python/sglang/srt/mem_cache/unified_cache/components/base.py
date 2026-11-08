@@ -173,6 +173,7 @@ def next_component_uuid(component_type: ComponentType) -> int:
 class TreeComponent(ABC):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
+        self.params = params
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
@@ -182,6 +183,17 @@ class TreeComponent(ABC):
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
+
+    def reuse_alignment(self) -> int:
+        """Grid a reused prefix length must land on for this component's state.
+
+        A stateless component only needs the tree page. A stateful one overrides
+        this with the granularity its state can actually be restored from: the
+        Mamba checkpoint grid, or a compression window. The tree core takes the
+        max over every component, so a new stateful component only has to
+        implement this method and never touch the match code.
+        """
+        return self.params.page_size
 
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)

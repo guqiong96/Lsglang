@@ -84,6 +84,11 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
+    def reuse_alignment(self) -> int:
+        # A recurrent state can only be restored at a checkpoint the prefill
+        # actually wrote, so a reused prefix has to end on this grid.
+        return self.mamba_checkpoint_grid
+
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]
         return data.value is not None and data.host_value is None
