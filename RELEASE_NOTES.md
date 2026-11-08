@@ -1,3 +1,31 @@
+# lsglang 1.7.4 (from 1.7.3)
+
+Needs lk_moe 2.8.4.
+
+## 2x RTX 5060 Ti (SM120)
+
+DeepSeek-V4.1 now serves on the 5060 Ti pair with the card's own paths: the sparse
+indexer, the FP8 decode GEMMs and wo_a all stay on the GPU instead of falling back,
+and a 256K context fits in 16 GB per card. New recipe:
+`launch/sglang_serve_dsv41_tp2_5060ti.sh`.
+
+New debug variable, default off: `SGLANG_SWA_REPLAY_REBUILD_WINDOW` (see the
+environment-variable reference).
+
+## Long prompts and cache reuse
+
+- Long prefills no longer run out of memory as the KV pool fills.
+- Prefix reuse stays available with the default decoder SWA replay mode; reuse of a
+  state-less tombstone is limited to models whose state can be restored.
+
+## Notes
+
+- Retaining the SWA window behind the replay boundary is back-ported from
+  sgl-project/sglang#46008, which is still open upstream.
+- Perplexity on the frozen corpus reads 5.49 on this build; the 1.7.3 note of 5.19 was
+  measured on an earlier build, so treat it as a build-to-build difference rather than a
+  regression from these changes.
+
 # lsglang 1.7.3 (from 1.7.2)
 
 Needs lk_moe 2.8.3.

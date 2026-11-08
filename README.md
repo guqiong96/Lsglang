@@ -204,6 +204,7 @@ Knobs in this section change what the engine *prints* or are only meaningful whe
 | `LK_VERIFY_PUMP` | debug | 0 | `1` also feeds the draft rows' ids to the admission ledger. Only sensible when the cache can hold a whole verify batch; on a small cache it evicts what it just brought in |
 | `LK_POOL_DET_SPLIT` | debug | 0 | deterministic split: publish the claimed batch and make the GPU half wait on that batch's copy fence before reading slots |
 | `LK_POOL_SPLIT_PROBE` | debug | 0 | log the frozen split (claim/ready/snapshot counts) per pool layer for batches of <=32 routed ids; skipped inside capture |
+| `SGLANG_SWA_REPLAY_REBUILD_WINDOW` | debug | false | leave one extra window out of a reused prefix when the decoder SWA replay path falls back to a Full-only cache entry; costs a little reuse length, so it is only for diagnosing that path |
 
 ### VRAM sizing (pool + GPU prefill)
 
@@ -292,6 +293,7 @@ Machine-level notes:
 | Model | GPU | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Decode | Spec. decode | Command |
 |-------|-----|-------------|-------------|--------------|--------------|--------|--------------|---------|
 | DeepSeek-V4.1-Flash-1017 | 3090 x2 | **1499 t/s** (22.0 s) | **1461 t/s** (44.9 s) | **1454 t/s** (90.3 s) | **1109 t/s** (228 s) | 29-36 t/s | 41-52 t/s | [plain](launch/sglang_serve_dsv41_tp2_3090.sh) · [DSPARK](launch/sglang_serve_dsv41_tp2_3090_dspark.sh) |
+| DeepSeek-V4.1-Flash-1017 | 5060Ti x2 | **799 t/s** (41.3 s) | — | — | **798 t/s** (314 s, 250K) | 20-22 t/s | — | [plain](launch/sglang_serve_dsv41_tp2_5060ti.sh) |
 | DeepSeek-V4-Flash-0731 | 3090 x2 | **1148 t/s** (28.7 s) | **1103 t/s** (59.4 s) | — | — | — | 42-52 t/s | [DSPARK](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
 | Qwen3.8-Flash-Next | 3090 x2 | **2214 t/s** | **2524 t/s** | — | **2333 t/s** | 59-70 t/s | **96-118 t/s** | [plain](launch/sglang_serve_qwen38_tp2_3090.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) |
 | Qwen3.8-Flash-Next | 5060Ti x2 | **2189 t/s** | **2066 t/s** | — | — | 40-49 t/s | 46-76 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
@@ -322,7 +324,7 @@ Legend: ✅ tested · `ok` supported, not yet tested · blank = to be filled.
 |-------|:----:|:----:|:----:|:----:|:-----:|:------:|--------|------|
 | [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen38_tp2_3090.sh)  | [PLE ON NVME](launch/sglang_serve_qwen38_mtp_tp4_nvme.sh) |
 | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) · | [ENGRAM ON NVME](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
-| [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_dsv41_tp2_3090.sh) | [ENGRAM ON NVME](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
+| [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | ok | ✅ | ok | ok | ok | ✅ | [3090](launch/sglang_serve_dsv41_tp2_3090.sh) · [5060Ti](launch/sglang_serve_dsv41_tp2_5060ti.sh) | [ENGRAM ON NVME](launch/sglang_serve_dsv41_tp2_3090_nvme.sh) |
 | [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_0731_tp2_3090.sh) | — |
 | [GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_glm53_tp2_3090.sh) | — |
 | [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | ok | ✅ | ok | ok | ok | ✅ | [launch](launch/sglang_serve_qwen36_tp2_3090.sh) | — |
