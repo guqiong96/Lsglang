@@ -30,13 +30,24 @@ using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10f;
-constexpr uint32_t GROUP_SIZE = 128;
-constexpr uint32_t THREADS_PER_GROUP = 8;
 constexpr uint32_t SUBWARPS_PER_BLOCK = 16;
 constexpr uint32_t INPUT_VEC_NUM_BYTES = 32;
 constexpr uint32_t INPUT_INT4_SIZE = INPUT_VEC_NUM_BYTES / sizeof(int4);
 constexpr int UE8M0_SCALES_PER_PACK = 4;
 static_assert(UE8M0_SCALES_PER_PACK == sizeof(int32_t));
+
+// GROUP_SIZE is a template parameter: 128 for the 128x128 wo_a checkpoints, 32
+// for the SM120 32x32 ones (fp8_einsum's 1x32 recipe). THREADS_PER_GROUP follows
+// from the 32-byte vector load, i.e. group_size / vec_size lanes per group.
+template <typename T, int kGroupSize>
+struct WoAQuantTraits {
+  static constexpr uint32_t kInputVecSize = INPUT_VEC_NUM_BYTES / sizeof(T);
+  static constexpr uint32_t kThreadsPerGroup = kGroupSize / kInputVecSize;
+  static_assert(kGroupSize % kInputVecSize == 0, "group size must be a multiple of the vector width");
+  static_assert(
+      kThreadsPerGroup >= 1 && kThreadsPerGroup <= 16 && (kThreadsPerGroup & (kThreadsPerGroup - 1)) == 0,
+      "threads per group must be 1, 2, 4, 8 or 16");
+};
 
 template <int THREADS_PER_SUBWARP>
 SGL_DEVICE float GroupReduceMax(float val) {
@@ -50,7 +61,7 @@ SGL_DEVICE float GroupReduceMax(float val) {
   return device::warp::reduce_max<THREADS_PER_SUBWARP>(val, mask);
 }
 
-template <typename T, bool kUsePDL>
+template <typename T, bool kUsePDL, int kGroupSize>
 __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
     const T* __restrict__ input,
     fp8_e4m3_t* __restrict__ output_q,
@@ -62,6 +73,9 @@ __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
     int64_t aligned_num_tokens,
     int64_t input_stride_t) {
   device::PDLWaitPrimary<kUsePDL>();
+
+  constexpr uint32_t GROUP_SIZE = kGroupSize;
+  constexpr uint32_t THREADS_PER_GROUP = WoAQuantTraits<T, kGroupSize>::kThreadsPerGroup;
 
   const int64_t subwarp_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
@@ -134,10 +148,13 @@ __global__ void fp8_wo_a_group_major_quant_ue8m0_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, bool kUsePDL>
+template <typename T, bool kUsePDL, int kGroupSize>
 struct FP8WoAGroupMajorQuantUE8M0Kernel {
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
+
+    constexpr uint32_t GROUP_SIZE = kGroupSize;
+    constexpr uint32_t THREADS_PER_GROUP = WoAQuantTraits<T, kGroupSize>::kThreadsPerGroup;
 
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
@@ -159,7 +176,7 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
     const auto input_stride_t = input.stride(0);
     constexpr int64_t kInputAlignElements = sizeof(int4) / sizeof(T);
 
-    RuntimeCheck(hidden_dim % GROUP_SIZE == 0, "hidden_dim must be divisible by 128");
+    RuntimeCheck(hidden_dim % GROUP_SIZE == 0, "hidden_dim must be divisible by the group size");
     const auto hidden_dim_groups = hidden_dim / GROUP_SIZE;
     RuntimeCheck(
         packed_hidden_dim_groups == (hidden_dim_groups + UE8M0_SCALES_PER_PACK - 1) / UE8M0_SCALES_PER_PACK,
@@ -188,7 +205,7 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
     const auto block = dim3(SUBWARPS_PER_BLOCK * THREADS_PER_GROUP);
     host::LaunchKernel(grid, block, device.unwrap())
         .enable_pdl(kUsePDL)(
-            fp8_wo_a_group_major_quant_ue8m0_kernel<T, kUsePDL>,
+            fp8_wo_a_group_major_quant_ue8m0_kernel<T, kUsePDL, kGroupSize>,
             static_cast<const T*>(input.data_ptr()),
             static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
             static_cast<int32_t*>(output_s.data_ptr()),

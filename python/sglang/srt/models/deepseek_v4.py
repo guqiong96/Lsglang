@@ -273,13 +273,22 @@ _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
-    """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
-    return (
-        _FP8_WO_A_GEMM
-        and isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size == [128, 128]
-    )
+    """Whether wo_a keeps its fp8 weights and absorbs through fp8_einsum.
+
+    ``fp8_einsum`` takes 1x128 (UE8M0, Blackwell incl. SM120), 128x128 (fp32,
+    SM90) and 1x32 (MXFP8) scale recipes - never a 32x32 block. A 32x32
+    checkpoint can therefore only go through the 1x32 recipe, by expanding its
+    32-row scale to per-row (the same exponent repeated, so the values the
+    weights were quantized with are preserved) in _setup_fp8_wo_a_scales. SM120
+    kernels accept that form; SM90 keeps 128x128 and SM8x keeps the bf16 dequant
+    path, so this only widens SM120.
+    """
+    if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
+        return False
+    block = quant_config.weight_block_size
+    if block == [128, 128]:
+        return True
+    return get_platform().is_sm120 and block == [32, 32]
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -830,6 +839,9 @@ def prewarm_block_fp8_linear_kernels(root: torch.nn.Module) -> None:
             or weight.device.type != "cuda"
             or scale is None
             or getattr(qm, "block_quant", False) is not True
+            # wo_a keeps a 3-D (group, row, packed-K) einsum scale instead of a
+            # 2-D block scale once the SM120 fp8 path rebuilds it.
+            or scale.dim() != 2
         ):
             # Marlin is an AOT torch op with no Triton cubin to cold-load, and
             # its apply reads layer.weight_scale, which is only built in
@@ -1686,6 +1698,13 @@ class MQALayer(MqaAttentionBase):
                 )
                 self.wq_b.weight_scale_inv.data = sf.contiguous()
                 method.weight_block_size = [16, block_k]
+        if self.wo_a_fp8:
+            # wo_a is fp8 for the einsum absorb (32x32 checkpoints are rebuilt
+            # into the 1x32 form in _setup_fp8_wo_a_scales). quantize_wo_a below
+            # expects bf16 weights, and its interleaved column order is not what
+            # _setup produced, so keep mega attention off for this layer.
+            self.use_mega_attention = False
+            return
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
@@ -3146,7 +3165,23 @@ class MQALayer(MqaAttentionBase):
             elif self.wo_a_fp8:
                 T, G, D = o.shape
                 R = self.o_lora_rank
-                if _FP8_WO_A_UE8M0:
+                weight_scale = self.wo_a.weight_scale_inv.data
+                # Scale width tells the block the weight was published with. A
+                # ue8m0 scale is int32 with four exponents per word, so its last
+                # dim covers 4x the groups; the fp32 form (sm90) is one per group.
+                scale_groups = weight_scale.shape[-1] * (
+                    4 if weight_scale.dtype == torch.int32 else 1
+                )
+                wo_a_block_k = D // scale_groups
+                if _FP8_WO_A_UE8M0 and wo_a_block_k == 32:
+                    # Same 1x32 recipe the mega path uses: per-row x 32-wide K.
+                    # The dedicated JIT kernel emits the [G][pack][T_aligned]
+                    # activation-scale layout the einsum asserts on.
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(
+                        o, group_size=32
+                    )
+                    recipe = (1, 1, 32)
+                elif _FP8_WO_A_UE8M0:
                     # Blackwell (including SM120): UE8M0 scales via the dedicated
                     # JIT kernel.
                     o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
@@ -3165,7 +3200,7 @@ class MQALayer(MqaAttentionBase):
                     o_fp8,
                     o_s,
                     self.wo_a.weight.view(G, R, D),
-                    self.wo_a.weight_scale_inv.data,
+                    weight_scale,
                     recipe=recipe,
                 )
             else:
@@ -5161,6 +5196,45 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         return output
 
+    def _warmup_wo_a_einsum(self, is_nextn: bool) -> None:
+        """Compile the wo_a fp8_einsum kernel (and, for a 32x32 checkpoint, the
+        group-32 activation quant) before serving.
+
+        DeepGEMM's warmup only enumerates GEMM kernel types, so fp8_einsum is
+        not covered: without this the first decode token JITs inside the
+        captured graph.
+        """
+        import deep_gemm
+
+        attn = (
+            self.model.decoder.self_attn
+            if is_nextn
+            else self.model.layers[self.model.start_layer].self_attn
+        )
+        G = attn.n_local_groups
+        R = attn.o_lora_rank
+        D = attn.wo_a.weight.shape[1]
+        weight = attn.wo_a.weight.view(G, R, D)
+        weight_scale = attn.wo_a.weight_scale_inv.data
+        scale_groups = weight_scale.shape[-1] * (
+            4 if weight_scale.dtype == torch.int32 else 1
+        )
+        group_size = D // scale_groups
+        recipe = (1, 1, group_size)
+        dev = weight.device
+        for rows in (1, 2):
+            o = torch.zeros(rows, G, D, device=dev, dtype=torch.bfloat16)
+            from sglang.kernels.ops.attention.dsv4.fp8_wo_a import (
+                sglang_per_token_group_quant_fp8_dsv4_wo_a as _quant,
+            )
+
+            o_q, o_s = _quant(o, group_size=group_size)
+            out = torch.empty(rows, G, R, device=dev, dtype=torch.bfloat16)
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd", (o_q, o_s), (weight, weight_scale), out, recipe=recipe
+            )
+        torch.cuda.synchronize()
+
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         if _FP8_WO_A_UE8M0:
             from deep_gemm import transform_sf_into_required_layout
@@ -5200,6 +5274,24 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = True
                 continue
 
+            if attn.wo_a.weight_scale_inv.data.shape[-1] != D // 128:
+                # 32x32 block (SM120 gate): fp8_einsum has no 32-row recipe, so
+                # rebuild the (weight, scale) pair in the 1x32 per-row form the
+                # mega path uses. The weight stays fp8 (half the bf16 copy).
+                from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+                    quantize_wo_a,
+                )
+
+                w_bf16 = _dequant_fp8(
+                    attn.wo_a.weight.data, attn.wo_a.weight_scale_inv.data
+                ).view(G, R, D)
+                wq, wsf = quantize_wo_a(w_bf16)
+                attn.wo_a.weight.data = wq.view(G * R, D)
+                attn.wo_a.weight_scale_inv.data = wsf
+                attn.wo_a.weight_scale_inv.format_ue8m0 = True
+                del w_bf16, wq
+                continue
+
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             if _FP8_WO_A_UE8M0:
                 attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
@@ -5218,6 +5310,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+            self._warmup_wo_a_einsum(is_nextn)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
