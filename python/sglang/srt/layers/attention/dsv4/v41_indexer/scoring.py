@@ -30,9 +30,28 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+
+
+def _score_budget_bytes() -> int:
+    """Per-tile budget for the DeepGEMM indexer logits, capped by free memory.
+
+    Same rule the torch scorer already follows (mqa_logits_budget_bytes): the
+    logits tile is the largest transient of a prefill, so a fixed 2 GiB budget
+    - sized for 24-80 GB cards - is exactly the allocation that OOMs on a 16 GB
+    card once the pool is nearly full. Measured on a 5060 Ti at 81% token
+    usage: 420 MiB requested against 411 MiB free, killing the 250K prefill.
+    """
+    from sglang.srt.layers.attention.mqa_logits_utils import (
+        mqa_logits_budget_bytes,
+    )
+
+    return min(
+        _DEEP_GEMM_SCORE_BUDGET_BYTES,
+        mqa_logits_budget_bytes(
+            device_index=torch.cuda.current_device(), allow_sync=True
+        ),
+    )
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -215,7 +234,7 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=_score_budget_bytes(),
     )
 
 
