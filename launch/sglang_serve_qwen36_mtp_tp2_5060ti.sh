@@ -31,7 +31,7 @@ LK_NUMA_INTERLEAVE=1 \
 LK_GPU_PREFILL_MIN_TOKENS=1024 \
 LK_GPU_PREFILL_ENGINE=flashinfer \
 LK_GPU_PREFILL_SM120_W4A4=1 \
-LK_GPU_PREFILL_SUB_M=65536 \
+LK_GPU_PREFILL_SUB_M=32768 \
 LK_GPU_PREFILL_D_SLOTS=16384 \
 LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 \
 LK_POOL_SLOTS=128 \
@@ -43,7 +43,7 @@ sglang serve --sleep-on-idle \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --max-running-requests 2 \
-    --chunked-prefill-size 8192 \
+    --chunked-prefill-size 4096 \
     --max-total-tokens 262144 \
     --mem-fraction-static 0.90 \
     --tool-call-parser auto \

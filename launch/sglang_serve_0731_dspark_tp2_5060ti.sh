@@ -53,7 +53,7 @@ sglang serve --sleep-on-idle \
   --tool-call-parser auto \
   --disable-shared-experts-fusion \
   --disable-custom-all-reduce \
-  --chunked-prefill-size 8192 \
+  --chunked-prefill-size 1024 \
   --max-total-tokens 262144 \
   --mem-fraction-static 0.92 \
   --warmups prefill_shapes \
