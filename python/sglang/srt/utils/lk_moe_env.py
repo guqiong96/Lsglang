@@ -243,7 +243,11 @@ def resolve_gpu_prefill_quant(requested: str, engine: str, weight_format: str,
             f"(legal: {legal})")
     if engine_quant_supported(engine, requested, fmt, is_sm120):
         return requested
-    fallback = next((m for m in legal if usable(m)), _PREFILL_QUANT_FALLBACK[fmt])
+    # An explicit request that the engine lacks degrades to the SAFE mode for
+    # that weight format (w4a16), never sideways into another 4-bit experiment:
+    # the operator asked for 8-bit activations, silently handing back 4-bit
+    # would be a worse surprise than keeping the known-good path.
+    fallback = _PREFILL_QUANT_FALLBACK[fmt]
     key = (requested, engine, fmt, fallback)
     if key not in _PREFILL_QUANT_WARNED:
         _PREFILL_QUANT_WARNED.add(key)

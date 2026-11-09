@@ -219,9 +219,9 @@ flashinfer's CuTe kernels are SM12x-only. Source of truth:
 `yes` = implemented on that engine and device, `-` = not implemented.
 
 - **A missing pair is not an error.** An explicit request for a mode the engine
-  does not implement warns once and falls back to the best mode that engine has
-  for those weights. Only an invalid value (or a mode that cannot exist for the
-  weight format) raises.
+  does not implement warns once and falls back to **the safe mode for those
+  weights (`w4a16`)** -- never sideways into another 4-bit experiment. Only an
+  invalid value (or a mode that cannot exist for the weight format) raises.
 - **`auto` still resolves to `w4a16`.** W4A4 is opt-in via the explicit value;
   graduating it is a one-line policy change, not another env var.
 - **`w4a4` needs NVFP4 weights.** MXFP4 checkpoints (the DeepSeek-V4.1 / 0731
