@@ -1945,6 +1945,61 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
+    def test_bounded_replay_tombstone_exposes_full_prefix_with_rebuild_window(self):
+        """Decoder SWA bounded replay stores a cached prefix as a Full-only
+        tombstone. The match must reuse the Full prefix but leave one
+        compression window out so prefill rebuilds the per-request compressor
+        state (DSV4 c4 ring / online c128). A guard keyed on
+        reuse_alignment() > page_size made this path unreachable for DSV4.1,
+        the only model that sets the feature."""
+        if not self.cfg.has_swa:
+            self.skipTest("needs an SWA component")
+        page = self.cfg.page_size
+        rebuild = max(page, 128)
+        rebuild = ((rebuild + page - 1) // page) * page
+        pages = max(3, (2 * rebuild + page - 1) // page)
+        seq = self._make_seq(1, pages)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        cache.evict(
+            EvictParams(num_tokens=0, swa_num_tokens=cache.swa_evictable_size() * 2)
+        )
+        key = RadixKey(array("q", seq))
+        masked = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(
+            masked.device_prefix_len, 0, "tombstone masks the joint match"
+        )
+        self.assertGreaterEqual(
+            masked.full_kv_hit_length,
+            len(seq) - max(page, self.cfg.sliding_window_size),
+            "FULL KV is resident up to the SWA tail replay window",
+        )
+        aligned = masked.full_kv_hit_length // page * page
+        self.assertGreaterEqual(aligned, rebuild, "prefix too short for the probe")
+
+        exec_stub = SimpleNamespace(
+            features=SimpleNamespace(enable_decoder_swa_bounded_replay=True)
+        )
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_cache.unified_tree_core.get_exec",
+            return_value=exec_stub,
+        ):
+            with envs.SGLANG_SWA_REPLAY_REBUILD_WINDOW.override(True):
+                hit = cache.match_prefix(MatchPrefixParams(key=key))
+            with envs.SGLANG_SWA_REPLAY_REBUILD_WINDOW.override(False):
+                control = cache.match_prefix(MatchPrefixParams(key=key))
+
+        self.assertEqual(
+            hit.device_prefix_len,
+            aligned - rebuild,
+            "reuse must leave one compression window for the state rebuild",
+        )
+        self.assertEqual(
+            control.device_prefix_len,
+            aligned,
+            "control arm (rebuild window off) reuses the whole Full prefix",
+        )
+
     def test_cache_salt_and_extra_key_form_independent_namespaces(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)

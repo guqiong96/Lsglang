@@ -1027,8 +1027,8 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SWA_REPLAY_REBUILD_WINDOW</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the decoder-SWA-bounded-replay tombstone match path only: keep one compression window (&ge;128 tokens, page-aligned) of the reused prefix out of the reuse so prefill rebuilds the low-ratio compression state at the boundary. Costs one window of reuse length; enable only when diagnosing that state.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the decoder-SWA-bounded-replay tombstone match path only: keep one compression window (&ge;128 tokens, page-aligned) of the reused prefix out of the reuse so prefill rebuilds the low-ratio compression state at the boundary. Costs one window of reuse length. Default on: the models on that path keep their compressor state per request slot, so a reuse without the rebuild feeds empty state into the low-ratio layers. Set to 0 only to reproduce the broken control arm.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_RETRACT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable retract decode testing</td>

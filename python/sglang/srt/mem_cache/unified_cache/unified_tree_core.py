@@ -1069,22 +1069,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # insert matches the same tombstone again, so a cold first request turns
         # its conversation into a permanently zero-hit one. Expose the
         # Full-device prefix instead and let prefill replay the SWA window.
+        #
+        # The feature flag above is declared only by the DeepSeek-V4.1 hook, so
+        # the per-request state on this branch is always the V4.1 low-ratio
+        # compressor (c4 ring + online c128), never a Mamba checkpoint grid.
+        # That state is rebuilt below by leaving one compression window out of
+        # the reuse; no component has to be able to restore it from the tree.
+        # (A previous `any(c.reuse_alignment() > page_size)` guard could never be
+        # true here -- only Mamba overrides reuse_alignment() and no Mamba model
+        # enables this feature -- so it silently disabled the whole path.)
         if (
             result.device_prefix_len == 0
             and result.full_kv_hit_length > 0
             and get_exec().features.enable_decoder_swa_bounded_replay
-            # Only restore reuse when a component can actually put its state
-            # back: a Mamba checkpoint grid restored into a per-request slot.
-            # DSV4.1's low-ratio (c4/c128) KV rows and indexer keys live in
-            # per-request state slots too, but nothing restores them, so reusing
-            # the Full-only tombstone feeds those layers nothing (measured:
-            # cached=6400 -> repetition). Keep upstream's no-reuse behaviour
-            # there instead of returning wrong answers.
-            and any(
-                c.reuse_alignment() > self.page_size
-                for c in self.components
-                if hasattr(c, "reuse_alignment")
-            )
         ):
             matched_len, node_id, pinned_len = self.match_full_device_prefix(
                 params.key
@@ -1097,10 +1094,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # a Full-only tombstone would start from an empty state and
                 # compress its new rows from nothing. Leave at least one
                 # compression window out of the reuse (page-aligned down) so
-                # prefill rebuilds that state before the boundary. Note: long
-                # prefix reuse on realistic text goes through the normal
-                # component match (SWA retention, see free_swa_out_of_window_slots)
-                # and never reaches this branch.
+                # prefill rebuilds that state before the boundary.
+                # On by default: dropping it feeds the low-ratio layers an empty
+                # compressor (measured on DSV4.1: cached=6400 with repetition).
+                # `SGLANG_SWA_REPLAY_REBUILD_WINDOW=0` is the control arm only.
                 if envs.SGLANG_SWA_REPLAY_REBUILD_WINDOW.get():
                     rebuild = max(self.page_size, _COMPRESS_REBUILD_TOKENS)
                     aligned_len = max(0, aligned_len - rebuild)
