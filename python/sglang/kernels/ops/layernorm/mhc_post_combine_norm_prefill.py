@@ -30,8 +30,23 @@ def _mhc_post_combine_norm_prefill(
     _module().run(x, residual, post, comb, pre, weight, updated, normalized, eps)
 
 
-def mhc_post_combine_norm_prefill(x, residual, post, comb, pre, weight, eps):
-    updated, normalized = torch.empty_like(residual), torch.empty_like(x)
+def mhc_post_combine_norm_prefill(
+    x, residual, post, comb, pre, weight, eps, *, residual_out=None
+):
+    """Fused prefill post/combine/RMSNorm.
+
+    ``residual_out`` may be ``residual`` itself: the kernel reads each tile
+    before writing the same tile from the same thread, and the norm reads the
+    combined row back from shared memory rather than from the output, so the
+    input is dead once its tile is read. Passing the caller's residual in makes
+    the [tokens, 4, 5120] bf16 output free -- at the 8192-row super-chunk that
+    is 320 MiB per forward, and on a 16 GB card it is what a long prefill after
+    a logprob-heavy batch died asking for (2026-11-11, DeepSeek-V4.1 on
+    2x5060 Ti, 147 MiB free). Same aliasing the sibling post/pre boundary
+    already relies on (ee67618bad).
+    """
+    updated = torch.empty_like(residual) if residual_out is None else residual_out
+    normalized = torch.empty_like(x)
     _mhc_post_combine_norm_prefill(
         x, residual, post, comb, pre, weight, updated, normalized, eps
     )

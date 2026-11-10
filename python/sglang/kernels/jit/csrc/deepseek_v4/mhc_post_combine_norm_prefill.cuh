@@ -170,10 +170,11 @@ struct MhcPostCombineNormPrefill {
       CHECK_HOST(reinterpret_cast<uintptr_t>(ptr) % 16 == 0) << "BF16 pointers must be 16-byte aligned";
     }
     CHECK_HOST(
-        residual_out.data_ptr() != residual.data_ptr() && residual_out.data_ptr() != x.data_ptr() &&
+        residual_out.data_ptr() != x.data_ptr() &&
         output.data_ptr() != residual.data_ptr() && output.data_ptr() != x.data_ptr() &&
         output.data_ptr() != residual_out.data_ptr())
-        << "outputs must not alias inputs or each other";
+        << "only residual_out may alias residual: each tile is read before the same "
+           "tile is written, so residual_out == residual is the intended in-place form";
     const MhcPostCombineNormPrefillParams params{
         static_cast<const bf16_t*>(x.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),

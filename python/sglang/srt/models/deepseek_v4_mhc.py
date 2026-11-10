@@ -733,6 +733,10 @@ def _post_fusion(
             pre,
             next.norm.weight,
             next.norm.variance_epsilon,
+            # The combine is residual's last reader (HcState.release only drops
+            # references), so let the kernel overwrite it instead of paying a
+            # second [tokens, 4, 5120] copy at every boundary.
+            residual_out=residual,
         )
         return HcState(updated, pre, HcNormed(normalized))
     return HcState(post(cfg, y, residual, post_mix, comb), pre)
