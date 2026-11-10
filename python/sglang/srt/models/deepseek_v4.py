@@ -69,6 +69,11 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
@@ -306,7 +311,7 @@ _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
 
-def _super_chunk_hc_bounds(forward_batch, rows: int):
+def _super_chunk_hc_bounds(forward_batch, rows: int, name: str = "hc"):
     """Token-axis [(lo, hi)] slices for row-local hc math while this forward
     runs inside the super-chunk inner loop, or None for today's monolithic
     pass. Looping keeps every hc intermediate at chunk-shape (never CAP-shape);
@@ -316,6 +321,9 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
     below what the plan was built from, or DP-padded rows) falls back to the
     monolithic pass — slicing by a stale plan is never sound. Capture forwards
     never carry a plan (wrapper gate), checked here only as a cheap belt.
+
+    ``name`` only picks the diagnostic off-switch (LK_SC_NO_<NAME>); the plan
+    itself is the wrapper's single token plan, shared by every caller.
     """
     if forward_batch is None or get_is_capture_mode():
         return None
@@ -328,20 +336,67 @@ def _super_chunk_hc_bounds(forward_batch, rows: int):
         # Decoder SWA bounded replay late layers: rows are the tail gather,
         # not the plan's full extend (expected, not a fallback).
         return None
-    plan = super_chunk_token_plan(forward_batch, "hc")
+    plan = super_chunk_token_plan(forward_batch, name)
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
         if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
             _super_chunk_hc_bounds._dbg = True
             logger.info(
-                "[sc-dbg] hc FALLBACK plan=%s rows=%d",
+                "[sc-dbg] %s FALLBACK plan=%s rows=%d",
+                name,
                 None if plan is None else len(plan),
                 rows,
             )
         return None
     if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_hc_bounds, "_dbg", False):
         _super_chunk_hc_bounds._dbg = True
-        logger.info("[sc-dbg] hc LOOP active plan=%d rows=%d", len(plan), rows)
+        logger.info("[sc-dbg] %s LOOP active plan=%d rows=%d", name, len(plan), rows)
     return [(lo, hi) for lo, hi, _ in plan]
+
+
+def _super_chunk_aux_bounds(forward_batch, rows: int):
+    """The same slices for the DSPARK capture writes, under its own gate name.
+
+    Captured hidden states are per row, so the rule that keeps hc intermediates
+    at chunk shape applies here too -- and banding the writes also deletes the
+    torch.cat the list path ended with, which on a 16 GB card was the
+    allocation that killed the service (2026-11-11, 0731 DSPARK: 384 MiB, the
+    4th slice, with 887 MiB already stranded as fragments).
+    """
+    return _super_chunk_hc_bounds(forward_batch, rows, "aux")
+
+
+def _dspark_capture(
+    collector: AuxHiddenStateAccumulator,
+    values: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Store one DSPARK capture, ``[tokens, hc_mult, hidden]`` -> ``[tokens, hidden]``.
+
+    The draft head reads these for every captured layer, and a prefill forward
+    covers up to ``max_prefill_tokens`` rows, so the whole-tensor form costs one
+    CAP-shape mean per layer and then a ``torch.cat`` of all of them at
+    ``pack_aux_hidden_states``. Inside the super-chunk inner loop the mean is
+    taken one band at a time and written straight into the capture's column of
+    the packed buffer instead: the only CAP-shape object left is the input the
+    layer already owns, and the pack is one buffer rather than K clones + a cat.
+
+    A collector that was built for banding but loses its plan mid-forward is a
+    bug, not a fallback: it would otherwise write chunk-shaped tensors into a
+    CAP-shaped buffer, so it raises.
+    """
+    if not isinstance(collector, AuxHiddenStatePacker):
+        # The list path: the mean is freshly allocated and borrowed by nobody,
+        # so it is adopted rather than cloned (that is what a plain append did).
+        collector.capture(values.mean(dim=1), owned=True)
+        return
+    bounds = _super_chunk_aux_bounds(forward_batch, values.shape[0])
+    if bounds is None:
+        raise RuntimeError(
+            "DSPARK capture lost its super-chunk plan mid-forward; refusing to "
+            "pack band-shaped captures into a CAP-shaped buffer"
+        )
+    for lo, hi in bounds:
+        collector.capture(values[lo:hi].mean(dim=1), owned=True, rows=(lo, hi))
 
 
 def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
@@ -4220,7 +4275,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
+        dspark_aux_hidden_states: AuxHiddenStateAccumulator,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4390,7 +4445,7 @@ class DeepseekV4Model(nn.Module):
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                _dspark_capture(dspark_aux_hidden_states, aux, forward_batch)
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4625,7 +4680,16 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # One packed buffer while this forward runs inside the super-chunk inner
+        # loop, the plain list otherwise (decode, capture mode, wrapper off, late
+        # tail) -- see _dspark_capture for why the list is the expensive one.
+        dspark_aux_hidden_states: AuxHiddenStateAccumulator = AuxHiddenStateList()
+        if capture_dspark and (
+            _super_chunk_aux_bounds(forward_batch, hidden_states.shape[0]) is not None
+        ):
+            dspark_aux_hidden_states = AuxHiddenStatePacker(
+                len(self.dspark_layers_to_capture), rows=hidden_states.shape[0]
+            )
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4727,7 +4791,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    _dspark_capture(dspark_aux_hidden_states, completed, forward_batch)
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
@@ -4815,6 +4879,10 @@ class DeepseekV4Model(nn.Module):
             )
 
         if capture_dspark:
+            if isinstance(dspark_aux_hidden_states, AuxHiddenStatePacker):
+                # One buffer, already packed band by band; pack_aux_hidden_states
+                # returns a tensor as-is.
+                dspark_aux_hidden_states = dspark_aux_hidden_states.finalize()
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
@@ -5171,7 +5239,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
                 if aux_hidden_states is not None:
-                    aux_hidden_states = [a[:n] for a in aux_hidden_states]
+                    # The packed-buffer path hands back one tensor; the list
+                    # path hands back K of them. Both are row-indexed the same
+                    # way, so the tail drop is a row slice either way.
+                    if isinstance(aux_hidden_states, torch.Tensor):
+                        aux_hidden_states = aux_hidden_states[:n]
+                    else:
+                        aux_hidden_states = [a[:n] for a in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu

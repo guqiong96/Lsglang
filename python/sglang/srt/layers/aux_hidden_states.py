@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -37,11 +37,24 @@ class AuxHiddenStatePacker:
     carries one, so every graph size aliases it instead of pinning its own.
     """
 
-    def __init__(self, num_captures: int, out: Optional[torch.Tensor] = None) -> None:
+    def __init__(
+        self,
+        num_captures: int,
+        out: Optional[torch.Tensor] = None,
+        rows: Optional[int] = None,
+    ) -> None:
         self._num_captures = int(num_captures)
         self._buffer = out
         self._feature_size: Optional[int] = None
         self._idx = 0
+        # Set only when a capture reaches this packer in row bands, i.e. while
+        # the super-chunk wrapper loops the forward in inner chunks: the buffer
+        # is CAP rows tall, which the first chunk's leading shape cannot tell
+        # us. ``_col`` is the capture being filled and ``_filled`` the rows it
+        # has taken so far, so a full band pass advances to the next column.
+        self._rows = None if rows is None else int(rows)
+        self._col = 0
+        self._filled = 0
 
     @classmethod
     def for_batch(
@@ -49,34 +62,85 @@ class AuxHiddenStatePacker:
     ) -> AuxHiddenStatePacker:
         return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
 
-    def append(self, hidden: torch.Tensor) -> None:
+    def append(
+        self, hidden: torch.Tensor, *, rows: Optional[Tuple[int, int]] = None
+    ) -> None:
+        """Store one capture: the whole tensor, or one ``[lo, hi)`` band of it.
+
+        The band form lets a model running inside the super-chunk inner loop
+        hand a capture over piece by piece instead of materializing a CAP-shape
+        copy of every captured layer; the destination is the same single column
+        of the packed buffer either way. Bands must arrive grouped -- all of one
+        capture before the next capture starts, which is what a layer loop does
+        -- and a band that would overrun its column raises instead of quietly
+        overwriting a neighbour's.
+        """
         feature_size = int(hidden.shape[-1])
+        if rows is None:
+            if self._feature_size is None:
+                self._feature_size = feature_size
+                shape = (*hidden.shape[:-1], feature_size * self._num_captures)
+                if self._buffer is None:
+                    self._buffer = hidden.new_empty(shape)
+                elif (
+                    self._buffer.shape != shape or self._buffer.dtype != hidden.dtype
+                ):
+                    raise ValueError(
+                        f"aux hidden output buffer is {tuple(self._buffer.shape)} "
+                        f"{self._buffer.dtype}, captures need {shape} {hidden.dtype}"
+                    )
+            start = self._idx * self._feature_size
+            self._buffer[..., start : start + self._feature_size].copy_(hidden)
+            self._idx += 1
+            return
+
+        lo, hi = int(rows[0]), int(rows[1])
         if self._feature_size is None:
             self._feature_size = feature_size
-            shape = (*hidden.shape[:-1], feature_size * self._num_captures)
+            shape = (int(self._rows), feature_size * self._num_captures)
             if self._buffer is None:
                 self._buffer = hidden.new_empty(shape)
-            elif self._buffer.shape != shape or self._buffer.dtype != hidden.dtype:
+            elif (
+                tuple(self._buffer.shape) != shape or self._buffer.dtype != hidden.dtype
+            ):
                 raise ValueError(
                     f"aux hidden output buffer is {tuple(self._buffer.shape)} "
                     f"{self._buffer.dtype}, captures need {shape} {hidden.dtype}"
                 )
-        start = self._idx * self._feature_size
-        self._buffer[..., start : start + self._feature_size].copy_(hidden)
-        self._idx += 1
+        elif self._filled == self._rows:
+            self._col += 1
+            self._filled = 0
+        if self._col >= self._num_captures or self._filled + (hi - lo) > self._rows:
+            raise RuntimeError(
+                f"aux capture bands out of order: column {self._col} of "
+                f"{self._num_captures}, rows {self._filled} + {hi - lo} of "
+                f"{self._rows}"
+            )
+        start = self._col * self._feature_size
+        self._buffer[lo:hi, start : start + self._feature_size].copy_(hidden)
+        self._filled += hi - lo
 
-    def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
+    def capture(
+        self, hidden: torch.Tensor, *, owned: bool = False, rows: Optional[Tuple[int, int]] = None
+    ) -> None:
         """Write directly to the final packed buffer, without an intermediate copy."""
-        self.append(hidden)
+        self.append(hidden, rows=rows)
+
+    def _captures_done(self) -> int:
+        """Captures fully stored, in either mode."""
+        if self._rows is None:
+            return self._idx
+        return self._col + (1 if self._filled == self._rows else 0)
 
     def __len__(self) -> int:
-        return self._idx
+        return self._captures_done()
 
     def finalize(self) -> torch.Tensor:
         """Return the packed buffer; callers guard the empty case on ``len()``."""
-        if self._feature_size is None or self._idx != self._num_captures:
+        done = self._captures_done()
+        if self._feature_size is None or done != self._num_captures:
             raise RuntimeError(
-                f"captured {self._idx} of {self._num_captures} aux hidden states"
+                f"captured {done} of {self._num_captures} aux hidden states"
             )
         return self._buffer
 
