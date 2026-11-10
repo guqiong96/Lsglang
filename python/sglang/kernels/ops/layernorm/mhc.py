@@ -1670,6 +1670,7 @@ def mhc_fused_post_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    residual_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse the boundary between one mHC post step and the next mHC pre step.
 
@@ -1757,7 +1758,32 @@ def mhc_fused_post_pre(
         dtype=torch.float32,
         device=residual.device,
     )
-    residual_cur = torch.empty_like(residual_flat)
+    # A caller that owns the destination can pass it, which is what stops a
+    # long prefill from paying a SECOND full-size residual copy at every mHC
+    # boundary: at the 16384-row max_prefill_tokens cap that copy is
+    # [16384, hc_mult=4, 4096] bf16 = 512 MiB per layer, and on a 16 GB card it
+    # is what killed every >=16K-token prefill (2026-11-10,
+    # DeepSeek-V4-Flash-0731 on 2x5060 Ti, 1.24 GiB of slack left by
+    # --mem-fraction-static 0.92).
+    #
+    # Honoured only above the FMA threshold. On the large-batch path the post
+    # and the pre GEMM are separate launches and nothing past the post reads
+    # residual_flat -- its last reader is the post itself, so the stream orders
+    # the read before the write, which is the same aliasing the unfused path
+    # already relies on when it does residual[tok].copy_(post(...)). The
+    # <=32-row FMA kernel runs post and the GEMM inside one launch, where that
+    # order is not asserted anywhere, so it keeps allocating -- at 32 rows a
+    # fresh buffer is a megabyte.
+    if residual_out is not None:
+        assert residual_out.numel() == residual_flat.numel(), (
+            f"residual_out has {residual_out.numel()} elements, expected "
+            f"{residual_flat.numel()}"
+        )
+    residual_cur = (
+        residual_out.reshape(residual_flat.shape)
+        if residual_out is not None and num_tokens > fma_token_threshold
+        else torch.empty_like(residual_flat)
+    )
 
     if num_tokens <= fma_token_threshold:
         # Small-batch path: one TileLang launch computes hc_post, the bf16

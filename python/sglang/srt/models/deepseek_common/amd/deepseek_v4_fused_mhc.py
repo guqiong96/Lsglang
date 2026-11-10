@@ -458,6 +458,10 @@ def apply_mhc_post_pre_boundary(
         sinkhorn_iters,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        # Write the post-mapped streams back over the ones being consumed: the
+        # old rows have no reader after the post, and at the prefill row cap a
+        # second full-size copy is 512 MiB per layer (mhc_fused_post_pre).
+        residual_out=residual,
     )
     post_out = post_out.squeeze(-1) if post_out.ndim == 3 else post_out
     return residual, layer_input_out, post_out, comb_out, True
