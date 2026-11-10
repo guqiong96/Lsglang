@@ -68,6 +68,53 @@ def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     return max(1, budget)
 
 
+# One persistent fp32 logits scratch per device, held by whoever first needs a
+# row-chunked logits matrix.
+_LOGITS_WORKSPACES: dict[int, torch.Tensor] = {}
+
+
+def mqa_logits_workspace(device_index: int, *, want_bytes: int) -> torch.Tensor:
+    """The persistent logits buffer, grown to ``want_bytes`` if it is smaller.
+
+    A row-chunk plan is built when the forward's metadata is built, but the
+    scores used to be allocated when each chunk ran. On a long prefill those two
+    moments are minutes and gigabytes apart, and the budget the plan trusted had
+    been spent meanwhile: the chunk then died on an allocation the plan had
+    already accounted for. Holding the bytes here makes the plan's budget a fact
+    -- the same fix the gfx950 fused indexer applies to its own workspace, which
+    takes it while weights load so the pools are not sized against memory that is
+    about to be taken.
+
+    Grow-only, and never grown past the budget at the moment it grows: a forward
+    that wants more rows than the buffer holds gets more, smaller chunks rather
+    than an allocation that may no longer be there, which is what turns an
+    over-budget 256K prefill from a crash into a slower run.
+    """
+    ws = _LOGITS_WORKSPACES.get(device_index)
+    want_bytes = max(int(want_bytes), 0)
+    have = 0 if ws is None else ws.numel() * MQA_LOGITS_BYTES_PER_ELEM
+    if have >= want_bytes and want_bytes > 0:
+        return ws
+    budget = mqa_logits_budget_bytes(device_index=device_index, allow_sync=True)
+    # Grow as far as the memory actually allows. When even what is already held
+    # is past that, leave the buffer alone: a live buffer cannot shrink.
+    target = min(max(want_bytes, MQA_LOGITS_BYTES_PER_ELEM), budget)
+    if target <= have:
+        target = max(have, MQA_LOGITS_BYTES_PER_ELEM)
+    elems = max(target // MQA_LOGITS_BYTES_PER_ELEM, 1)
+    grown = torch.empty(elems, dtype=torch.float32, device=f"cuda:{device_index}")
+    if ws is not None and ws.numel():
+        grown[: ws.numel()] = ws
+    _LOGITS_WORKSPACES[device_index] = grown
+    return grown
+
+
+def mqa_logits_workspace_bytes(device_index: int) -> int:
+    """Bytes currently held, so a planner can chunk against memory that exists."""
+    ws = _LOGITS_WORKSPACES.get(device_index)
+    return 0 if ws is None else ws.numel() * MQA_LOGITS_BYTES_PER_ELEM
+
+
 def mqa_logits_should_chunk(
     *,
     num_rows: int,

@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_needs_budget_check,
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    mqa_logits_workspace,
+    mqa_logits_workspace_bytes,
     mqa_logits_should_chunk,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -313,9 +315,15 @@ class PagedIndexerMetadata:
             or is_in_tc_piecewise_cuda_graph()
         ):
             return None
-        return mqa_logits_budget_bytes(
-            device_index=self.compressed_seq_lens.device.index, allow_sync=True
-        )
+        device_index = self.compressed_seq_lens.device.index
+        budget = mqa_logits_budget_bytes(device_index=device_index, allow_sync=True)
+        # Take the bytes this plan is about to budget against. A plan that only
+        # promises them is what killed a 256K prefill: the chunk ran minutes
+        # after this read, on an allocation the plan had already counted, and the
+        # memory was gone by then. Now the budget the plan reports is memory this
+        # process holds, and the buffer only ever grows from here.
+        mqa_logits_workspace(device_index, want_bytes=budget)
+        return mqa_logits_workspace_bytes(device_index)
 
     @property
     def max_seq_len(self) -> int:

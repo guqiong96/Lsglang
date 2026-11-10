@@ -46,8 +46,10 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     iter_row_chunks,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
+    MQA_LOGITS_BYTES_PER_ELEM,
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    mqa_logits_workspace,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -1235,6 +1237,9 @@ class C4IndexerBackendMixin:
         else:
             assert len(weights.shape) == 3
             weights = weights.squeeze(2)
+        # Only the tilelang kernel can write its scores into a buffer the caller
+        # owns; every other kernel keeps allocating its own.
+        takes_out = False
         if use_fp4_indexer and not use_aiter_fp4:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
@@ -1246,6 +1251,8 @@ class C4IndexerBackendMixin:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
+
+            takes_out = True
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
@@ -1471,6 +1478,22 @@ class C4IndexerBackendMixin:
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
+                kwargs = {}
+                if takes_out:
+                    # The scores land in the buffer the row-chunk plan paid for
+                    # when it was built, so a chunk cannot die on an allocation the
+                    # plan had only counted. A buffer that still cannot hold this
+                    # chunk (the budget was already spent elsewhere) leaves out unset
+                    # and the kernel allocates, exactly as it did before.
+                    cols = indexer_metadata.max_compressed_seq_len
+                    part = rows.stop - rows.start
+                    elems = part * cols
+                    ws = mqa_logits_workspace(
+                        page_table.device.index,
+                        want_bytes=elems * MQA_LOGITS_BYTES_PER_ELEM,
+                    )
+                    if ws.numel() >= elems:
+                        kwargs["out"] = ws[:elems].view(part, cols)
                 logits = fn(
                     row_q,
                     c4_indexer_kv_cache,
@@ -1480,6 +1503,7 @@ class C4IndexerBackendMixin:
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
+                    **kwargs,
                 )
                 run_topk_transform(rows, logits, topk_plan)
 

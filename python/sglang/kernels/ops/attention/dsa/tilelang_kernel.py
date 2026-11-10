@@ -1666,7 +1666,16 @@ def tilelang_fp8_paged_mqa_logits(
     deep_gemm_metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``out`` writes the scores into a buffer the caller already owns.
+
+    Safe to reuse across calls: the kernel ends in ``T.copy`` into the output, so
+    an element never depends on what was there before (which is the same reason
+    ``torch.empty`` is correct here today). The caller keeps one persistent
+    logits buffer so the memory a row-chunked forward budgets is memory it holds,
+    not memory it hopes is still free when the chunk runs.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -1679,7 +1688,18 @@ def tilelang_fp8_paged_mqa_logits(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
-    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    if out is None:
+        logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    else:
+        want = (batch_size, max_seq_len)
+        if tuple(out.shape) != want or out.dtype != torch.float32:
+            raise ValueError(
+                f"paged MQA logits output is {tuple(out.shape)} {out.dtype}, "
+                f"needs {want} float32"
+            )
+        if not out.is_contiguous():
+            raise ValueError("paged MQA logits output must be contiguous")
+        logits = out
 
     NUM_CU = 256
     split_kv = split_kv = max(1, min(max_seq_len // block_size, NUM_CU // batch_size))
