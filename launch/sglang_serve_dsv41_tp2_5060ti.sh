@@ -54,7 +54,6 @@ else
     # detached/tool launch: plain file append, no coprocess a teardown can kill
     exec >> "$LOG" 2>&1
 fi
-export PATH="/home/guqiong/.conda/envs/Lsglang/bin:$PATH"
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \

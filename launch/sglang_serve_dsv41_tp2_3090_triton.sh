@@ -3,7 +3,6 @@
 # The CLI lives in the project environment: a tool/harness launch has no conda
 # activation, and relying on the caller's PATH fails as
 # "sglang: command not found" before the first token (2026-11-06, official gate).
-export PATH="/home/guqiong/.conda/envs/Lsglang/bin:$PATH"
 LOG="${LOG:-/tmp/opencode/serve_logs/sglang_serve_dsv41_tp2_3090.log}"
 mkdir -p /tmp/opencode/serve_logs
 echo "===== $(date "+%F %T") launch pid=$$ =====" >> "$LOG"
