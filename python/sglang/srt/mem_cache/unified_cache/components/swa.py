@@ -1001,9 +1001,19 @@ class SWAComponent(TreeComponent):
         if effective_cache_len > token_ids_len:
             return None
 
-        # Record the logical SWA branch boundary for insertion.
+        # Record the logical SWA branch boundary for insertion, but let the
+        # insert span the whole request: the branch point says where live SWA
+        # starts again, not where the request's tokens stop being cacheable.
+        # Truncating the key here made a partial hit into a SWA-less full-KV
+        # region a fixed point -- the insert stopped at the length the match
+        # had just reported, so the tree never grew past it and every later
+        # turn matched the same prefix and inserted nothing (#37). The commit
+        # step already treats a key that runs past the branch point as a fork
+        # whose fresh range carries SWA (swa_branch_inserted), and full-KV past
+        # it is a tombstone by evicted_seqlen, which is the state a match
+        # handles on the way in.
         insert_params.swa_branching_seqlen = branching_seqlen
-        return effective_cache_len
+        return None
 
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
