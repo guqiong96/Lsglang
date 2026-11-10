@@ -144,27 +144,116 @@ def get_gpu_prefill_engine() -> str:
     val = get_str_env_var("LK_GPU_PREFILL_ENGINE", "cutlass").strip().lower()
     return val if val in ("triton", "flashinfer") else "cutlass"
 
-def is_gpu_prefill_sm120_w4a4_enabled() -> bool:
-    # Quantization-level switch for the LK GPU-prefill tier (2026-10-27
-    # doctrine: three orthogonal factors, any one off degrades safely to
-    # W4A16, whose numerics equal the BF16-activation paths). Two of them
-    # are decided here, in one place: this env (pure switch, default off --
-    # lk_switch_doctrine rule 2) and the device capability (SM120 family,
-    # hard check; the three-key rule -- capability decides correctness,
-    # never the name). The third is the engine's w4a4_support(), asked by
-    # the caller against the driver it just created. There is NO second
-    # token threshold inside the tier: the batch gate is
-    # LK_GPU_PREFILL_MIN_TOKENS and nothing else (the retired
-    # MIN_TOKENS-version threshold left no compatibility layer).
-    if not get_bool_env_var("LK_GPU_PREFILL_SM120_W4A4"):
+_GPU_PREFILL_QUANT_MODES = ("auto", "w4a4", "w4a8", "w4a16", "w8a8")
+
+# THE validity table: (engine, requested mode) -> requirements.
+#
+#   frozenset()            always implementable by that engine
+#   {"sm120"}              SM120 family only
+#   {"nvfp4"}              NVFP4 weights only (MXFP4 needs a swizzled SF mirror)
+#
+# A pair that is absent from the table is NOT implemented: asking for it warns
+# and degrades (precision is a speed setting, the fallback is still correct).
+# Keeping this as a table is the point -- the engine x mode decision was spread
+# over capability probes and ad-hoc sets, which nobody could read.
+#
+# Two tables, one per device family -- the same pair resolves differently:
+#
+# SM120 (5060 Ti / RTX PRO / B-series GeForce)
+#   engine \ mode   auto        w4a4            w4a8   w4a16   w8a8
+#   cutlass          -> w4a16    nvfp4           -      yes     -
+#   triton           -> w4a16    -               -      yes     -
+#   flashinfer       -> w4a16    nvfp4           -      yes     -
+#
+# sm8x / SM90 and everything else
+#   cutlass          -> w4a16    -               -      yes     -
+#   triton           -> w4a16    -               -      yes     -
+#   flashinfer       - (SM12x-only kernels; its probe fails elsewhere)
+#
+# "auto" deliberately does not pick w4a4 until _PREFILL_AUTO_PREFERS_W4A4 is
+# flipped: the explicit request is the opt-in, and there is no second knob.
+_PREFILL_QUANT_MATRIX = {
+    ("cutlass", "w4a16"): frozenset(),
+    ("cutlass", "w4a4"): frozenset({"sm120", "nvfp4"}),
+    ("triton", "w4a16"): frozenset(),
+    ("flashinfer", "w4a16"): frozenset({"sm120"}),
+    ("flashinfer", "w4a4"): frozenset({"sm120", "nvfp4"}),
+}
+_PREFILL_AUTO_PREFERS_W4A4 = False
+_PREFILL_QUANT_WARNED = set()
+_PREFILL_QUANT_LEGAL = {
+    "nvfp4": ("w4a4", "w4a8", "w4a16"),
+    "mxfp4": ("w4a4", "w4a8", "w4a16"),
+    "fp8": ("w8a8", "w8a16"),
+    "bf16": ("w8a16",),
+}
+_PREFILL_QUANT_FALLBACK = {"nvfp4": "w4a16", "mxfp4": "w4a16",
+                           "fp8": "w8a16", "bf16": "w8a16"}
+
+
+def get_gpu_prefill_quant() -> str:
+    """The requested prefill precision: one knob, resolved per layer."""
+    if get_bool_env_var("LK_GPU_PREFILL_SM120_W4A4"):
+        raise ValueError(
+            "LK_GPU_PREFILL_SM120_W4A4 is retired: set "
+            "LK_GPU_PREFILL_QUANT=w4a4 instead")
+    quant = (get_str_env_var("LK_GPU_PREFILL_QUANT", "auto") or "auto").strip().lower()
+    if quant not in _GPU_PREFILL_QUANT_MODES:
+        raise ValueError(
+            f"LK_GPU_PREFILL_QUANT={quant!r} is not one of "
+            f"{_GPU_PREFILL_QUANT_MODES}")
+    return quant
+
+
+def engine_quant_supported(engine: str, mode: str, weight_format: str,
+                           is_sm120: bool) -> bool:
+    """Table lookup: does `engine` implement `mode` for these weights here?"""
+    req = _PREFILL_QUANT_MATRIX.get((engine, mode))
+    if req is None:
         return False
-    if torch.cuda.get_device_capability()[0] != 12:  # SM120 family
-        # warnings.warn dedups per call site: one line, not one per layer.
+    return all(
+        (need != "sm120" or is_sm120) and
+        (need != "nvfp4" or weight_format == "nvfp4")
+        for need in req
+    )
+
+
+def resolve_gpu_prefill_quant(requested: str, engine: str, weight_format: str,
+                              is_sm120: bool) -> str:
+    """The mode this layer runs. Pure table + policy, no capability probing."""
+    fmt = (weight_format or "").lower()
+    if fmt not in _PREFILL_QUANT_LEGAL:
+        raise ValueError(f"unknown prefill weight format {weight_format!r}")
+    legal = _PREFILL_QUANT_LEGAL[fmt]
+
+    def usable(mode):
+        if mode == "w4a4" and not _PREFILL_AUTO_PREFERS_W4A4 and requested == "auto":
+            return False
+        return engine_quant_supported(engine, mode, fmt, is_sm120)
+
+    if requested == "auto":
+        for mode in legal:
+            if usable(mode):
+                return mode
+        return _PREFILL_QUANT_FALLBACK[fmt]
+
+    if requested not in legal:
+        raise ValueError(
+            f"LK_GPU_PREFILL_QUANT={requested} is not valid for {fmt} weights "
+            f"(legal: {legal})")
+    if engine_quant_supported(engine, requested, fmt, is_sm120):
+        return requested
+    fallback = next((m for m in legal if usable(m)), _PREFILL_QUANT_FALLBACK[fmt])
+    key = (requested, engine, fmt, fallback)
+    if key not in _PREFILL_QUANT_WARNED:
+        _PREFILL_QUANT_WARNED.add(key)
         warnings.warn(
-            "LK_GPU_PREFILL_SM120_W4A4=1 but this device is not SM120-"
-            "family -> prefill stays W4A16", stacklevel=2)
-        return False
-    return True
+            f"LK_GPU_PREFILL_QUANT={requested} is not implemented by the "
+            f"{engine} engine for {fmt} weights on this device -> prefill runs "
+            f"{fallback}; this is a speed mode, not a correctness setting",
+            stacklevel=3)
+    return fallback
+
 
 def get_pool_window() -> int:
     # Tuned default (hit ~81%). The ONLY pool switch is LK_POOL_SLOTS: any

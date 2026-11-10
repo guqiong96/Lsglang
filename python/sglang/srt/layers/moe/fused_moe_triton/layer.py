@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 _LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
 _LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, is_gpu_prefill_sm120_w4a4_enabled
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, get_gpu_prefill_quant, resolve_gpu_prefill_quant
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -2150,6 +2150,11 @@ class FusedMoE(torch.nn.Module):
         cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
         cfg.prefill_wave_experts = self.prefill_wave_experts
         cfg.prefill_d_slots = self.prefill_d_slots
+        # 1 = W4A4 block-scaled prefill, 0 = the W4A16 dequant path. The C++
+        # object COPIES this struct at construction, so the decision has to be
+        # made here (see _resolve_prefill_quant_early) -- arming the driver later
+        # in _init_pool is too late for the engine to see it.
+        cfg.prefill_quant = 1 if self._resolve_prefill_quant_early() == "w4a4" else 0
         cfg.pool_window = get_pool_window()
         cfg.pool_inflight = get_pool_inflight()
         cfg.pool_log = get_pool_log()
@@ -2472,12 +2477,11 @@ class FusedMoE(torch.nn.Module):
                 from lk_moe.prefill_staging import StagingPrefill
                 drv = StagingPrefill.probe(self.lk_moe)
             self._gpu_prefill_driver = drv
-            # Quantization-level switch: armed at the spot where the engine
-            # was just chosen -- no quant-method-side arm hook. env and the
-            # SM120-family capability are decided by the helper; the engine
-            # answers for itself via w4a4_support().
-            if is_gpu_prefill_sm120_w4a4_enabled():
-                self.lk_moe_arm_w4a4()
+            # Quantization-level knob: armed at the spot where the engine was
+            # just chosen -- no quant-method-side arm hook. The engine answers
+            # with the modes it implements for (arch, weight format); the
+            # policy (auto order, warn-and-degrade) lives in lk_moe_env.
+            self._arm_prefill_quant(drv)
         self._pool_layer_info = None
         self.lk_moe.pool_gpu_report(False)
         if self.pool_decode:
@@ -2824,6 +2828,91 @@ class FusedMoE(torch.nn.Module):
         
         return output_gpu
  
+    # One log line per (requested, weights, resolved) combination, not per layer.
+    _PREFILL_QUANT_LOGGED = set()
+
+    def _prefill_weight_format(self) -> str:
+        """Expert-weight format of THIS layer: nvfp4 / mxfp4 / fp8 / bf16.
+
+        NVFP4 and MXFP4 share the fp4 data type and differ only in the scale
+        element (e4m3 at 16-element blocks vs e8m0 at 32-element blocks), which
+        is exactly what decides whether an activation pair is fp4/fp8/mxfp8.
+        """
+        # ModelOpt NVFP4 keeps `w13_weight_scale` (e4m3) + `..._scale_2`
+        # (fp32 global); MXFP4 keeps `w13_weight_scale_inv` (e8m0). Check both
+        # spellings before falling back to the quant method's name.
+        for attr in ("w13_weight_scale", "w13_weight_scale_inv"):
+            scale = getattr(self, attr, None)
+            if scale is None:
+                continue
+            if scale.dtype == torch.float8_e8m0fnu:
+                return "mxfp4"
+            if scale.dtype == torch.float8_e4m3fn:
+                return "nvfp4"
+        if getattr(self, "w13_weight_scale_2", None) is not None:
+            return "nvfp4"
+        name = ""
+        if self.quant_config is not None:
+            try:
+                name = (self.quant_config.get_name() or "").lower()
+            except Exception:  # noqa: BLE001
+                name = ""
+        if "mxfp4" in name:
+            return "mxfp4"
+        if "nvfp4" in name or "w4a4" in name:
+            return "nvfp4"
+        weight = getattr(self, "w13_weight", None)
+        if weight is not None and weight.dtype == torch.float8_e4m3fn:
+            return "fp8"
+        return "bf16"
+
+    def _resolve_prefill_quant_early(self) -> str:
+        """The precision this layer's C++ object will be built with.
+
+        Runs before the engine exists, so it cannot ask the driver; it only
+        mirrors the driver's capability statically (cutlass W4A4 is the
+        experiment switch on an SM120 device; flashinfer arms itself later and
+        does not read cfg.prefill_quant).
+        """
+        fmt = self._prefill_weight_format()
+        supported = {"w4a16"}
+        try:
+            import torch as _t
+            sm12 = _t.cuda.get_device_capability()[0] == 12
+        except Exception:  # noqa: BLE001
+            sm12 = False
+        # One table, one knob: lk_moe_env owns the (engine x mode) validity
+        # matrix and the "auto" policy. No capability probing here.
+        return resolve_gpu_prefill_quant(
+            get_gpu_prefill_quant(), get_gpu_prefill_engine(), fmt, sm12)
+
+    def _arm_prefill_quant(self, drv) -> None:
+        """Resolve LK_GPU_PREFILL_QUANT for this layer and arm the engine.
+
+        The engine claims what it implements (``w4a4_support`` today; the
+        w4a8/mxfp8 siblings plug in here); the request/fallback policy is
+        lk_moe_env.resolve_gpu_prefill_quant. A mode the engine lacks degrades
+        with one warning -- precision is a speed setting, not correctness.
+        """
+        fmt = self._prefill_weight_format()
+        requested = get_gpu_prefill_quant()
+        try:
+            import torch as _t
+            sm12 = _t.cuda.get_device_capability()[0] == 12
+        except Exception:  # noqa: BLE001
+            sm12 = False
+        mode = resolve_gpu_prefill_quant(
+            requested, get_gpu_prefill_engine(), fmt, sm12)
+        self.prefill_quant_mode = mode
+        if mode == "w4a4":
+            self.lk_moe_arm_w4a4()
+        key = (requested, fmt, mode)
+        if key not in FusedMoE._PREFILL_QUANT_LOGGED:
+            FusedMoE._PREFILL_QUANT_LOGGED.add(key)
+            logger.info(
+                "[prefill] quant=%s (requested %s, weights %s)", mode, requested, fmt
+            )
+
     def lk_moe_arm_w4a4(self):
         """Hand this checkpoint's calibrated FP4 activation multipliers
         (1 / input_scale) to the engine driver, for every batch inside the

@@ -132,7 +132,7 @@ Scope: layers served by lk_moe (CPU-offloaded, pooled, GPU-prefill tier) never
 route through the sglang runner, so this flag does not affect them - it is
 safe, and recommended, to set it together with any `LK_*` configuration. The
 `launch/` recipes targeting 5060 Ti cards already pin it. It is independent of
-`LK_GPU_PREFILL_SM120_W4A4`: that knob is about the pool tier's prefill
+`LK_GPU_PREFILL_QUANT`: that knob is about the pool tier's prefill
 activations, this one about resident-layer GEMMs.
 
 ### Switch linkage (one master gate)
@@ -146,7 +146,7 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
  │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton|flashinfer (default cutlass; triton = opt-out;
  │   │                                             flashinfer = SM120/SM121 + NVFP4 checkpoints only)
- │   ├─ w4a4 level     LK_GPU_PREFILL_SM120_W4A4=1   (NVFP4 activations; SM120-family + flashinfer engine)
+ │   ├─ precision      LK_GPU_PREFILL_QUANT=auto|w4a4|w4a8|w4a16|w8a8  (see the engine table below)
  │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
  │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
@@ -187,11 +187,53 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 1024 (on) | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path. On by default; set `0` for pure CPU prefill (16 GB cards) |
-| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | which GPU prefill path runs above the token gate. `cutlass`: fastest on long prompts, works with every pooled dtype; rounds activations to bf16 — long-context logits can shift and borderline EOS can flip; `triton`: output bit-matches the CPU reference, slightly slower; `flashinfer` (SM120/SM121 + **NVFP4 checkpoints only** — the CuTe kernels are NVFP4-only, an fp8/mxfp4 pool layer fails its init probe and the boot aborts by design): stages the weights as FP4 and runs the FP4 tensor cores — works standalone at W4A16 (CPU-matching) numerics, add `LK_GPU_PREFILL_SM120_W4A4=1` to run activations in FP4 too; forwarded via cfg, the C++ library itself does not read this env |
-| `LK_GPU_PREFILL_SM120_W4A4` | prefill | 0 = off | `0`: prefill activations run as BF16 (W4A16) — numerics equal the CPU path on every GPU; `1`: activations run as FP4 (W4A4) — visibly faster prefill, slightly different numerics. Needs the `flashinfer` engine (the only engine implementing W4A4) *and* an SM120-family card; otherwise a one-time warning is logged and prefill stays W4A16 |
+| `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | which GPU prefill path runs above the token gate. `cutlass`: fastest on long prompts, works with every pooled dtype; rounds activations to bf16 — long-context logits can shift and borderline EOS can flip; `triton`: output bit-matches the CPU reference, slightly slower; `flashinfer` (SM120/SM121 + **NVFP4 checkpoints only** — the CuTe kernels are NVFP4-only, an fp8/mxfp4 pool layer fails its init probe and the boot aborts by design): stages the weights as FP4 and runs the FP4 tensor cores — works standalone at W4A16 (CPU-matching) numerics; `LK_GPU_PREFILL_QUANT=w4a4` runs its activations in FP4 too; forwarded via cfg, the C++ library itself does not read this env |
+| `LK_GPU_PREFILL_QUANT` | prefill | `auto` | prefill precision, resolved per layer against the engine table below: `auto` keeps W4A16 for now, an explicit `w4a4` / `w4a8` / `w4a16` / `w8a8` is a request; a mode the engine lacks **warns and degrades** (precision is a speed setting, never a correctness one). Replaces the retired `LK_GPU_PREFILL_SM120_W4A4`, which now raises |
 | `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | tier wave width, ONE geometry for all three engines, frozen at init: `-1`/unset = one wave over all E experts (the gate-tested default), `>0` = W experts per wave - a per-wave gemm loop only the cutlass engine has, so `0 < W < E` on a staging engine (triton/flashinfer) aborts at init; appears as `wave=` in the `[tier]` boot line |
 | `LK_GPU_PREFILL_D_SLOTS` | prefill | 0 = off | tier activation window in slot rows, frozen at init (the `act_rows=` figure in the `[tier]` boot line); **all three engines** pace their prefill passes to hold it, at the cost of extra kernel launches, result unchanged. The two staging engines never walk more than their built-in 8192-slot block, so the knob only *tightens* their walk: a value at or above that block (and `0`) leaves them byte-identical to before, and the triton scratch follows a tighter walk. The staging arena still reports `act 0 B` -- its activations live in the driver buffers, not in the arena. `0` = one window per pass (cutlass) |
 | `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 65536), `0` = per-chunk staging; the super-chunk attention wrapper only arms when SUB_M exceeds `--chunked-prefill-size`. Bigger values move more of each expert's weights per token (faster) but raise the token budget of a single forward - the `CAP=` in the `Super-chunk prefill wrapper active` boot line - and with it the scratch that scales with that budget, incl. a pre-reserved output buffer of ~ SUB_M × hidden × 4 bytes per rank that is already counted against the KV budget; halving it roughly halves that scratch |
+
+#### Prefill precision: `LK_GPU_PREFILL_QUANT` x `LK_GPU_PREFILL_ENGINE`
+
+Two tables, one per device family: the same (engine, mode) pair resolves
+differently because the block-scaled CUTLASS family is SM120-only and
+flashinfer's CuTe kernels are SM12x-only. Source of truth:
+`_PREFILL_QUANT_MATRIX` in `srt/utils/lk_moe_env.py`.
+
+**SM120** (RTX 5060 Ti, RTX PRO, B-series GeForce)
+
+| engine \ mode | `auto` | `w4a4` | `w4a8` | `w4a16` | `w8a8` |
+|---|---|---|---|---|---|
+| `cutlass` | -> `w4a16` | yes (NVFP4) | - | yes | - |
+| `triton` | -> `w4a16` | - | - | yes | - |
+| `flashinfer` | -> `w4a16` | yes (NVFP4) | - | yes | - |
+
+**sm8x / SM90 and older** (RTX 3090, A100/H100)
+
+| engine \ mode | `auto` | `w4a4` | `w4a8` | `w4a16` | `w8a8` |
+|---|---|---|---|---|---|
+| `cutlass` | -> `w4a16` | - | - | yes | - |
+| `triton` | -> `w4a16` | - | - | yes | - |
+| `flashinfer` | - | - | - | - | - |
+
+`yes` = implemented on that engine and device, `-` = not implemented.
+
+- **A missing pair is not an error.** An explicit request for a mode the engine
+  does not implement warns once and falls back to the best mode that engine has
+  for those weights. Only an invalid value (or a mode that cannot exist for the
+  weight format) raises.
+- **`auto` still resolves to `w4a16`.** W4A4 is opt-in via the explicit value;
+  graduating it is a one-line policy change, not another env var.
+- **`w4a4` needs NVFP4 weights.** MXFP4 checkpoints (the DeepSeek-V4.1 / 0731
+  experts) store their block scales as a plain `[N/32, K/32]` buffer while the
+  block-scaled GEMM reads the 128x4-swizzled layout, so they would need a
+  swizzled scale mirror at load time first.
+- `w4a8` / `w8a8` are reserved: CUTLASS has kernels for both, the engine wiring
+  is not done, so they degrade today.
+- Measured (Qwen3.8-Flash-Next, 2x5060Ti, cold prefix cache, 32K prompt):
+  `flashinfer`+`w4a4` **2195 t/s**, `cutlass`+`w4a16` **1406-1421 t/s**,
+  `cutlass`+`w4a4` **1410 t/s** — on SM120 the cutlass engine's staging cost
+  dominates the GEMM, which is why `auto` does not pick it.
 
 ### GPU Pool (expert cache)
 
