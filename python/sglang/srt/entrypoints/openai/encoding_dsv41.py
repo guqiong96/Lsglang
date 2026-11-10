@@ -661,6 +661,19 @@ def _encode_messages_text(
     effective_drop_thinking = drop_thinking
     if any(m.get("tools") for m in full_messages):
         effective_drop_thinking = False
+    # Thinking turns are also not droppable once the client sent their reasoning.
+    # What the server cached for such a turn is the block opened, its text, the block
+    # closed, the answer, so a rendering that leaves the reasoning out cannot match
+    # that turn -- and once one turn fails to match, nothing after it can either.
+    # That is the frozen cached length of a growing conversation, so dropping here is
+    # not a token saving: the bytes come back as re-prefilled prompt on every later
+    # turn. Presence of the field is what says "this turn thought", not a non-empty
+    # string: an empty block still opened and closed.
+    if effective_drop_thinking and any(
+        m.get("role") == "assistant" and m.get("reasoning_content") is not None
+        for m in full_messages
+    ):
+        effective_drop_thinking = False
 
     if thinking_mode == "thinking" and effective_drop_thinking:
         full_messages = _drop_thinking_messages(full_messages)

@@ -3099,8 +3099,14 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 self.assertEqual((messages, context), original)
 
-    def test_dsv41_drop_thinking_without_tools(self):
-        """Tool results do not start a new turn, so current-turn reasoning is kept."""
+    def test_dsv41_replays_reasoning_without_tools(self):
+        """Reasoning the client sent back is replayed, tool result or not.
+
+        Dropping it left a turn that matches nothing the server cached, so every
+        later turn re-prefilled the whole conversation -- the frozen cached length
+        reported in #36. Both assistant turns here are history, and both keep the
+        block they were generated inside.
+        """
         from sglang.srt.entrypoints.openai import encoding_dsv41
 
         messages = [
@@ -3124,20 +3130,22 @@ class ServingChatTestCase(CustomTestCase):
             messages, thinking_mode="thinking", drop_thinking=True
         )
         self.assertIn(
-            "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>", prompt
+            "".join(
+                [
+                    encoding_dsv41.USER_SP_TOKEN,
+                    "q1",
+                    encoding_dsv41.ASSISTANT_SP_TOKEN,
+                    encoding_dsv41.thinking_start_token,
+                    "r1",
+                    encoding_dsv41.thinking_end_token,
+                    "a1",
+                    encoding_dsv41.eos_token,
+                ]
+            ),
+            prompt,
         )
-        self.assertNotIn("r1", prompt)
-        self.assertIn("<think>r2</think>", prompt)
-        self.assertTrue(
-            prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
-        )
+        self.assertIn("r2", prompt)
 
-        next_turn = encoding_dsv41.encode_messages(
-            messages + [{"role": "user", "content": "q3"}],
-            thinking_mode="thinking",
-        )
-        self.assertNotIn("r2", next_turn)
-        self.assertTrue(next_turn.endswith("q3<｜Assistant｜><think>"))
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
