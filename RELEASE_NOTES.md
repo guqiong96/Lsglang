@@ -1,3 +1,69 @@
+# lsglang 1.7.5 (from 1.7.4)
+
+Needs lk_moe 2.8.5.
+
+```
+pip install lsglang==1.7.5
+```
+
+The deep_gemm build is unchanged from 1.7.4, so nothing to reinstall if that already
+works; it ships with the package (Python 3.12, linux x86_64) and can also be installed
+by hand:
+
+```
+pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
+```
+
+On an environment that still has `sgl-deep-gemm` from an older release, remove it
+first — both provide the `deep_gemm` module:
+
+```
+pip uninstall -y sgl-deep-gemm
+```
+
+Upgrade `lk_moe` before starting a 2x RTX 5060 Ti recipe: an older one leaves that path
+unusable and the server falls back quietly, which then surfaces as a long prompt failing
+to start rather than as an error at boot.
+
+## Thinking conversations keep their cache
+
+Two prefix-cache faults, both only visible inside a real conversation:
+
+* A thinking conversation stopped extending its cache at the first assistant turn -- the
+  cached length froze while the prompt kept growing, so the hit rate slid as the chat got
+  longer (#36). Reasoning the client sends back is now replayed as the turn that produced
+  it: over four turns on DeepSeek-V4-Flash-0731, 0, 0, 0 cached tokens became 256, 512,
+  512, with non-thinking conversations unchanged. The V4.1 format renders the same turn
+  the same way and carries the same fix, covered by the same tests.
+* A conversation that started with a partial hit on another conversation's prefix
+  contributed nothing of its own, so the cache never grew for it, however many turns it
+  ran (#37).
+
+Both are covered by CPU tests, each with a case that must not match; the thinking fix is
+additionally measured on hardware, the #37 one is not yet measured with two live
+conversations on this build.
+
+## 2x RTX 5060 Ti serves the 0731 checkpoint
+
+The recipe boots and serves: 262,144 tokens of KV, the card's own block-scaled prefill
+active, **792 t/s** prefill at 32K and **862 t/s** at 128K, **56-69 t/s** decode sampled
+from live OpenWebUI turns at 3.5K-11.3K context. A 256K prompt still does not fit two
+16 GB cards, so treat 128K as the ceiling there and use a 3090 recipe for 256K.
+
+## Long-prompt scoring memory is held rather than promised
+
+The paged indexer's score matrix used to be counted in a long prompt's plan when the plan
+was built, and allocated later, once per piece, when that piece was scored. It is now
+taken once and kept by the process; reusing it was checked to give exactly the scores a
+fresh allocation would. That removes one way a long prefill can die on an allocation its
+own plan had already accounted for. It does not reduce what a long prompt costs -- on two
+16 GB cards a 256K prompt is still out of reach, and 128K is the largest shape measured
+here (**862 t/s**).
+
+A prompt split into pieces now also captures the speculative draft's inputs for every
+piece instead of only the first; the 32K and 128K numbers above were taken with DSPARK
+enabled.
+
 # lsglang 1.7.4 (from 1.7.3)
 
 Needs lk_moe 2.8.4.
