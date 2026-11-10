@@ -41,7 +41,7 @@ from sglang.srt.utils import logger
 # One-shot diagnostics (which plan was taken, why the wrapper declined). Off
 # by default: they are useful while chasing a layout bug and pure noise in a
 # production boot log.
-_SC_DEBUG = os.environ.get("LK_SC_DEBUG", "0") not in ("", "0")
+_SC_DEBUG = os.environ.get("LK_SC_DEBUG", "0") not in ("", "0")not in ("", "0")
 _SC_ACTIVE_LOGGED = False
 _SC_WARNED_REASONS = set()
 

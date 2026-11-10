@@ -378,7 +378,7 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
         return None
     plan = super_chunk_token_plan(forward_batch, "attn")
     if plan is None or len(plan) < 2 or plan[-1][1] != rows:
-        if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+        if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
             _super_chunk_attn_plan._dbg = True
             logger.info(
                 "[sc-dbg] attn-plan FALLBACK(plan) plan=%s rows=%d",
@@ -391,7 +391,7 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
         if any(
             not torch.is_tensor(v) or v.shape[0] != rows for v in values
         ):
-            if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+            if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
                 _super_chunk_attn_plan._dbg = True
                 logger.info(
                     "[sc-dbg] attn-plan FALLBACK(x_quant) shapes=%s rows=%d",
@@ -399,7 +399,7 @@ def _super_chunk_attn_plan(forward_batch, rows: int, x_quant=None):
                     rows,
                 )
             return None
-    if rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
+    if _SC_DEBUG and rows > 1024 and not getattr(_super_chunk_attn_plan, "_dbg", False):
         _super_chunk_attn_plan._dbg = True
         logger.info("[sc-dbg] attn-plan LOOP active plan=%d rows=%d", len(plan), rows)
     return plan
@@ -4786,7 +4786,7 @@ class DeepseekV4Model(nn.Module):
                         self.hc_head_base,
                     )
             hidden_states = out
-            if not getattr(self, "_hc_head_sc_logged", False):
+            if _SC_DEBUG and not getattr(self, "_hc_head_sc_logged", False):
                 self._hc_head_sc_logged = True
                 logger.info(
                     "[sc-dbg] hc-head LOOP active plan=%d rows=%d chunk_max=%d",

@@ -1778,13 +1778,14 @@ class DeepseekV2MoE(nn.Module):
         forward_normal carries no forward_batch.
         """
         from sglang.srt.layers.attention.super_chunk_backend import (
+            _SC_DEBUG,
             super_chunk_token_plan,
         )
 
         plan = super_chunk_token_plan(None, "shexp")
         if plan is None or len(plan) < 2 or plan[-1][1] != hidden_states.shape[0]:
             return None
-        if not getattr(self, "_shared_super_chunk_logged", False):
+        if _SC_DEBUG and not getattr(self, "_shared_super_chunk_logged", False):
             self._shared_super_chunk_logged = True
             logger.info(
                 "[sc-dbg] shared-expert LOOP active plan=%d rows=%d chunk_max=%d",

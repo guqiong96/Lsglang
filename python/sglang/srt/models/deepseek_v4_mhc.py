@@ -424,6 +424,7 @@ def _combine(
     plan = None
     if not quantize and not (get_platform().is_blackwell or get_platform().is_sm90):
         from sglang.srt.layers.attention.super_chunk_backend import (
+            _SC_DEBUG,
             super_chunk_in_late_tail,
             super_chunk_token_plan,
         )
@@ -447,7 +448,7 @@ def _combine(
                 )
             out[tok] = rows
         global _SC_COMBINE_LOGGED
-        if not _SC_COMBINE_LOGGED:
+        if _SC_DEBUG and not _SC_COMBINE_LOGGED:
             _SC_COMBINE_LOGGED = True
             logger.info(
                 "[sc-dbg] mhc-combine LOOP active plan=%d rows=%d chunk_max=%d",
@@ -520,6 +521,7 @@ def post(
     # return value). The monolithic empty_like(residual) is [CAP, mult, H]
     # bf16: 640 MiB at CAP=16K, and it is the post path's largest transient.
     from sglang.srt.layers.attention.super_chunk_backend import (
+        _SC_DEBUG,
         super_chunk_in_late_tail,
         super_chunk_token_plan,
     )
@@ -536,7 +538,7 @@ def post(
                 post(cfg, x[tok], residual[tok], post_mix[tok], comb[tok])
             )
         global _SC_POST_LOGGED
-        if not _SC_POST_LOGGED:
+        if _SC_DEBUG and not _SC_POST_LOGGED:
             _SC_POST_LOGGED = True
             logger.info(
                 "[sc-dbg] mhc-post LOOP active plan=%d rows=%d chunk_max=%d",
