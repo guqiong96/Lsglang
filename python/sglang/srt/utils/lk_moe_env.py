@@ -190,10 +190,12 @@ _PREFILL_QUANT_LEGAL = {
     "nvfp4": ("w4a4", "w4a8", "w4a16"),
     "mxfp4": ("w4a4", "w4a8", "w4a16"),
     "fp8": ("w8a8", "w8a16"),
-    "bf16": ("w8a16",),
+    # A bf16 checkpoint has no 8-bit weights to name: its only mode is the
+    # plain bf16 GEMM, so the safe mode says 16-bit weights, not w8a16.
+    "bf16": ("w16a16",),
 }
 _PREFILL_QUANT_FALLBACK = {"nvfp4": "w4a16", "mxfp4": "w4a16",
-                           "fp8": "w8a16", "bf16": "w8a16"}
+                           "fp8": "w8a16", "bf16": "w16a16"}
 
 
 def get_gpu_prefill_quant() -> str:

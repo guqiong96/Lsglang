@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsglang"
-version = "1.7.4"
+version = "1.7.5"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -77,9 +77,11 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "deep-gemm @ https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl",
+  # deep_gemm: PyPI rejects direct-URL requirements in core metadata (HTTP 400),
+  # so it is not a dependency here. Install it by hand:
+  #   pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
   "sglang-kernel==0.4.10",
-  "lk_moe==2.8.4",
+  "lk_moe==2.8.5",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",

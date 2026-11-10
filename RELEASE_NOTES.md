@@ -6,9 +6,9 @@ Needs lk_moe 2.8.5.
 pip install lsglang==1.7.5
 ```
 
-The deep_gemm build is unchanged from 1.7.4, so nothing to reinstall if that already
-works; it ships with the package (Python 3.12, linux x86_64) and can also be installed
-by hand:
+The deep_gemm build with the SM120 kernels is not a package dependency: PyPI refuses
+requirements that point at a URL, so installing this package cannot pull it for you.
+Install it once by hand (Python 3.12, linux x86_64) — skip this if it already works:
 
 ```
 pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
@@ -21,9 +21,30 @@ first — both provide the `deep_gemm` module:
 pip uninstall -y sgl-deep-gemm
 ```
 
-Upgrade `lk_moe` before starting a 2x RTX 5060 Ti recipe: an older one leaves that path
-unusable and the server falls back quietly, which then surfaces as a long prompt failing
-to start rather than as an error at boot.
+## FP4 x FP4 prefill on SM120
+
+The 2x RTX 5060 Ti recipes now run prefill with 4-bit activations against 4-bit weights:
+packed codes and scale factors go straight to the card's block-scaled GEMM instead of
+being dequantized to bf16 first. It is one knob, resolved per checkpoint:
+
+```
+LK_GPU_PREFILL_QUANT=w4a4     # auto | w4a4 | w4a8 | w4a16 | w8a8
+```
+
+Only an engine that carries the W4A4 arm can serve that request;
+`LK_GPU_PREFILL_ENGINE` picks the engine (`cutlass` by default):
+
+| engine | `w4a4` on SM120 | checkpoints |
+|--------|-----------------|-------------|
+| `cutlass` | yes | NVFP4 and MXFP4 — the new arm in this release |
+| `triton` | — | never had it |
+| `flashinfer` | yes | NVFP4 only |
+
+`auto` is the default and keeps each checkpoint on a mode it can run. A mode the engine
+does not implement for these weights degrades to the safe one and says so at boot, so an
+older `lk_moe` or an older card costs you speed, not the boot. The boot line reports the
+mode that is actually live; no W4A4 line means the recipe asked for it and did not get
+it.
 
 ## Thinking conversations keep their cache
 
@@ -45,24 +66,16 @@ conversations on this build.
 
 ## 2x RTX 5060 Ti serves the 0731 checkpoint
 
-The recipe boots and serves: 262,144 tokens of KV, the card's own block-scaled prefill
-active, **792 t/s** prefill at 32K and **862 t/s** at 128K, **56-69 t/s** decode sampled
-from live OpenWebUI turns at 3.5K-11.3K context. A 256K prompt still does not fit two
-16 GB cards, so treat 128K as the ceiling there and use a 3090 recipe for 256K.
+The recipe boots and serves: 262,144 tokens of KV, **792 t/s** prefill at 32K and
+**862 t/s** at 128K, **56-69 t/s** decode sampled from live OpenWebUI turns at
+3.5K-11.3K context. A 256K prompt still does not fit two 16 GB cards, so treat 128K as
+the ceiling there and use a 3090 recipe for 256K.
 
-## Long-prompt scoring memory is held rather than promised
+## Long-prompt memory
 
-The paged indexer's score matrix used to be counted in a long prompt's plan when the plan
-was built, and allocated later, once per piece, when that piece was scored. It is now
-taken once and kept by the process; reusing it was checked to give exactly the scores a
-fresh allocation would. That removes one way a long prefill can die on an allocation its
-own plan had already accounted for. It does not reduce what a long prompt costs -- on two
-16 GB cards a 256K prompt is still out of reach, and 128K is the largest shape measured
-here (**862 t/s**).
-
-A prompt split into pieces now also captures the speculative draft's inputs for every
-piece instead of only the first; the 32K and 128K numbers above were taken with DSPARK
-enabled.
+Scoring memory for a long prompt used to be counted when the plan was made and taken
+later; it is now held from the start, so a long prefill no longer dies on memory its own
+plan had already counted. What a long prompt costs is unchanged.
 
 # lsglang 1.7.4 (from 1.7.3)
 

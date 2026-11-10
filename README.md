@@ -66,8 +66,8 @@ sudo apt-get install libnuma-dev      # Ubuntu  /  sudo dnf install numactl-deve
 pip install lsglang                   # or build from source below
 ```
 
-`lsglang` pulls the deep_gemm build with the SM120 kernels (Python 3.12, linux
-x86_64). It can also be installed by hand:
+The deep_gemm build with the SM120 kernels is installed by hand, not pulled in with
+the package: PyPI refuses requirements that point at a URL (Python 3.12, linux x86_64):
 
 ```bash
 pip install https://github.com/guqiong96/Lsglang/releases/download/lsglang-v1.7.4/deep_gemm-2.8.0+local-cp312-cp312-linux_x86_64.whl
@@ -204,7 +204,7 @@ flashinfer's CuTe kernels are SM12x-only. Source of truth:
 
 | engine \ mode | `auto` | `w4a4` | `w4a8` | `w4a16` | `w8a8` |
 |---|---|---|---|---|---|
-| `cutlass` | -> `w4a16` | yes (NVFP4) | - | yes | - |
+| `cutlass` | -> `w4a16` | yes (NVFP4 and MXFP4) | - | yes | - |
 | `triton` | -> `w4a16` | - | - | yes | - |
 | `flashinfer` | -> `w4a16` | yes (NVFP4) | - | yes | - |
 
@@ -224,10 +224,10 @@ flashinfer's CuTe kernels are SM12x-only. Source of truth:
   invalid value (or a mode that cannot exist for the weight format) raises.
 - **`auto` still resolves to `w4a16`.** W4A4 is opt-in via the explicit value;
   graduating it is a one-line policy change, not another env var.
-- **`w4a4` needs NVFP4 weights.** MXFP4 checkpoints (the DeepSeek-V4.1 / 0731
-  experts) store their block scales as a plain `[N/32, K/32]` buffer while the
-  block-scaled GEMM reads the 128x4-swizzled layout, so they would need a
-  swizzled scale mirror at load time first.
+- **`w4a4` covers both 4-bit weight families.** NVFP4 keeps e4m3 scales at
+  16-element blocks; MXFP4 (the DeepSeek-V4.1 / 0731 experts) stores e8m0 scales
+  at 32-element blocks, which the `cutlass` engine now repacks into the dense
+  layout the block-scaled GEMM reads. `flashinfer` stays NVFP4-only.
 - `w4a8` / `w8a8` are reserved: CUTLASS has kernels for both, the engine wiring
   is not done, so they degrade today.
 - Measured (Qwen3.8-Flash-Next, 2x5060Ti, cold prefix cache, 32K prompt):

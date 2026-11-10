@@ -65,6 +65,18 @@ class TestPrefillQuantMatrix(CustomTestCase):
         self.assertEqual(self._resolve("w4a8", "cutlass", NV, True), "w4a16")
         self.assertEqual(self._resolve("w8a8", "cutlass", "fp8", True), "w8a16")
 
+    def test_bf16_names_16bit_weights(self):
+        # A bf16 checkpoint has no 8-bit weights to name: its only mode is the
+        # plain bf16 GEMM. Calling that w8a16 would claim a weight
+        # quantization that never happens, and the boot line would repeat it.
+        self.assertEqual(self._resolve("auto", "cutlass", "bf16", True), "w16a16")
+        self.assertNotEqual(self._resolve("auto", "cutlass", "bf16", True), "w8a16")
+        for engine in ("cutlass", "triton", "flashinfer"):
+            self.assertEqual(
+                self._resolve("auto", engine, "bf16", False), "w16a16")
+        with self.assertRaises(ValueError):
+            self._resolve("w4a4", "cutlass", "bf16", True)   # no 4-bit weights
+
     def test_illegal_values_raise(self):
         with self.assertRaises(ValueError):
             self._resolve("w4a4", "cutlass", "fp8", True)   # 4-bit mode on fp8
