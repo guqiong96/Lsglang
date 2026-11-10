@@ -174,7 +174,12 @@ _GPU_PREFILL_QUANT_MODES = ("auto", "w4a4", "w4a8", "w4a16", "w8a8")
 # flipped: the explicit request is the opt-in, and there is no second knob.
 _PREFILL_QUANT_MATRIX = {
     ("cutlass", "w4a16"): frozenset(),
-    ("cutlass", "w4a4"): frozenset({"sm120", "nvfp4"}),
+    # cutlass reads both 4-bit weight families: NVFP4 (ModelOpt/Qwen) and
+    # MXFP4 (DSV4 / DSV4.1 experts). MXFP4 only became addressable once the
+    # prefill engine learned the native panel -> dense repack for its
+    # 32-element scale blocks (lk_moe repack_panel_to_dense, 2026-11-10).
+    # flashinfer's block-scaled kernel is NVFP4-only and stays gated below.
+    ("cutlass", "w4a4"): frozenset({"sm120"}),
     ("triton", "w4a16"): frozenset(),
     ("flashinfer", "w4a16"): frozenset({"sm120"}),
     ("flashinfer", "w4a4"): frozenset({"sm120", "nvfp4"}),

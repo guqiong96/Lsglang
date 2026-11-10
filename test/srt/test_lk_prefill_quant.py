@@ -34,11 +34,13 @@ class TestPrefillQuantMatrix(CustomTestCase):
                          {"auto", "w4a4", "w4a8", "w4a16", "w8a8"})
 
     def test_sm120_table(self):
-        # w4a4 exists for the two engines that carry block-scaled kernels --
-        # and only for NVFP4 weights (MXFP4 scales need a swizzle mirror first).
+        # w4a4 exists for the two engines that carry block-scaled kernels.
+        # cutlass covers both 4-bit weight families; flashinfer's kernel is
+        # NVFP4-only, so MXFP4 degrades to w4a16 there.
         for engine in ("cutlass", "flashinfer"):
             self.assertEqual(self._resolve("w4a4", engine, NV, True), "w4a4")
-            self.assertEqual(self._resolve("w4a4", engine, MX, True), "w4a16")
+        self.assertEqual(self._resolve("w4a4", "cutlass", MX, True), "w4a4")
+        self.assertEqual(self._resolve("w4a4", "flashinfer", MX, True), "w4a16")
         self.assertEqual(self._resolve("w4a4", "triton", NV, True), "w4a16")
         for engine in ("cutlass", "triton", "flashinfer"):
             self.assertEqual(self._resolve("w4a16", engine, NV, True), "w4a16")

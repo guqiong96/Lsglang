@@ -2919,12 +2919,43 @@ class FusedMoE(torch.nn.Module):
         tier's gate. The env + SM120-family factors live in
         ``is_gpu_prefill_sm120_w4a4_enabled`` (checked by the single caller,
         ``_init_pool``); the engine answers for itself via w4a4_support().
-        Whether the checkpoint carries calibrated input scales is the
-        operator's choice to arm -- no check here, a scale-less checkpoint
-        fails on its own at boot.
+
+        Which attributes carry the calibration is a property of the
+        quantization method, and every format this repo loads is a named
+        class (see ``_do_process_weights_after_loading``), so dispatch on
+        those names instead of probing for attributes:
+
+        * ``ModelOptNvFp4FusedMoEMethod`` and ``CompressedTensors`` with the
+          ``CompressedTensorsW4A4Nvfp4MoE`` scheme -- NVFP4, e4m3 scales at
+          16-element blocks -- carry ``w13/w2_input_scale`` (the calibrated
+          per-layer activation scales) plus ``w13_weight_scale_2``, which is
+          what the gate/up ratio below is read from.
+        * The MXFP4 methods (``Mxfp4MarlinMoEMethod``,
+          ``Mxfp4FlashinferTrtllmMoEMethod``, ``Mxfp4FlashinferCutlassMoEMethod``)
+          -- e8m0 scales at 32-element blocks -- carry ``w13_weight_scale_inv``
+          and NO input_scale: MXFP4 derives the activation scale per block, so
+          the engine discards the global multiplier for it (lk_moe
+          csrc/cuda/moe_v2_gpu_quant.cuh, "global_scale is ignored for MXFP4").
+          Nothing to arm, so nothing to read.
+        * Every other format (WNA16, AWQ, FP8, unquantized) never resolves to
+          w4a4 in the quant matrix at all.
+
+        Reading the NVFP4 names unconditionally booted the first MXFP4 W4A4
+        attempt into AttributeError: 'w13_weight_scale_2' inside
+        process_weights_after_loading (2026-11-10, DeepSeek-V4-Flash-0731).
         """
         drv = self._gpu_prefill_driver
         if drv is None or not drv.w4a4_support():
+            return
+        if not (
+            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            or (
+                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+                and isinstance(
+                    getattr(self, "scheme", None), CompressedTensorsW4A4Nvfp4MoE
+                )
+            )
+        ):
             return
         one = torch.ones((), dtype=torch.float32)
         gs13 = self.w13_weight_scale_2.detach().to(torch.float32)
