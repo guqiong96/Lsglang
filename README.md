@@ -355,7 +355,7 @@ Machine-level notes:
 | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | 5060Ti x2 | **799 t/s** | — | **815 t/s** | 22-24 t/s | — | [plain](launch/sglang_serve_dsv41_tp2_5060ti.sh) |
 | [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | 3090 x2 + 5060Ti x2 (TP4) | **914 t/s** | **889 t/s** | **818 t/s** | 19-21 t/s | — | [plain](launch/sglang_serve_dsv41_tp4.sh) |
 | [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 3090 x2 | **1160 t/s** | **941 t/s** | **745 t/s** | 28-34 t/s | 44-51 t/s | [plain](launch/sglang_serve_0731_tp2_3090.sh) · [DSPARK](launch/sglang_serve_0731_dspark_tp2_3090.sh) |
-| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 5060Ti x2 | — | — | — | — | — | [DSPARK](launch/sglang_serve_0731_dspark_tp2_5060ti.sh) |
+| [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 5060Ti x2 | **792 t/s** | **862 t/s** | — | — | 56-69 t/s | [DSPARK](launch/sglang_serve_0731_dspark_tp2_5060ti.sh) |
 | [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | 3090 x2 | **2174 t/s** | **2507 t/s** | **2345 t/s** | 58-63 t/s | 96-119 t/s | [plain](launch/sglang_serve_qwen38_tp2_3090.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_3090.sh) |
 | [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | 5060Ti x2 | **2195 t/s** | **2091 t/s** | **2050 t/s** | 39-46 t/s | 67-76 t/s | [plain](launch/sglang_serve_qwen38_tp2_5060ti.sh) · [NEXTN](launch/sglang_serve_qwen38_mtp_tp2_5060ti.sh) |
 | [Qwen3.8-Flash-Next](https://huggingface.co/lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4) | 3090 x2 + 5060Ti x2 (TP4) | **1249 t/s** | **1247 t/s** | — | — | 63-83 t/s | [NEXTN](launch/sglang_serve_qwen38_mtp_tp4.sh) |
@@ -371,7 +371,10 @@ number is the steady-state 4K generation end to end, the second is the highest p
 generation rate the server reported for the same run; **Spec. decode** is DSPARK (DeepSeek)
 or NEXTN (Qwen3.8/Qwen3.6), and a recipe without `--speculative-*` never prints an
 `accept len` line, which is how the plain rows were confirmed. A short client-side window
-(a few hundred tokens) reads 20-30% lower because it also pays the first token.
+(a few hundred tokens) reads 20-30% lower because it also pays the first token. The 0731
+row on 5060Ti samples its spec-decode range from 41 turns of live OpenWebUI traffic
+(3.5K-11.3K context, batch 1) instead of a fixed 4K run: same statistic, real prompts,
+which is why its accept length is 4.6 rather than the ~2.3 a synthetic prompt gets.
 `—` = not measured for that configuration, not a failure. A DSPARK prefill is within ~3% of
 its plain twin.
 
