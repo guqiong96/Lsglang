@@ -1,3 +1,63 @@
+# lsglang 1.7.6 (from 1.7.5)
+
+Needs lk_moe 2.8.5.
+
+```
+pip install lsglang==1.7.6
+```
+
+## Correctness fixes
+
+- **Banded auxiliary captures now tile the column they were built for.** A band that
+  skipped rows left allocator bytes in the draft model's input, and one that overlapped
+  rewrote rows that were already correct; both are refused instead of silently handing
+  the model wrong hidden states.
+- **DeepSeek-V4.1 with DSPARK and bounded replay boots again.** Those recipes used to
+  build a capture packer sized for CAP rows, then refuse to write the replay tail; the
+  layer loop and the collector now read the same tail predicate.
+
+## QSA K/V host offload (Qwen3.8)
+
+`--enable-qsa-kv-offload` keeps the full-attention K/V of the QSA layers in pinned host
+memory and holds only the blocks the indexer selects on the card, in a per-request hot
+cache. On 2x RTX 3090 the KV pool drops from 19.6 GB to 16.2 GB per card at the same
+262,144 tokens, and the logical pool can grow to 524,288. Weights, indexer and prefix
+reuse are untouched, and the packed K/V is bit-identical to the fully device-resident
+path (checked against the pool gather).
+
+```
+--enable-qsa-kv-offload
+--qsa-kv-offload-host-size 8        # GB per rank
+--qsa-kv-offload-hot-blocks 2048    # draft tokens x 512 with MTP, otherwise 1024
+```
+
+It cannot be combined with `--enable-hierarchical-cache`, and it does not offload the
+Mamba state, so a hybrid model's prefix reuse is still bounded by the Mamba pool.
+
+## Recipes
+
+- **Every recipe pins the tree core to Python** (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`).
+  The Rust tree core is compiled from source on demand whenever a checkout and cargo are
+  present, which silently changed the backend between machines and between days for the
+  same version.
+- **Hybrid linear-attention recipes enable the hierarchical cache** (Qwen3.8, Qwen3.6,
+  GLM-5.3, ratio 4). A radix hit there needs a donated Mamba state; the 11-slot device
+  pool cannot hold one per long context, and the host tier keeps those states
+  recoverable instead of silently recomputing the whole prefix.
+- **Qwen3.6's MTP recipes declare the KV dtype explicitly** (`--kv-cache-dtype fp8_e4m3`
+  with `--speculative-draft-kv-cache-dtype fp8_e4m3`) so the draft pool matches the
+  target's fp8 cache; the hierarchical cache refuses to boot otherwise.
+- **DeepSeek-V4.1 recipes enable the same hierarchical cache** (ratio 4). Mind the host
+  budget: one TP rank already takes about 338 GB for the CPU expert pool, so the tier
+  fits only when the machine is not also running another engine.
+- New: `SGLANG_DEBUG_MAMBA_CHECKPOINT=1` logs what a finished request donates to the
+  radix cache and what each match reuses. Off by default.
+
+## Measured quality
+
+Same gate, same frozen corpus, 2x RTX 3090: Qwen3.6 MTP 8.105 (8.108 with the
+hierarchical cache), 0731 DSpark 6.983, GLM-5.3 6.503, all `GATE PASSED`.
+
 # lsglang 1.7.5 (from 1.7.4)
 
 Needs lk_moe 2.8.5.
