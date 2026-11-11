@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup
 from sglang.srt.layers.layer_boundary.row_transport import TransportRows
 from sglang.srt.models import deepseek_v4_boundary as boundary
@@ -49,6 +50,12 @@ class TestHcConsumer(unittest.TestCase):
         model.start_layer, model.end_layer = 0, 2
         model.pp_group = SimpleNamespace(world_size=1)
         model.engram_hasher = model.late_layer_start = None
+        # The loop reads the config for the pre-engram vision select (8fa2d810f5).
+        # This is a text batch, so keep the select off rather than fake a vision
+        # config the batch would not match.
+        model.config = SimpleNamespace(
+            model_type="deepseek_v4", vision_n_layers=0, image_token_id=-1
+        )
         model.dspark_layers_to_capture = [1]
         positions = torch.arange(3)
         batch = SimpleNamespace(
@@ -58,7 +65,9 @@ class TestHcConsumer(unittest.TestCase):
             residual_stream=None,
         )
         source = torch.arange(24.0).reshape(3, 2, 4)
-        aux = []
+        # The collector is what DeepseekV4Model.forward hands in; a bare list has
+        # no capture() and the tap goes through it.
+        aux = AuxHiddenStateList()
         recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
         with (
             patch.object(deepseek_v4, "_is_cuda", True),
@@ -202,6 +211,116 @@ class TestAttentionCompletion(unittest.TestCase):
                     completed = transport.prepare_output(deferred).complete()
                 torch.testing.assert_close(completed, immediate, atol=0, rtol=0)
                 torch.testing.assert_close(completed, (value + 1) * 2, atol=0, rtol=0)
+
+
+class TestDsparkCollectorChoice(unittest.TestCase):
+    """Which collector a DSPARK forward gets, and what a lost plan then means.
+
+    The packer is sized for the whole prefill batch, so a forward that runs its
+    late layers over the decoder-SWA bounded-replay tail hands it capture rows it
+    cannot take (2026-11-11: the dsv4.1 2x3090 DSPARK recipes run
+    --enable-decoder-swa-bounded-replay *and* --speculative-algorithm DSPARK, and
+    the first version of the banded capture built a CAP-row packer for them and
+    then raised in the tail). The two decisions are kept in step by one
+    predicate, so it gets a truth table, and the capture outcomes on either side
+    of it get tested rather than asserted in a comment.
+    """
+
+    def _fb(self, mode, return_logprob=False, starts=None, lens=None):
+        fb = SimpleNamespace(forward_mode=mode)
+        if return_logprob:
+            fb.return_logprob = True
+            fb.extend_logprob_start_lens_cpu = starts
+            fb.extend_seq_lens_cpu = lens
+        return fb
+
+    def test_only_a_whole_extend_runs_the_tail(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models.deepseek_v4 import _builds_late_layer_tail
+
+        prompt_logprobs = self._fb(ForwardMode.EXTEND, True, [0], [8])
+        completion_logprobs_only = self._fb(ForwardMode.EXTEND, True, [8], [8])
+        cases = [
+            # bounded replay off: nothing gathers to a tail
+            (None, self._fb(ForwardMode.EXTEND), False),
+            (None, prompt_logprobs, False),
+            # on, and this forward takes the tail
+            (20, self._fb(ForwardMode.EXTEND), True),
+            (20, completion_logprobs_only, True),
+            # on, but the rows are not the extend (decode, verify) or some prompt
+            # row is read too (start < len), so no tail
+            (20, self._fb(ForwardMode.DECODE), False),
+            (20, self._fb(ForwardMode.TARGET_VERIFY), False),
+            (20, prompt_logprobs, False),
+        ]
+        for late, fb, want in cases:
+            self.assertEqual(
+                _builds_late_layer_tail(late, fb),
+                want,
+                f"late_layer_start={late} mode={fb.forward_mode}",
+            )
+
+    def test_tail_capture_through_the_list_path_keeps_its_rows(self):
+        from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import deepseek_v4
+
+        # The tail rows of one request, four of them, three hc lanes.
+        values = torch.randn(4, 3, 6)
+        collector = AuxHiddenStateList()
+        with patch.object(deepseek_v4, "_super_chunk_aux_bounds", return_value=None):
+            deepseek_v4._dspark_capture(collector, values, self._fb(ForwardMode.EXTEND))
+        torch.testing.assert_close(
+            pack_aux_hidden_states(collector), values.mean(1), atol=0, rtol=0
+        )
+
+    def test_packer_without_a_plan_refuses_instead_of_short_writing(self):
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import deepseek_v4
+
+        # The other half of the pair: with the packer the same capture raises
+        # rather than write 4 rows into a buffer sized for the whole batch. That
+        # raise is what the predicate above exists to keep unreachable.
+        collector = AuxHiddenStatePacker(1, rows=8)
+        with patch.object(deepseek_v4, "_super_chunk_aux_bounds", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "lost its super-chunk plan"):
+                deepseek_v4._dspark_capture(
+                    collector, torch.randn(4, 3, 6), self._fb(ForwardMode.EXTEND)
+                )
+
+    def test_packer_with_a_plan_writes_the_same_bytes_as_the_list(self):
+        from sglang.srt.layers.aux_hidden_states import (
+            AuxHiddenStatePacker,
+            pack_aux_hidden_states,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import deepseek_v4
+
+        values = torch.randn(4, 3, 6)
+        packed = AuxHiddenStatePacker(1, rows=4)
+        listed = AuxHiddenStateList()
+        with patch.object(
+            deepseek_v4, "_super_chunk_aux_bounds", return_value=[(0, 2), (2, 4)]
+        ):
+            deepseek_v4._dspark_capture(packed, values, self._fb(ForwardMode.EXTEND))
+        deepseek_v4._dspark_capture(listed, values, self._fb(ForwardMode.EXTEND))
+        self.assertTrue(torch.equal(packed.finalize(), pack_aux_hidden_states(listed)))
+
+    def test_both_decisions_share_the_predicate(self):
+        # Drift guard: the layer loop and the collector have to agree, so neither
+        # is allowed to re-inline the condition.
+        import inspect
+
+        from sglang.srt.models import deepseek_v4
+
+        for fn in (
+            deepseek_v4.DeepseekV4Model._forward_impl,
+            deepseek_v4.DeepseekV4Model._forward_layers_hc_pre_from_prev,
+        ):
+            self.assertIn(
+                "_builds_late_layer_tail(", inspect.getsource(fn), fn.__name__
+            )
 
 
 class TestMoeSourceRows(unittest.TestCase):

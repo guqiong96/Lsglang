@@ -1197,6 +1197,22 @@ def _prompt_rows_requested(fb) -> bool:
     return any(s < n for s, n in zip(starts, lens))
 
 
+def _builds_late_layer_tail(late_layer_start, forward_batch) -> bool:
+    """True when this forward runs its late layers over the tail gather.
+
+    One predicate for the two places that have to agree about it: the layer loop
+    (it swaps in the tail metadata and gathers the state down to tail rows) and
+    the DSPARK collector (a buffer sized for CAP rows then has no rows to take,
+    which is why the packer must not be built for such a forward). Written twice
+    they drift; the drift is silent in the loop and a crash in the collector.
+    """
+    return (
+        late_layer_start is not None
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and not _prompt_rows_requested(forward_batch)
+    )
+
+
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
     # backend onto the tail metadata of the *live* batch (the captured args hold
@@ -4320,11 +4336,7 @@ class DeepseekV4Model(nn.Module):
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
         tail = None
-        if (
-            self.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and not _prompt_rows_requested(forward_batch)
-        ):
+        if _builds_late_layer_tail(self.late_layer_start, forward_batch):
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
             self._check_late_layer_tail_readers(forward_batch, tail)
@@ -4683,12 +4695,22 @@ class DeepseekV4Model(nn.Module):
         # One packed buffer while this forward runs inside the super-chunk inner
         # loop, the plain list otherwise (decode, capture mode, wrapper off, late
         # tail) -- see _dspark_capture for why the list is the expensive one.
+        #
+        # The bounded-replay tail rules the packer out on its own, plan or no
+        # plan: the captures are tail rows either way (the loop gathers them at
+        # late_layer_start from, and tail.rows() before that), so a buffer sized
+        # for CAP rows has nothing to take and _dspark_capture would refuse to
+        # write it. Those captures are one SWA window per request, so the list
+        # is the cheap path here -- not the CAP-shape list that OOMed a 16 GB
+        # card (2026-11-11), which is what this branch is for.
         dspark_aux_hidden_states: AuxHiddenStateAccumulator = AuxHiddenStateList()
+        packed_capture_rows = hidden_states.shape[0]
         if capture_dspark and (
-            _super_chunk_aux_bounds(forward_batch, hidden_states.shape[0]) is not None
+            not _builds_late_layer_tail(self.late_layer_start, forward_batch)
+            and _super_chunk_aux_bounds(forward_batch, packed_capture_rows) is not None
         ):
             dspark_aux_hidden_states = AuxHiddenStatePacker(
-                len(self.dspark_layers_to_capture), rows=hidden_states.shape[0]
+                len(self.dspark_layers_to_capture), rows=packed_capture_rows
             )
 
         attn_backend = get_attn_backend()
