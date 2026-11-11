@@ -22,6 +22,7 @@ GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
 CUDA_VISIBLE_DEVICES=1,2 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
 LK_MOE_HYBRID_ENABLED=1 \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
@@ -51,7 +52,9 @@ sglang serve --sleep-on-idle \
   --ple-offload-embedding \
   --ple-offload-backend pinned \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 262144 \
+  --max-total-tokens 524288 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 4 \
   --mem-fraction-static 0.80 \
   --warmups prefill_shapes \
   --mm-feature-transport=cpu \

@@ -19,6 +19,7 @@ GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
 LK_MOE_HYBRID_ENABLED=1 \
 LK_THREADS=48 \
 OMP_NUM_THREADS=1 \
@@ -53,7 +54,9 @@ sglang serve --sleep-on-idle \
   --ple-offload-backend nvme \
   --ple-offload-dir ~/Models/.ple_cache/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --chunked-prefill-size 1024 \
-  --max-total-tokens 262144 \
+  --max-total-tokens 524288 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 4 \
   --mem-fraction-static 0.80 \
   --warmups prefill_shapes \
   --mm-feature-transport=cpu \

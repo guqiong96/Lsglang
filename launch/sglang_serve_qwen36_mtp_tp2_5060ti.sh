@@ -21,6 +21,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=1,2 \
 SGLANG_SKIP_P2P_CHECK=1 \
 SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 \
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
 LK_MOE_HYBRID_ENABLED=1 \
 LK_THREAD_BINDING=NUMA_NODE \
 LK_THREADS=48 \
@@ -44,6 +45,10 @@ sglang serve --sleep-on-idle \
     --max-running-requests 2 \
     --chunked-prefill-size 4096 \
     --max-total-tokens 262144 \
+    --kv-cache-dtype fp8_e4m3 \
+    --speculative-draft-kv-cache-dtype fp8_e4m3 \
+    --enable-hierarchical-cache \
+    --hicache-ratio 4 \
     --mem-fraction-static 0.90 \
     --tool-call-parser auto \
     --reasoning-parser auto \
