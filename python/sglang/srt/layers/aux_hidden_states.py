@@ -70,13 +70,25 @@ class AuxHiddenStatePacker:
         The band form lets a model running inside the super-chunk inner loop
         hand a capture over piece by piece instead of materializing a CAP-shape
         copy of every captured layer; the destination is the same single column
-        of the packed buffer either way. Bands must arrive grouped -- all of one
-        capture before the next capture starts, which is what a layer loop does
-        -- and a band that would overrun its column raises instead of quietly
-        overwriting a neighbour's.
+        of the packed buffer either way. Bands of one capture have to *tile* it:
+        grouped, in increasing row order, no gaps and no overlap -- which is
+        what a layer loop over one token plan produces.
+
+        Tiling is enforced, not assumed. Both ways of breaking it are otherwise
+        silent, and both leave wrong bytes in the draft model's input: a band
+        that skips rows leaves whatever the allocator had there, and one that
+        overlaps rewrites rows that were already right. Either needs only a row
+        count that disagrees with the buffer, which is exactly what a lost or
+        stale super-chunk plan hands over.
         """
         feature_size = int(hidden.shape[-1])
         if rows is None:
+            if self._rows is not None:
+                raise RuntimeError(
+                    "aux capture mixes whole-tensor and banded writes: this packer "
+                    "was built with a row count, i.e. for the super-chunk inner "
+                    "loop, where every capture arrives in bands"
+                )
             if self._feature_size is None:
                 self._feature_size = feature_size
                 shape = (*hidden.shape[:-1], feature_size * self._num_captures)
@@ -95,6 +107,11 @@ class AuxHiddenStatePacker:
             return
 
         lo, hi = int(rows[0]), int(rows[1])
+        if self._rows is None:
+            raise RuntimeError(
+                "aux capture asked for a band but this packer was built without a "
+                "row count, i.e. for the whole-tensor form"
+            )
         if self._feature_size is None:
             self._feature_size = feature_size
             shape = (int(self._rows), feature_size * self._num_captures)
@@ -110,11 +127,22 @@ class AuxHiddenStatePacker:
         elif self._filled == self._rows:
             self._col += 1
             self._filled = 0
-        if self._col >= self._num_captures or self._filled + (hi - lo) > self._rows:
+        if self._col >= self._num_captures:
             raise RuntimeError(
                 f"aux capture bands out of order: column {self._col} of "
-                f"{self._num_captures}, rows {self._filled} + {hi - lo} of "
-                f"{self._rows}"
+                f"{self._num_captures}, rows {self._filled} of {self._rows}"
+            )
+        # _filled is the row this column has filled up to, so it is also the row
+        # the next band has to start at.
+        if lo != self._filled or hi <= lo:
+            raise RuntimeError(
+                f"aux capture bands must tile one column in order: column {self._col} "
+                f"is filled to row {self._filled}, got [{lo}, {hi})"
+            )
+        if self._filled + (hi - lo) > self._rows:
+            raise RuntimeError(
+                f"aux capture band [{lo}, {hi}) overruns column {self._col} of "
+                f"{self._num_captures}, which holds {self._rows} rows"
             )
         start = self._col * self._feature_size
         self._buffer[lo:hi, start : start + self._feature_size].copy_(hidden)

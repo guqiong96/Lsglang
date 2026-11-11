@@ -293,5 +293,85 @@ class TestBoundCaptureOwnership(CustomTestCase):
                     self.exercise(enabled=custom, custom=custom, callback=callback)
 
 
+class TestAuxCaptureBanding(CustomTestCase):
+    """The super-chunk inner loop hands one capture over in row bands, so the
+    packed bytes must be exactly what the whole-tensor form writes -- and a band
+    sequence that is not a tiling of its column must fail loudly rather than
+    leave allocator bytes, or a re-written row, in the draft model's input."""
+
+    ROWS = 8
+    HIDDEN = 4
+    CAPTURES = 3
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.src = [torch.randn(self.ROWS, self.HIDDEN) for _ in range(self.CAPTURES)]
+        self.reference = torch.cat(self.src, dim=-1)
+
+    def _band(self, packer, order=None, band=2):
+        for index in order or range(self.CAPTURES):
+            source = self.src[index]
+            for lo in range(0, self.ROWS, band):
+                packer.capture(source[lo : lo + band], rows=(lo, lo + band))
+
+    def test_bands_write_the_reference_bytes(self):
+        packer = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        self._band(packer)
+        packed = packer.finalize()
+        self.assertEqual(tuple(packed.shape), (self.ROWS, self.HIDDEN * self.CAPTURES))
+        torch.testing.assert_close(packed, self.reference, rtol=0, atol=0)
+
+    def test_bands_match_the_whole_tensor_form(self):
+        whole = AuxHiddenStatePacker(self.CAPTURES)
+        for source in self.src:
+            whole.capture(source)
+        banded = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        self._band(banded)
+        self.assertTrue(torch.equal(whole.finalize(), banded.finalize()))
+
+    def test_reordering_captures_changes_the_bytes(self):
+        # Keeps the two equality checks above from passing on a packer that
+        # ignores which capture it is writing.
+        packer = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        self._band(packer, order=reversed(range(self.CAPTURES)))
+        self.assertFalse(torch.equal(packer.finalize(), self.reference))
+
+    def test_band_that_skips_rows_raises_instead_of_leaving_holes(self):
+        packer = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        packer.capture(self.src[0][0:4], rows=(0, 4))
+        with self.assertRaisesRegex(RuntimeError, "tile one column in order"):
+            packer.capture(self.src[0][6:8], rows=(6, 8))
+
+    def test_band_that_restarts_a_column_raises_instead_of_rewriting(self):
+        packer = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        packer.capture(self.src[0][0:4], rows=(0, 4))
+        with self.assertRaisesRegex(RuntimeError, "tile one column in order"):
+            packer.capture(self.src[1][0:4], rows=(0, 4))
+
+    def test_band_past_the_buffer_raises(self):
+        packer = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        packer.capture(self.src[0][0:4], rows=(0, 4))
+        with self.assertRaisesRegex(RuntimeError, "overruns column"):
+            packer.capture(self.src[0][4:8], rows=(4, 12))
+
+    def test_partial_capture_finalise_raises(self):
+        short = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        for index in range(self.CAPTURES - 1):
+            for lo in range(0, self.ROWS, 4):
+                short.capture(self.src[index][lo : lo + 4], rows=(lo, lo + 4))
+        with self.assertRaisesRegex(RuntimeError, "captured 2 of 3"):
+            short.finalize()
+
+    def test_mixing_bands_and_whole_tensor_raises(self):
+        banded = AuxHiddenStatePacker(self.CAPTURES, rows=self.ROWS)
+        banded.capture(self.src[0], rows=(0, self.ROWS))
+        with self.assertRaisesRegex(RuntimeError, "mixes whole-tensor and banded"):
+            banded.capture(self.src[1])
+        plain = AuxHiddenStatePacker(self.CAPTURES)
+        plain.capture(self.src[0])
+        with self.assertRaisesRegex(RuntimeError, "built without a row count"):
+            plain.capture(self.src[1], rows=(0, self.ROWS))
+
+
 if __name__ == "__main__":
     unittest.main()
