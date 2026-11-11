@@ -502,6 +502,10 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Log the finished-request mamba checkpoint decision (last/prev track seqlen,
+    # key length -> donated cache_len) so a "cached=0 forever" report can be told
+    # apart from a cache-layer bug.
+    SGLANG_DEBUG_MAMBA_CHECKPOINT = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)

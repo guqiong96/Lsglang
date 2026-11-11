@@ -3,8 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
+import logging
+
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -59,6 +62,8 @@ if TYPE_CHECKING:
         UnifiedTreeNode,
     )
 
+
+logger = logging.getLogger(__name__)
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
@@ -191,6 +196,19 @@ class MambaComponent(TreeComponent):
         if self.has_host_value_only(last_node):
             result = result._replace(
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
+            )
+
+        if envs.SGLANG_DEBUG_MAMBA_CHECKPOINT.get():
+            cd = last_node.component_data[self.component_type]
+            logger.info(
+                "mamba match(tree core): key=%d device_prefix=%d host_hit=%d "
+                "full_kv=%d mamba_boundary=%d best_node=%s dev=%s host=%s "
+                "branching=%s",
+                len(params.key.token_ids), result.device_prefix_len,
+                result.host_hit_length, result.full_kv_hit_length,
+                mamba_boundary_len, last_node.id,
+                cd.value is not None, cd.host_value is not None,
+                branching_seqlen,
             )
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
@@ -552,8 +570,16 @@ class MambaComponent(TreeComponent):
         pool = self.cache.req_to_token_pool
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
         cache_len = req.kv.mamba_last_track_seqlen or 0
+        debug = envs.SGLANG_DEBUG_MAMBA_CHECKPOINT.get()
 
         if cache_len <= token_ids_len:
+            if debug:
+                logger.info(
+                    "mamba checkpoint: rid=%s key=%d last=%s prev=%s slots=%d -> donate %d",
+                    req.rid, token_ids_len, req.kv.mamba_last_track_seqlen,
+                    req.kv.mamba_prev_track_seqlen,
+                    pool.mamba_ping_pong_track_buffer_size, cache_len,
+                )
             return cache_len, keep_idx
 
         # Overshoot: the latest state ran past the key. The other slot always
@@ -564,7 +590,22 @@ class MambaComponent(TreeComponent):
             or previous_cache_len is None
             or previous_cache_len > token_ids_len
         ):
+            if debug:
+                logger.warning(
+                    "mamba checkpoint: rid=%s key=%d last=%s prev=%s slots=%d -> "
+                    "DONATE NOTHING (request stays uncached)",
+                    req.rid, token_ids_len, req.kv.mamba_last_track_seqlen,
+                    previous_cache_len, pool.mamba_ping_pong_track_buffer_size,
+                )
             return None
+        if debug:
+            logger.info(
+                "mamba checkpoint: rid=%s key=%d last=%s prev=%s slots=%d -> "
+                "fallback donate %d",
+                req.rid, token_ids_len, req.kv.mamba_last_track_seqlen,
+                previous_cache_len, pool.mamba_ping_pong_track_buffer_size,
+                previous_cache_len,
+            )
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
     def prepare_for_caching_req(
@@ -659,6 +700,18 @@ class MambaComponent(TreeComponent):
                 insert_result is not None and not insert_result.mamba_exist
             )
             pool = self.cache.req_to_token_pool
+            if envs.SGLANG_DEBUG_MAMBA_CHECKPOINT.get():
+                logger.info(
+                    "mamba cleanup: rid=%s inserted=%s mamba_exist=%s free_before=%s "
+                    "req_slot=%s",
+                    req.rid,
+                    mamba_value_inserted,
+                    None if insert_result is None else insert_result.mamba_exist,
+                    pool.mamba_allocator.available_size(),
+                    None
+                    if req.kv.mamba_pool_idx is None
+                    else int(req.kv.mamba_pool_idx.reshape(-1)[0]),
+                )
 
             if self.int8_ckpt_pool is not None:
                 insert_value_unused = (

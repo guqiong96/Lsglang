@@ -621,6 +621,18 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if envs.SGLANG_DEBUG_MAMBA_CHECKPOINT.get():
+            logger.info(
+                "mamba match: key=%d device=%d host=%d full=%d mamba_hit=%s "
+                "mamba_branch=%s node=%s",
+                len(params.key),
+                result.device_prefix_len,
+                result.host_hit_length,
+                getattr(result, "full_kv_hit_length", None),
+                getattr(result, "mamba_hit_length", None),
+                getattr(result, "mamba_branching_seqlen", None),
+                getattr(result.best_match_node, "id", None),
+            )
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         if _RADIX_DEBUG:
