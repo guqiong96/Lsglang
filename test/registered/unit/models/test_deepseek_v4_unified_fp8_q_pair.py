@@ -165,6 +165,15 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
         # the ROCm model glue is only imported on ROCm; the unified path needs none of it
         patch.object(deepseek_v4, "_hip", _NO_HIP_GLUE),
         patch.object(deepseek_v4, "_is_npu", False),
+        # Pin the group's arch answer. The decode wo_a arm is arch-driven
+        # (``fuse_inv_rope=_tp_all("sm8")``), so left alone this file would
+        # follow whichever GPU the runner happens to have: on an SM86 box it
+        # takes the fused inverse-RoPE grouped einsum, which asserts the real
+        # 512-wide head and dies on these toy shapes; on any other host it takes
+        # the plain einsum. False is the arm these assertions were written for
+        # -- the standalone rope pass the ``fused_rope_inplace`` patch above
+        # stands in for.
+        patch.object(deepseek_v4, "_tp_all", lambda pred: False),
     ):
         layer.forward(
             torch.zeros(TOKENS, 4, dtype=torch.bfloat16),
