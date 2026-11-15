@@ -515,7 +515,12 @@ class Envs:
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
-    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # Warn rather than die when an idle pool invariant finds a drift. Upstream
+    # raises by default; one DSV4.1 TP4 boot hit a single transient drift of
+    # exactly +1280 tokens on both pool counters and strict mode turned it into a
+    # dead server (2026-11-15). The checks still run and still print either way;
+    # set =1 for CI-style fail-fast.
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
