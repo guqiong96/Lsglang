@@ -1,3 +1,43 @@
+# lsglang 1.7.7 (from 1.7.6)
+
+Needs lk_moe 2.8.5.
+
+```
+pip install lsglang==1.7.7
+```
+
+## Correctness fixes
+
+- **Mixed-GPU tensor-parallel groups no longer hang.** A machine that mixes GPU
+  generations (e.g. RTX 3090 with RTX 5000/6000-class) used to decide which
+  communication graphs to capture by reading the GPU generation card by card. One
+  disagreeing card made the cards capture different graphs, which showed up either as
+  a hang at startup or as a decode that silently stops with the GPUs busy. Every
+  decision that changes the communication pattern is now taken once for the whole
+  group, at startup; the answer every card can execute wins. Uniform-GPU machines get
+  their own local answer and are unaffected.
+- **Speculative decode no longer stalls mid-request.** Two draft-model code paths
+  loaded their device code the first time a decode step touched them, so whichever
+  request hit them first stalled in the middle of its decode. Both paths are now
+  loaded at startup -- the eager draft path at init, the QSA draft-graph metadata at
+  the end of graph capture -- before any request is served.
+
+## Logprobs
+
+- Every launch recipe now sets `SGLANG_LOGPROB_CHUNK_SIZE` to a value the card fits
+  (the default of 2048 does not fit a 24 GB card, and a logprobs request could
+  exhaust memory while computing it).
+
+## Memory diagnostics
+
+- The idle pool-leak check warns instead of exiting by default: if a KV pool's
+  token ledger drifts, the server logs the numbers and keeps serving. Set
+  `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=1` to restore fail-fast (a check
+  that exits also kills a server that was still perfectly usable).
+- Setting `SGLANG_DEBUG_POOL_LEDGER=1` logs every change to the KV cache's
+  evictable/protected counters together with the transition that caused it. Off by
+  default, and verbose -- use it when the leak warning appears.
+
 # lsglang 1.7.6 (from 1.7.5)
 
 Needs lk_moe 2.8.5.
