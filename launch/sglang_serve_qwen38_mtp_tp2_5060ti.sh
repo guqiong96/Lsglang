@@ -16,6 +16,14 @@ else
     exec >> "$LOG" 2>&1
 fi
 # Qwen3.8-Flash-Next-NVFP4 · 2× RTX 5060 Ti (SM120), TP2, MTP speculative decode (NEXTN).
+#
+# SGLANG_LOGPROB_CHUNK_SIZE=256 exists because the default does not fit this card.
+# Input-logprob requests (the quality gate computes NLL/PPL) cut at
+# min(chunk_size, chunked_prefill_size) = 1024 rows, and one row is the whole vocab
+# in fp32: 1024 * 248320 * 4 = 970 MiB for a single `logits.float()`. Measured
+# 2026-11-15: that is exactly the allocation that killed the server at
+# --mem-fraction-static 0.82 (OOM with 544 MiB free), so the gate could not run at
+# all. 256 rows is 242 MiB and the numbers are unchanged -- it is a staging size.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLIBC_TUNABLES=glibc.malloc.thp_enabled=0 \
@@ -39,6 +47,7 @@ LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_GPU_RESIDENT_MOE_LAYERS_SPEC="" \
 LK_POOL_SLOTS=16 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+SGLANG_LOGPROB_CHUNK_SIZE=256 \
 sglang serve --sleep-on-idle \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4 \

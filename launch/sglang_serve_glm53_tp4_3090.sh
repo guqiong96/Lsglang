@@ -39,6 +39,7 @@ LK_GPU_RESIDENT_MOE_LAYERS="" \
 LK_POOL_SLOTS=0 \
 FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+SGLANG_LOGPROB_CHUNK_SIZE=256 \
 sglang serve --sleep-on-idle \
   --model ~/Models/GLM-5.3-Flash-NVFP4 \
   --served-model-name GLM-5.3-Flash-NVFP4 \

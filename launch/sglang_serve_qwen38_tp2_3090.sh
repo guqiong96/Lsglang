@@ -43,6 +43,7 @@ LK_GPU_RESIDENT_MOE_LAYERS_MTP=0 \
 LK_POOL_SLOTS=69 \
 FLASHINFER_USE_CUDA_NORM=1 \
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+SGLANG_LOGPROB_CHUNK_SIZE=256 \
 sglang serve --sleep-on-idle \
   --model ~/Models/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4 \
