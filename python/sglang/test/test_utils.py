@@ -237,14 +237,18 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+# The first visible device index, used only to spread test-server ports across
+# concurrent jobs. An empty CUDA_VISIBLE_DEVICES -- the usual way to hide every
+# GPU, e.g. when running the CPU suite on a box that has cards in it -- has no
+# [0], and indexing it raised IndexError at import time, taking every test file
+# that imports this module down with it. Same value as before for any non-empty
+# setting, including the multi-index form (the first character, as before).
+_FIRST_VISIBLE_DEVICE = int((os.environ.get("CUDA_VISIBLE_DEVICES") or "0").strip()[:1] or 0)
+
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _FIRST_VISIBLE_DEVICE * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _FIRST_VISIBLE_DEVICE * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
