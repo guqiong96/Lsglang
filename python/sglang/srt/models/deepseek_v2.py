@@ -62,6 +62,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_glm_moe_dsa,
 )
+from sglang.srt.distributed.arch_consensus import prewarm_tp_arch_predicates, tp_all
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -625,45 +626,9 @@ class MergedMoEOutput(MoEOutput):
         return self.routed
 
 
-_TP_ARCH_CACHE: dict[str, bool] = {}
-
-
-def _tp_all(pred: str) -> bool:
-    """Whether EVERY rank in the TP group satisfies an arch predicate.
-
-    ``_fuse_finalize_all_reduce`` and friends decide a communication op that is
-    captured into the CUDA graph. In a heterogeneous TP group (e.g. SM86 +
-    SM120) a per-rank ``get_platform()`` value makes one rank emit a fused
-    finalize all-reduce and its peers a plain one, so the captures diverge and
-    warmup deadlocks on the first small-M (<=8) decode/verify graph. Resolving
-    the decision on a group-wide AND keeps every rank's graph identical;
-    homogeneous hosts get back their own local value. Mirrors the same helper
-    in ``deepseek_v4`` (kept local to avoid a circular import).
-    """
-    cached = _TP_ARCH_CACHE.get(pred)
-    if cached is not None:
-        return cached
-    plat = get_platform()
-    local = {
-        "blackwell": bool(plat.is_blackwell),
-    }[pred]
-    group = get_parallel().tp_group
-    world = getattr(group, "world_size", 1)
-    if (
-        world > 1
-        and torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-    ):
-        flag = torch.tensor(
-            [1 if local else 0], dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        torch.distributed.all_reduce(flag, group=group.device_group)
-        result = int(flag.item()) == world
-    else:
-        result = local
-    _TP_ARCH_CACHE[pred] = result
-    return result
-
+# One group-wide arch consensus for every model that can land in a
+# heterogeneous TP group; see designs/hetero_tp_decision_doctrine.md.
+_tp_all = tp_all
 
 class DeepseekV2MoE(nn.Module):
     def __init__(

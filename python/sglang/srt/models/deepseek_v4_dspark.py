@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.arch_consensus import tp_all as _tp_all
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -137,7 +138,10 @@ class DSparkAttention(MqaAttentionBase):
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
-        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        # Group-wide, not per rank: the limit decides which captured decode
+        # graphs overlap their KV store on a second stream, so a mixed TP
+        # group has to agree on it. Homogeneous groups get the local value.
+        self._multi_stream_bs_limit = 128 if _tp_all("blackwell") else 64
         if _is_npu:
             self.register_buffer(
                 "_q_post_norm_weight",
@@ -763,7 +767,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             torch.cuda.Stream()
             if use_multi_stream
             and torch.version.cuda is not None
-            and get_platform().is_blackwell
+            and _tp_all("blackwell")
             and getattr(config, "hc_pre_from_prev_sublayer", False)
             else None
         )

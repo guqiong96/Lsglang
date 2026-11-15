@@ -16,6 +16,9 @@ else
     exec >> "$LOG" 2>&1
 fi
 # DeepSeek-V4.1-Flash-1017 · 2× RTX 3090 (SM86), 2x RTX 5060Ti, TP4.
+# A mixed arch group on purpose: that is what exercises the group-wide arch
+# predicates, and the only place a per-rank answer would quietly capture different
+# graphs on the two halves.
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 GLOO_SOCKET_IFNAME=lo NCCL_SOCKET_IFNAME=lo \

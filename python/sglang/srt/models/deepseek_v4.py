@@ -46,6 +46,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.arch_consensus import prewarm_tp_arch_predicates, tp_all
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -207,7 +208,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_pp_layers,
 )
-from sglang.srt.utils.common import is_sm80_supported, is_sm120_supported, is_lk_engram_nvme_enabled
+from sglang.srt.utils.common import is_lk_engram_nvme_enabled
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -788,64 +789,9 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
     return x_quant, x_bf16
 
 
-@functools.lru_cache(maxsize=1)
-def _IS_SM8() -> bool:
-    # SM80/SM86/SM89 (Ampere): no FP8 tensor cores, so the fp8 wo_a einsum is off
-    # and the decode wo_a low-rank is a bf16 grouped einsum with a fused inverse
-    # RoPE (see deepseek_v4_wo_a_einsum.py). Lazy (not module-level): the probes
-    # key on the *current* device, which is only set per-rank after import in
-    # mixed-arch TP (SM86 + SM120).
-    return is_sm80_supported() and not is_sm120_supported()
-
-
-_TP_ARCH_CACHE: Dict[str, bool] = {}
-
-
-def _tp_all(pred: str) -> bool:
-    """Whether EVERY rank in the TP group satisfies an arch predicate.
-
-    Arch capability decides which kernel / stream structure each rank's forward
-    uses (hc_mix split-K, mhc_post split-h, alt_streams overlap, ...). A
-    heterogeneous TP group (e.g. SM86 + SM120) must make that decision on a
-    group-wide AND so every rank emits the same graph; the per-rank
-    ``get_platform()`` value would otherwise diverge the captures and deadlock
-    warmup on the first Blackwell-only Triton load. Homogeneous hosts get back
-    their own local value, so nothing changes there.
-
-    Resolved on first call by a single int32 all-reduce (sum); prewarm
-    ``_tp_all`` for every predicate once at model init so the collective never
-    lands inside a CUDA graph.
-    """
-    cached = _TP_ARCH_CACHE.get(pred)
-    if cached is not None:
-        return cached
-    plat = get_platform()
-    local = {
-        "blackwell": bool(plat.is_blackwell),
-        "sm90": bool(plat.is_sm90),
-        "hopper_or_blackwell": bool(plat.is_sm90 or plat.is_blackwell),
-        # Ampere/Ada-only forward shape (e.g. fusing inverse-RoPE into the wo_a
-        # einsum on SM8 decode). Group AND keeps it off on a mixed host so the
-        # SM86 ranks don't skip the standalone rope the SM120 ranks still run.
-        "sm8": bool(_IS_SM8()),
-    }[pred]
-    group = get_parallel().tp_group
-    world = getattr(group, "world_size", 1)
-    if (
-        world > 1
-        and torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-    ):
-        flag = torch.tensor(
-            [1 if local else 0], dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        torch.distributed.all_reduce(flag, group=group.device_group)
-        result = int(flag.item()) == world
-    else:
-        result = local
-    _TP_ARCH_CACHE[pred] = result
-    return result
-
+# One group-wide arch consensus for every model that can land in a
+# heterogeneous TP group; see designs/hetero_tp_decision_doctrine.md.
+_tp_all = tp_all
 
 def prewarm_block_fp8_linear_kernels(root: torch.nn.Module) -> None:
     """Warm every block-fp8 quant linear under *root* at the real captured M.
@@ -4113,8 +4059,7 @@ class DeepseekV4Model(nn.Module):
         # Warm every arch predicate the captured forward branches on so the
         # group-wide AND's all-reduce lands here (outside any CUDA graph), never
         # on the first capture-path call. See ``_tp_all``.
-        for _pred in ("blackwell", "sm90", "hopper_or_blackwell", "sm8"):
-            _tp_all(_pred)
+        prewarm_tp_arch_predicates()
         self.engram_layout = EngramLayout.from_config(config)
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
