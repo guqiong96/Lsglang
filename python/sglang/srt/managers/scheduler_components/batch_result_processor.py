@@ -1470,6 +1470,20 @@ class SchedulerBatchResultProcessor:
 
         # no_buffer donates the live state, which cannot be shortened with the key.
         if req.owned_kv_len() != req.kv.kv_committed_len:
+            if envs.SGLANG_DEBUG_MAMBA_CHECKPOINT.get():
+                logger.info(
+                    "mamba cache insert skipped: rid=%s owned_kv_len=%d "
+                    "kv_committed_len=%d delta=%d correct_drafts=%s",
+                    req.rid,
+                    req.owned_kv_len(),
+                    req.kv.kv_committed_len,
+                    req.owned_kv_len() - req.kv.kv_committed_len,
+                    (
+                        result.num_correct_drafts_per_req_cpu[i]
+                        if result.num_correct_drafts_per_req_cpu is not None
+                        else None
+                    ),
+                )
             return False
 
         retained = result.grammar_retained_tokens
