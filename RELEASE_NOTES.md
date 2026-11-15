@@ -12,9 +12,12 @@ pip install lsglang==1.7.6
   skipped rows left allocator bytes in the draft model's input, and one that overlapped
   rewrote rows that were already correct; both are refused instead of silently handing
   the model wrong hidden states.
-- **DeepSeek-V4.1 with DSPARK and bounded replay boots again.** Those recipes used to
-  build a capture packer sized for CAP rows, then refuse to write the replay tail; the
-  layer loop and the collector now read the same tail predicate.
+- **DeepSeek-V4.1 with DSPARK and bounded replay no longer crashes on long requests.**
+  Those recipes built a capture packer sized for CAP rows and then refused to write the
+  replay tail, so the first request large enough to enter the super-chunk inner loop died
+  with "DSPARK capture lost its super-chunk plan mid-forward"; short requests never got
+  there and boot was fine. The layer loop and the collector now read the same tail
+  predicate.
 
 ## QSA K/V host offload (Qwen3.8)
 
