@@ -100,8 +100,11 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
+    draft_prewarm_batch_sizes,
+    draft_track_intervals,
     prepare_for_draft,
     prepare_for_draft_extend,
+    prewarm_draft_step_path,
     run_eagle_verify,
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
@@ -635,6 +638,52 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
+        # Device-load the eager draft kernels first, before anything is captured and
+        # before an early return can skip it: graph capture covers the draft forward,
+        # but prepare_for_draft, the verify-input build and the verify-commit outputs
+        # run outside the graph and specialize on the step count, and nothing else
+        # runs them at init. Their first launch then lands in a served step -- 510 ms
+        # when it is merely slow, a wedged TP group when it lands while the peer rank
+        # is parked in a collective. This runs on the eager path too, which is why it
+        # sits above the graph-backend early returns.
+        if self.topk == 1 and torch.cuda.is_available():
+            server_args = getattr(self.draft_runner, "server_args", None)
+            # Page size from the KV allocator, the same source `prepare_for_draft`
+            # reads (`batch.token_to_kv_pool_allocator.page_size`). It is NOT on the
+            # server args in this tree, and reading a missing attribute there returns
+            # None, which silently collapses the track-interval set to {0} -- the
+            # exact gap this warm-up exists to close, hidden again.
+            page_size = getattr(
+                getattr(
+                    self.target_worker.model_runner,
+                    "token_to_kv_pool_allocator",
+                    None,
+                ),
+                "page_size",
+                None,
+            )
+            track_intervals = draft_track_intervals(page_size)
+            req_to_token = self.draft_runner.req_to_token_pool.req_to_token
+            launches = prewarm_draft_step_path(
+                req_to_token,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                batch_sizes=draft_prewarm_batch_sizes(
+                    getattr(server_args, "max_running_requests", None)
+                ),
+                track_intervals=track_intervals,
+            )
+            if launches:
+                log_info_on_rank0(
+                    logger,
+                    f"Prewarmed {launches} eager draft kernel launch(es) for "
+                    f"steps={self.speculative_num_steps}, "
+                    f"draft_tokens={self.speculative_num_draft_tokens}, "
+                    f"bs up to {getattr(server_args, 'max_running_requests', None)}, "
+                    f"page_size={page_size}, track intervals {track_intervals}.",
+                )
+
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
@@ -790,6 +839,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+
+        # Device-load the QSA draft-graph metadata kernel now that capture has built
+        # the per-batch-size metadata it is launched with from the replay path. See
+        # QwenSparseMultiStepDraftBackend.prewarm_draft_graph_metadata.
+        warm = getattr(self.draft_attn_backend, "prewarm_draft_graph_metadata", None)
+        if warm is not None:
+            launches = warm()
+            if launches:
+                log_info_on_rank0(
+                    logger,
+                    f"Graph capture: prewarmed {launches} QSA draft-graph metadata "
+                    f"launch(es) on {type(self.draft_attn_backend).__name__}.",
+                )
 
     @_spec_probe.stage("draft")
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):

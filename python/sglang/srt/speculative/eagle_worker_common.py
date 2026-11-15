@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+import math
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
 
@@ -22,7 +23,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.runtime_context import (
+    get_server_args,
+    mamba_cache_chunk_size,
+    mamba_track_grid,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -241,6 +246,207 @@ def prepare_for_draft_extend(
     return forward_batch
 
 
+def draft_window_cols(
+    *, topk: int, num_steps: int, num_draft_tokens: Optional[int], plans_window: bool
+) -> int:
+    """Columns the draft-cache-loc kernel copies for one draft iteration.
+
+    One function because this number also selects the Triton specialization:
+    `window_cols` is a `tl.constexpr`, so a warm-up that derives it differently from
+    the served path compiles and loads a different binary, which is worse than not
+    warming at all — it looks covered.
+    """
+    return int(num_draft_tokens) if plans_window else int(num_steps)
+
+
+def launch_assign_draft_cache_locs(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    topk: int,
+    window_cols: int,
+    positions: Optional[torch.Tensor],
+    mrope: Optional[torch.Tensor],
+    bs: int,
+) -> None:
+    """The single call site of the draft-cache-loc Triton kernel.
+
+    Kept as a function so the warm-up and the served step cannot disagree about
+    which specialization gets compiled: the constexprs (`BS`, `window_cols`, and
+    `pool_len` from the table's row width) and the int arguments Triton keys on all
+    come from here.
+    """
+    assign_draft_cache_locs_contiguous[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        req_to_token.shape[1],
+        topk,
+        window_cols,
+        positions=positions,
+        mrope=mrope,
+        BS=bs,
+        WRITE_POSITIONS=positions is not None,
+        WRITE_MROPE=mrope is not None,
+    )
+
+
+def draft_prewarm_batch_sizes(max_running_requests: Optional[int]) -> tuple[int, ...]:
+    """Every batch size whose draft kernels Triton compiles separately.
+
+    Triton specializes an int argument three ways: the value 1 becomes a constant, a
+    multiple of 16 gets the divisibility hint, and everything else shares one binary.
+    The draft kernels also take DERIVED ints — bs * window_cols, bs * row stride —
+    whose class is not the class of bs: bs=2 gives 8 (the generic binary) while bs=4
+    gives 16 (divisible, its own), so a {1, 2, 16} shortcut serves bs=4 with a module
+    nobody loaded. Up to 16 this list is therefore exhaustive rather than clever;
+    above 16 it falls back to powers of two, which is the honest limit of the
+    argument above and the point where startup cost starts to matter.
+    """
+    cap = int(max_running_requests or 0)
+    if cap <= 0:
+        return (1,)
+    if cap <= 16:
+        return tuple(range(1, cap + 1))
+    return tuple(
+        sorted(set(range(1, 17)) | {p for p in (32, 64, 128, 256) if p <= cap})
+    )
+
+
+def draft_track_intervals(page_size: Optional[int]) -> tuple[int, ...]:
+    """The `mamba_track_interval` values the verify-commit kernel is called with.
+
+    `TRACK_INTERVAL` is a `tl.constexpr` there: the served path passes
+    `mamba_track_grid(page_size)` for a batch carrying track indices and 0 for one
+    that does not, so both are live specializations. `mamba_track_grid` reads the
+    execution config, which is not entered during engine init, so when it is
+    unavailable the same value is derived from the server args instead of being
+    skipped: covering only 0 leaves the served call to device-load a module mid-step,
+    which is the hazard this whole warm-up exists to remove.
+    """
+    if not page_size:
+        return (0,)
+    intervals = {0}
+    try:
+        intervals.add(int(mamba_track_grid(int(page_size))))
+    except Exception:
+        # mamba_track_grid(tree_page) = lcm(mamba_checkpoint_grid(tree_page),
+        # mamba_track_interval), and mamba_checkpoint_grid needs only the server args.
+        grid = math.lcm(int(mamba_cache_chunk_size()), int(page_size))
+        args = get_server_args()
+        intervals.add(
+            int(math.lcm(grid, int(getattr(args, "mamba_track_interval", 0) or 0)))
+        )
+    return tuple(sorted(intervals))
+
+
+def prewarm_draft_step_path(
+    req_to_token: torch.Tensor,
+    *,
+    topk: int,
+    num_steps: int,
+    num_draft_tokens: Optional[int],
+    batch_sizes: Sequence[int] = (1,),
+    track_intervals: Sequence[int] = (0,),
+) -> int:
+    """Device-load every eager kernel one decode step launches, before serving.
+
+    Graph capture covers the draft forward, but `prepare_for_draft`, the verify-input
+    build and the verify-commit outputs run OUTSIDE the graph, and they specialize on
+    the step count and draft width (`tl.constexpr`). Nothing runs them at init, so the
+    first served step pays their first launch: measured 510 ms against 0.03 ms once
+    warm. That is merely slow until it lands in a TP-synchronized step while the peer
+    rank is parked in a collective — then `cuModuleLoadData` wedges the group, both
+    schedulers at 100% CPU inside libcuda with the GPUs idle (this signature killed a
+    qwen3.8 boot on 2x5060 Ti on 2026-10-18 and several boots on 2026-11-15).
+
+    Coverage has to match what Triton actually keys on, not just call each kernel
+    once: batch size is an int argument (warming bs=1 does not warm bs=2), and
+    argument dtype and stride are part of the key, so every dummy below is built the
+    way the served call site builds it — bonus tokens int32 from the fused commit
+    path and int64 from sampling, draft tokens int64 from the drafter and int32 from
+    the graph output, mrope on and off.
+
+    Dummy inputs are zero-filled indices: the kernels read table row 0 and write only
+    their own scratch, so nothing in the pools is disturbed.
+    """
+    if not req_to_token.is_cuda:
+        return 0
+    device = req_to_token.device
+    width = int(num_draft_tokens) if num_draft_tokens else int(num_steps) + 1
+    # Both layouts the served path can pick: the window plan (translator present and
+    # num_draft_tokens > num_steps) or the plain num_steps copy. Warming one of them
+    # is what a wrong assumption about `plans_window` would buy.
+    window_variants = sorted({int(num_steps), width})
+    launches = 0
+    for bs in sorted({max(1, int(b)) for b in batch_sizes}):
+        if req_to_token.shape[1] <= bs * max(window_variants) + 1:
+            continue
+        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device=device)
+        seq_lens = torch.zeros(bs, dtype=torch.int64, device=device)
+        for window_cols in window_variants:
+            out_cache_loc = torch.empty(
+                (bs * topk * window_cols,), dtype=torch.int64, device=device
+            )
+            positions = torch.empty((bs * topk,), dtype=torch.int64, device=device)
+            for mrope in (None, torch.zeros((3, bs), dtype=torch.int64, device=device)):
+                launch_assign_draft_cache_locs(
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=req_to_token,
+                    seq_lens=seq_lens,
+                    out_cache_loc=out_cache_loc,
+                    topk=topk,
+                    window_cols=window_cols,
+                    positions=positions,
+                    mrope=mrope,
+                    bs=bs,
+                )
+                launches += 1
+        # The chain-tree builder is the verify-input kernel of a chain draft. Its
+        # dtypes follow the two producers named above, and it allocates its own mask
+        # when given None, which is the same launch the served path makes first.
+        for bonus_dtype in (torch.int32, torch.int64):
+            for draft_dtype in (torch.int64, torch.int32):
+                for with_mrope in (True, False):
+                    build_chain_tree(
+                        torch.zeros((bs,), dtype=bonus_dtype, device=device),
+                        torch.zeros(
+                            (bs, num_steps), dtype=draft_dtype, device=device
+                        ),
+                        seq_lens,
+                        None,
+                        req_pool_indices=req_pool_indices,
+                        req_to_token=req_to_token,
+                        with_mrope=bool(with_mrope),
+                    )
+                    launches += 1
+        # Draft extend runs on the next prefill and specializes on the draft width.
+        for with_mrope in (True, False):
+            prepare_draft_extend_lengths(seq_lens, width, 0)
+            prepare_draft_extend_layout(seq_lens, width, bool(with_mrope))
+            launches += 2
+        # The verify-commit kernel derives the accepted-token bookkeeping; its inputs
+        # are eagle_sample's outputs: predict is the flattened int32 token row,
+        # accept_index is (bs, width) int32 filled with -1, accept_lens is int32.
+        predict = torch.zeros((bs * width,), dtype=torch.int32, device=device)
+        accept_index = torch.full((bs, width), -1, dtype=torch.int32, device=device)
+        accept_lens = torch.zeros((bs,), dtype=torch.int32, device=device)
+        for interval in track_intervals:
+            prepare_verify_commit_outputs(
+                predict,
+                accept_index,
+                accept_lens,
+                seq_lens,
+                num_draft_tokens=width,
+                mamba_track_interval=int(interval),
+            )
+            launches += 1
+    return launches
+
+
 def prepare_for_draft(
     draft_input: EagleDraftInput,
     req_to_token_pool: ReqToTokenPool,
@@ -274,7 +480,12 @@ def prepare_for_draft(
         )
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
-        window_cols = num_draft_tokens if plans_window else num_steps
+        window_cols = draft_window_cols(
+            topk=topk,
+            num_steps=num_steps,
+            num_draft_tokens=num_draft_tokens,
+            plans_window=plans_window,
+        )
         if page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * window_cols,),
@@ -301,19 +512,16 @@ def prepare_for_draft(
                             (3, bs), dtype=torch.int64, device=batch.device
                         )
                 # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    window_cols,
+                launch_assign_draft_cache_locs(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    seq_lens=batch.seq_lens,
+                    out_cache_loc=batch.out_cache_loc,
+                    topk=topk,
+                    window_cols=window_cols,
                     positions=prepared_positions,
                     mrope=prepared_mrope_positions,
-                    BS=bs,
-                    WRITE_POSITIONS=prepared_positions is not None,
-                    WRITE_MROPE=prepared_mrope_positions is not None,
+                    bs=bs,
                 )
             if plans_window:
                 kv_loc_plan = target_translator.plan(

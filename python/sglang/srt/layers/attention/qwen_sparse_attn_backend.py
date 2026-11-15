@@ -2113,6 +2113,68 @@ class QwenSparseMultiStepDraftBackend:
             for _ in range(speculative_num_steps - 1)
         ]
 
+    def prewarm_draft_graph_metadata(self) -> int:
+        """Device-load the draft-graph metadata kernel for every captured batch size.
+
+        The served step resolves this launch lazily, per batch size, on the first
+        step that uses one (`_draft_graph_metadata_args`). Graph capture does not
+        load it either: the kernel is launched from the replay path with those cached
+        arguments, so nothing before serving ever launches it and the first step at
+        each batch size pays a ``cuModuleLoadData``. In a TP-synchronized step with
+        the peer rank already parked in a collective that is not a slow compile -- it
+        wedges the group, both schedulers spinning in libcuda with the GPUs idle.
+
+        The buffers are clones. The kernel writes the compressed page tables that
+        replay reads, so a warm-up must not touch them.
+        """
+        if not self.attn_backends or not self.attn_backends[0].req_to_token.is_cuda:
+            return 0
+        from sglang.srt.layers.attention.qsa.graph_metadata import (
+            launch_draft_graph_metadata,
+            prepare_draft_graph_metadata,
+        )
+
+        first = self.attn_backends[0]
+        device = first.req_to_token.device
+        # The buckets capture actually built: a batch size with no graph cannot be
+        # served from the replay path, so warming it would load a module nothing uses.
+        buckets = sorted(
+            bs
+            for mode, bs in first._cuda_graph_metadata
+            if mode == ForwardMode.DECODE
+        )
+        launches = 0
+        for bs in buckets:
+            try:
+                metadata = tuple(
+                    backend._cuda_graph_metadata[(ForwardMode.DECODE, bs)]
+                    for backend in self.attn_backends
+                )
+                args = prepare_draft_graph_metadata(
+                    metadata,
+                    first.req_to_token,
+                    metadata[0].indexer_metadata.token_to_kv_pool,
+                )
+            except KeyError:
+                continue
+            buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+            launch_draft_graph_metadata(
+                (
+                    tuple(tuple(buffer.clone() for buffer in group) for group in buffers),
+                    req_to_token,
+                    row_stride,
+                    max_pages,
+                    ratio,
+                    full_page,
+                ),
+                torch.zeros(bs, dtype=torch.int64, device=device),
+                torch.zeros(bs, dtype=torch.int64, device=device),
+                bs,
+                0,
+            )
+            launches += 1
+        return launches
+
     @staticmethod
     def _as_cpu_lengths(seq_lens_cpu, seq_lens: torch.Tensor) -> torch.Tensor:
         if seq_lens_cpu is None:
