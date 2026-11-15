@@ -16,6 +16,11 @@ from unittest import mock
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+import sys
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 PATH = str(Path(__file__).with_name("test_unified_radix_cache_unittest.py"))
 
 
@@ -70,3 +75,6 @@ def test_zero_cache_len_skips_the_insert(uc):
         cache.checkpoint_into_tree(req, up_to=len(tokens))
 
     assert not insert.called, "a zero cache length must not reach cache.insert()"
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

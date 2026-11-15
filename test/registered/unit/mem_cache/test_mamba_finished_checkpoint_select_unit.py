@@ -15,6 +15,10 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.test.ci.ci_register import register_cpu_ci
+import sys
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _component(buffer_size=2):
@@ -71,3 +75,6 @@ class TestSelectFinishedCheckpoint:
         assert _select(17920, 17664, 17920) == (17920, 0)
         assert _select(18176, 17920, 17920) == (17920, 1)
         assert _select(18176, None, 17920) is None
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
