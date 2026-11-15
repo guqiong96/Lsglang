@@ -94,6 +94,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class _TracedSizes(dict):
+    """`{component: tokens}` that reports every mutation under one env flag.
+
+    The idle pool-leak invariant is checked per pool (available + evictable +
+    protected + session_held + uncached == total), and when it fails the counters say
+    by how much the ledger drifted but not which transition drifted it -- twelve
+    places across the components add to and subtract from these two dicts, including
+    ones added after this comment. Wrapping the dict covers all of them, because every
+    mutation is `d[ct] += x` / `d[ct] -= x` on the object itself.
+
+    Off by default: this is one log line per mutation, which on a served box is more
+    than the rest of the log combined.
+    """
+
+    __slots__ = ("_ledger_name",)
+
+    def __init__(self, ledger_name: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ledger_name = ledger_name
+
+    def __setitem__(self, key, value) -> None:
+        if envs.SGLANG_DEBUG_POOL_LEDGER.get():
+            old = self.get(key, 0)
+            frame = sys._getframe(1)
+            logger.info(
+                "pool ledger %s[%s]: %s -> %s (%+d) at %s:%d in %s",
+                self._ledger_name,
+                getattr(key, "name", key),
+                old,
+                value,
+                value - old,
+                frame.f_code.co_filename.rsplit("/", 1)[-1],
+                frame.f_lineno,
+                frame.f_code.co_name,
+            )
+        super().__setitem__(key, value)
+
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
 # the TP consistency check can still all_reduce [digest, -digest] in int64.
@@ -509,8 +547,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for ct in self.component_types:
             self.root_node.component_data[ct].lock_ref = 1
 
-        self.component_evictable_size_ = {ct: 0 for ct in self.component_types}
-        self.component_protected_size_ = {ct: 0 for ct in self.component_types}
+        self.component_evictable_size_ = _TracedSizes(
+            "evictable", {ct: 0 for ct in self.component_types}
+        )
+        self.component_protected_size_ = _TracedSizes(
+            "protected", {ct: 0 for ct in self.component_types}
+        )
 
         self.lru_lists = {
             ct: UnifiedLRUList(

@@ -521,6 +521,11 @@ class Envs:
     # dead server (2026-11-15). The checks still run and still print either way;
     # set =1 for CI-style fail-fast.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(False)
+    # Trace every mutation of the unified cache's per-component evictable/protected
+    # counters (see _TracedSizes). The idle pool-leak invariant reports the size of a
+    # drift but not which transition caused it, and twelve places add and subtract
+    # those counters. Off by default: one line per mutation is a lot of lines.
+    SGLANG_DEBUG_POOL_LEDGER = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
