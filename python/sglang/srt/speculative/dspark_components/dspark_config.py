@@ -322,3 +322,16 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
     )
+
+
+def dspark_stage_count(dspark_config: DSparkDraftConfig,
+                       draft_hf_config: Any) -> int:
+    # THE number of platform stages a bundled DSpark draft instantiates. Each
+    # stage is one MoE decoder layer of DeepseekV4ForCausalLMDSpark, so this is
+    # also how many MoE layers the draft contributes. ONE derivation, read by
+    # the model class itself AND by the pool registry record that must know the
+    # draft's presence before its layers are constructed (the pool's global
+    # region is sized by the first lk_moe ctor, which can run first).
+    if dspark_config.target_layer_ids is not None:
+        return len(dspark_config.target_layer_ids)
+    return int(getattr(draft_hf_config, "num_nextn_predict_layers", 1) or 1)

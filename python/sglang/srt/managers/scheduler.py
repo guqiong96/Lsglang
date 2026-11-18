@@ -1009,6 +1009,55 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync()
 
     def init_tp_model_worker(self):
+        if not self.spec_algorithm.is_none():
+            # The FIRST lk_moe ctor -- the one that sizes the expert pool's
+            # global region for main + draft -- runs during the TARGET's
+            # weight post-processing, tens of seconds before the draft worker
+            # is even constructed. Record the draft's MoE layer count now,
+            # through the framework's own draft-config derivation, so region
+            # sizing never races the draft's construction order.
+            from sglang.srt.managers.tp_worker import (
+                _record_draft_pool_members,
+            )
+
+            draft_path = get_spec().speculative_draft_model_path
+            from sglang.srt.utils.lk_moe_env import get_pool_log as _get_pool_log
+            if _get_pool_log() > 0:
+                logger.info("[pool] registry-spec-early spec=%s draft_path=%s",
+                            self.spec_algorithm, draft_path)
+            if draft_path:
+                _record_draft_pool_members(
+                    ModelConfig.from_server_args(
+                        self.server_args,
+                        model_path=draft_path,
+                        model_revision=get_spec(
+                        ).speculative_draft_model_revision,
+                        is_draft_model=True,
+                    )
+                )
+            else:
+                # BUNDLED draft: Qwen3.5-Moe / InternS2 style checkpoints carry
+                # their MTP layers INSIDE the target checkpoint (mtp.* weights) and
+                # declare no separate draft path. Without this branch the registry
+                # stayed at the main count, the ONE region was laid one cell short,
+                # and the draft's tier refused it: "41 counted members here but the
+                # ONE global region was laid for 40" (measured 2026-11-17 on
+                # Qwen3.6-35B-A3B-NVFP4, main NVFP4 + draft BF16). The draft
+                # worker applies ModelConfig's draft rewrite to the TARGET path, so
+                # doing the same here yields the same count -- the rewrite is what
+                # makes arch endswith("MTP") and num_nextn_predict_layers true.
+                try:
+                    _record_draft_pool_members(
+                        ModelConfig.from_server_args(
+                            self.server_args,
+                            model_path=self.server_args.model_path,
+                            is_draft_model=True,
+                        )
+                    )
+                except Exception as e:      # a draftless algorithm (NGRAM) is fine
+                    if _get_pool_log() > 0:
+                        logger.info("[pool] registry-spec-early: bundled draft probe"
+                                    " skipped (%s)", e)
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=get_device().gpu_id,

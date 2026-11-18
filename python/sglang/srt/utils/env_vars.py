@@ -43,4 +43,11 @@ def set_int_env_var(name: str, value: int):
 
 
 def get_str_env_var(var_name: str, default: str | None = None) -> str:
-    return os.getenv(var_name, default) 
+    val = os.getenv(var_name)
+    if val is None:
+        val = ""
+    if default is None:
+        default = ""
+    val = val.strip()
+    return val or default
+    

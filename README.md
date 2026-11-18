@@ -240,6 +240,7 @@ flashinfer's CuTe kernels are SM12x-only. Source of truth:
 | Env var | Type | Default | Description |
 |--------|------|--------|------|
 | `LK_POOL_SLOTS` | pool | 0 = off | **GPU Pool switch AND expert-cache capacity**: the value itself switches (e.g. 64 turns the pool on; `0` = off, all `LK_POOL_*` inert) = resident expert slots per MOE layer. If it is below what one prefill pass needs it is **auto-extended** at boot (free: those rows sit in the same allocation) and the log prints `auto extended LK_POOL_SLOTS X to Y`; a larger value is never shrunk. It sizes the CACHE only: the domain's total VRAM is `max(cache, prefill working set)` — see [VRAM sizing](#vram-sizing-pool--gpu-prefill). Must be `>= top_k` when non-zero |
+| `LK_POOL_DRAFT_SLOTS` | pool | 0 = all | How many of the slots a **draft** layer admits to; real layers ignore it. `0` = the draft uses the slot count its own cache budget gives it (same as a real layer); `>0` narrows the draft's LRU set to the first N slots -- same addressing, no VRAM of its own either way. Keep it `>= top_k`; when it bites the boot prints `[pool] L<n> admits to N of M slots (draft knob)` |
 | `LK_POOL_DECODE` | pool | follow pool | decode GPU half: pool-resident experts go to the GPU resident-gemv half. `1` on / `0` off explicitly; unset follows `LK_POOL_SLOTS` > 0 |
 | `LK_POOL_MBOX_SPLIT` | pool | 0 = off | Start the decode GPU half before joining the CPU half instead of in one step. Nothing measured at one or two rows per step (7.43 vs 7.07-7.35 ms/step at one row), so the `launch/` recipes no longer set it |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
@@ -312,6 +313,7 @@ ids stay out of the admission ledger (see `LK_VERIFY_PUMP` under
 | `LK_SPEC_PROBE` | spec | print per-step draft/verify stage timings |
 | `LK_PLE_PROBE` | ple | PLE row-locality/traffic probe (`LK_PLE_PROBE_DUMP=<path>` dumps rows) |
 | `LK_PP_DEBUG` | prefill | extra `[prefill]` tracing lines |
+| `LK_PP_DEBUG_EVERY` | prefill | 0 = once per key | Cadence for `LK_PP_DEBUG`'s CPU-reference compare: with `N`, check every Nth call of each layer instead of the first call of each `(layer, shape)` pair -- the default fires only during the idle boot warmup, so anything that needs live traffic (staging churn, concurrent copies) stays invisible |
 | `LK_DECODE_TS` / `LK_TS_SKIPGEMM` | host decode | decode-path timestamp trace / skip-the-gemm A/B (read by lk_moe) |
 | `LK_MBOX_STOPFILE` | mbox | stop-file for orderly teardown (read by lk_moe) |
 | `LK_DISABLE_QSA_SHARE` | draft | draft worker: disable QSA share (A/B isolation only) |

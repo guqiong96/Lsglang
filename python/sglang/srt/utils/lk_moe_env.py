@@ -112,158 +112,44 @@ def is_numa_interleave_enabled() -> bool:
     return get_bool_env_var("LK_NUMA_INTERLEAVE", default="true")
 
 def get_gpu_prefill_min_tokens() -> int:
-    # Dual knob (designs/lk_switch_doctrine.md rule 2): >0 both enables the GPU
-    # prefill tier and sets its batch gate. Default 1024 (2026-11-07): the tier
-    # is on out of the box -- a recipe no longer has to opt in, and 1024 tokens
-    # is the smallest prompt where the GPU engine wins over the CPU path.
-    # Forwarded to lk_moe via cfg; lk_moe itself never reads the env.
     return get_int_env_var("LK_GPU_PREFILL_MIN_TOKENS", 1024)
 
 def get_gpu_prefill_engine() -> str:
-    # Pure selector switch (lk_switch_doctrine: a selector never flips the
-    # tier itself -- the GPU-prefill tier still powers on only via
-    # LK_GPU_PREFILL_MIN_TOKENS>0 under the master switch). Chooses WHICH
-    # GPU-prefill implementation a powered tier uses:
-    #   "cutlass" (default) = restored CUTLASS grouped-GEMM engine (bf16
-    #                         intermediates; that extra bf16 rounding drifts
-    #                         long-context logits and can flip borderline EOS
-    #                         -- see journal 2026-10-22; set "triton" to opt out)
-    #   "triton"            = staging group-GEMM over pool slots (legacy,
-    #                         fp32 activations, matches the CPU reference)
-    #   "flashinfer"        = SM120/SM121 only: stage FP4, bridge the rows to
-    #                         flashinfer's CuTe DSL moe_nvfp4_w4a16 layout and
-    #                         run the FP4 tensor cores directly (no dequant,
-    #                         1/4 the staged bytes; same numerics as W4A16)
-    # Unset and unrecognized values both select cutlass (2026-10-23: restored
-    # as the default, reversing the 2026-10-22 hotfix; every production launch
-    # script now pins the engine explicitly, so this default only matters for
-    # direct python embedding). Inert unless the tier is on. Forwarded to
-    # lk_moe as cfg.gpu_prefill_engine ("" when the tier is off -- the string
-    # carries the tier bit by being non-empty; the C++ decodes it into the
-    # staging-ring / cutlass-arena buffer builds at ctor time).
-    val = get_str_env_var("LK_GPU_PREFILL_ENGINE", "cutlass").strip().lower()
-    return val if val in ("triton", "flashinfer") else "cutlass"
+    if not is_lk_gpu_prefill_enabled():
+        return ""
+    return get_str_env_var("LK_GPU_PREFILL_ENGINE", "cutlass").lower()
 
-_GPU_PREFILL_QUANT_MODES = ("auto", "w4a4", "w4a8", "w4a16", "w8a8")
-
-# THE validity table: (engine, requested mode) -> requirements.
-#
-#   frozenset()            always implementable by that engine
-#   {"sm120"}              SM120 family only
-#   {"nvfp4"}              NVFP4 weights only (MXFP4 needs a swizzled SF mirror)
-#
-# A pair that is absent from the table is NOT implemented: asking for it warns
-# and degrades (precision is a speed setting, the fallback is still correct).
-# Keeping this as a table is the point -- the engine x mode decision was spread
-# over capability probes and ad-hoc sets, which nobody could read.
-#
-# Two tables, one per device family -- the same pair resolves differently:
-#
-# SM120 (5060 Ti / RTX PRO / B-series GeForce)
-#   engine \ mode   auto        w4a4            w4a8   w4a16   w8a8
-#   cutlass          -> w4a16    nvfp4           -      yes     -
-#   triton           -> w4a16    -               -      yes     -
-#   flashinfer       -> w4a16    nvfp4           -      yes     -
-#
-# sm8x / SM90 and everything else
-#   cutlass          -> w4a16    -               -      yes     -
-#   triton           -> w4a16    -               -      yes     -
-#   flashinfer       - (SM12x-only kernels; its probe fails elsewhere)
-#
-# "auto" deliberately does not pick w4a4 until _PREFILL_AUTO_PREFERS_W4A4 is
-# flipped: the explicit request is the opt-in, and there is no second knob.
-_PREFILL_QUANT_MATRIX = {
-    ("cutlass", "w4a16"): frozenset(),
-    # cutlass reads both 4-bit weight families: NVFP4 (ModelOpt/Qwen) and
-    # MXFP4 (DSV4 / DSV4.1 experts). MXFP4 only became addressable once the
-    # prefill engine learned the native panel -> dense repack for its
-    # 32-element scale blocks (lk_moe repack_panel_to_dense, 2026-11-10).
-    # flashinfer's block-scaled kernel is NVFP4-only and stays gated below.
-    ("cutlass", "w4a4"): frozenset({"sm120"}),
-    ("triton", "w4a16"): frozenset(),
-    ("flashinfer", "w4a16"): frozenset({"sm120"}),
-    ("flashinfer", "w4a4"): frozenset({"sm120", "nvfp4"}),
+_LK_PREFILL_QUANT_OK = {
+    # (arch, engine, quant); present = legal, absent = raise.
+    ("sm120", "cutlass",    "w4a4"),
+    ("sm120", "cutlass",    "w4a16"),
+    ("other", "cutlass",    "w4a16"),
+    ("sm120", "triton",     "w4a16"),
+    ("other", "triton",     "w4a16"),
+    ("sm120", "flashinfer", "w4a16"),
+    ("sm120", "flashinfer", "w4a4"),
 }
-_PREFILL_AUTO_PREFERS_W4A4 = False
-_PREFILL_QUANT_WARNED = set()
-_PREFILL_QUANT_LEGAL = {
-    "nvfp4": ("w4a4", "w4a8", "w4a16"),
-    "mxfp4": ("w4a4", "w4a8", "w4a16"),
-    "fp8": ("w8a8", "w8a16"),
-    # A bf16 checkpoint has no 8-bit weights to name: its only mode is the
-    # plain bf16 GEMM, so the safe mode says 16-bit weights, not w8a16.
-    "bf16": ("w16a16",),
-}
-_PREFILL_QUANT_FALLBACK = {"nvfp4": "w4a16", "mxfp4": "w4a16",
-                           "fp8": "w8a16", "bf16": "w16a16"}
 
 
 def get_gpu_prefill_quant() -> str:
-    """The requested prefill precision: one knob, resolved per layer."""
-    if get_bool_env_var("LK_GPU_PREFILL_SM120_W4A4"):
-        raise ValueError(
-            "LK_GPU_PREFILL_SM120_W4A4 is retired: set "
-            "LK_GPU_PREFILL_QUANT=w4a4 instead")
-    quant = (get_str_env_var("LK_GPU_PREFILL_QUANT", "auto") or "auto").strip().lower()
-    if quant not in _GPU_PREFILL_QUANT_MODES:
-        raise ValueError(
-            f"LK_GPU_PREFILL_QUANT={quant!r} is not one of "
-            f"{_GPU_PREFILL_QUANT_MODES}")
-    return quant
+    return get_str_env_var("LK_GPU_PREFILL_QUANT", "auto").lower()
 
 
-def engine_quant_supported(engine: str, mode: str, weight_format: str,
-                           is_sm120: bool) -> bool:
-    """Table lookup: does `engine` implement `mode` for these weights here?"""
-    req = _PREFILL_QUANT_MATRIX.get((engine, mode))
-    if req is None:
-        return False
-    return all(
-        (need != "sm120" or is_sm120) and
-        (need != "nvfp4" or weight_format == "nvfp4")
-        for need in req
-    )
+def resolve_prefill_quant() -> str:
+    engine = get_gpu_prefill_engine()
+    if not engine:
+        return ""
+    quant = get_gpu_prefill_quant()
+    mode = "w4a16" if quant == "auto" else quant
+    arch = "sm120" if torch.cuda.get_device_capability()[0] == 12 else "other"
+    if (arch, engine, mode) not in _LK_PREFILL_QUANT_OK:
+        raise ValueError(f"LK_GPU_PREFILL_QUANT={quant}: not in "
+                         f"_LK_PREFILL_QUANT_OK on {arch} for engine {engine!r}")
+    return mode
 
 
-def resolve_gpu_prefill_quant(requested: str, engine: str, weight_format: str,
-                              is_sm120: bool) -> str:
-    """The mode this layer runs. Pure table + policy, no capability probing."""
-    fmt = (weight_format or "").lower()
-    if fmt not in _PREFILL_QUANT_LEGAL:
-        raise ValueError(f"unknown prefill weight format {weight_format!r}")
-    legal = _PREFILL_QUANT_LEGAL[fmt]
-
-    def usable(mode):
-        if mode == "w4a4" and not _PREFILL_AUTO_PREFERS_W4A4 and requested == "auto":
-            return False
-        return engine_quant_supported(engine, mode, fmt, is_sm120)
-
-    if requested == "auto":
-        for mode in legal:
-            if usable(mode):
-                return mode
-        return _PREFILL_QUANT_FALLBACK[fmt]
-
-    if requested not in legal:
-        raise ValueError(
-            f"LK_GPU_PREFILL_QUANT={requested} is not valid for {fmt} weights "
-            f"(legal: {legal})")
-    if engine_quant_supported(engine, requested, fmt, is_sm120):
-        return requested
-    # An explicit request that the engine lacks degrades to the SAFE mode for
-    # that weight format (w4a16), never sideways into another 4-bit experiment:
-    # the operator asked for 8-bit activations, silently handing back 4-bit
-    # would be a worse surprise than keeping the known-good path.
-    fallback = _PREFILL_QUANT_FALLBACK[fmt]
-    key = (requested, engine, fmt, fallback)
-    if key not in _PREFILL_QUANT_WARNED:
-        _PREFILL_QUANT_WARNED.add(key)
-        warnings.warn(
-            f"LK_GPU_PREFILL_QUANT={requested} is not implemented by the "
-            f"{engine} engine for {fmt} weights on this device -> prefill runs "
-            f"{fallback}; this is a speed mode, not a correctness setting",
-            stacklevel=3)
-    return fallback
+def is_prefill_w4a4(weight_format: str) -> bool:
+    return resolve_prefill_quant() == "w4a4" and weight_format in ("nvfp4", "mxfp4")
 
 
 def get_pool_window() -> int:
@@ -285,19 +171,23 @@ def get_pool_inflight() -> int:
     # backpressure cap is 8x this -- 12 false-positives at small batch.
     return get_int_env_var("LK_POOL_INFLIGHT", 16)
 
-def get_verify_resident() -> int:
+def get_verify_pump() -> bool:
+    return get_bool_env_var("LK_VERIFY_PUMP", "false")
+
+
+def get_verify_resident() -> bool:
     # VR: draft-row pool-resident experts computed GPU-side. Default ON since the
     # ride-share split (verify_pump stays off, so the draft rows only read the
     # residency the real tokens built): measured on 0731/DSPARK at accept 4.25 vs
     # 4.29 without it -- the fidelity cost the old comment warned about did not
     # materialise there -- while the pooled hit rate (48%) took the step from
     # 130 ms to 109 ms. LK_VERIFY_RESIDENT=0 keeps the old CPU-only behaviour.
-    return get_int_env_var("LK_VERIFY_RESIDENT", 1)
+    return get_bool_env_var("LK_VERIFY_RESIDENT", "true")
 
 
-def get_hf_mbox() -> int:
+def get_hf_mbox() -> bool:
     # mailbox early-start decode path (default on; 0 = pure host-node path).
-    return get_int_env_var("LK_HF_MBOX", 1)
+    return get_bool_env_var("LK_HF_MBOX", "true")
 
 
 def get_pool_log() -> int:
@@ -308,6 +198,18 @@ def is_lk_prefill_debug() -> bool:
     # Extra tracing inside the prefill staging tier.
     return get_bool_env_var("LK_PP_DEBUG")
 
+
+def get_pp_debug_every() -> int:
+    return get_int_env_var("LK_PP_DEBUG_EVERY", 0)
+
+
+def is_lk_pool_det_split() -> bool:
+    return is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_DET_SPLIT")
+
+
+def is_lk_pool_split_probe() -> bool:
+    return is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_SPLIT_PROBE")
+
 def get_prefill_wave_experts() -> int:
     # Tier wave width, ONE geometry for all three engines: <=0 (default)
     # = every expert in one wave (wave = E); >0 = W experts per wave, a
@@ -315,7 +217,7 @@ def get_prefill_wave_experts() -> int:
     # 2*wave rows of the pool's row space (shared, zero extra VRAM).
     #
     # The knob is cutlass-only (LK_GPU_PREFILL_WAVE_EXPERTS in the README
-    # table), so a positive width means nothing to the staging engines: they
+    # table), so a positive width means nothing to the whole-window engines: they
     # gemm the whole layer per stage. Normalise it here, once, instead of
     # letting the tier refuse to start a valid staging deployment.
     wave = get_int_env_var("LK_GPU_PREFILL_WAVE_EXPERTS", -1)
@@ -333,7 +235,7 @@ def get_prefill_wave_experts() -> int:
 def get_prefill_d_slots() -> int:
     # Tier act window in slot rows, ONE formula for all engines: 0/-1
     # (default) = sub_m*topk + 7*E; >0 = that many rows, clamped. The
-    # cutlass act planes are the tier arena's tail sized from it; the
+    # cutlass act planes are the tier global region's tail sized from it; the
     # staging drivers keep their own fixed-size launch-block buffers.
     return get_int_env_var("LK_GPU_PREFILL_D_SLOTS", 0)
 
@@ -349,19 +251,29 @@ def get_model_type_from_layer_name(layer_name: str) -> str:
     return "main"
 
 def get_gpu_resident_env_var(model_type: str = "main") -> str | None:
+    """Resident (never pooled) layers, per ROLE.
+
+    `LK_GPU_RESIDENT_MOE_LAYERS` names MAIN layers only. A draft used to inherit
+    that list through a fallback, and the consequence was not cosmetic: draft
+    models restart their layer ids at 0, so `...=0-1,33-34` silently marked the
+    draft's own layer 0 resident, the draft never registered as a pool member,
+    and the "draft never joins the pool" question stayed open for days
+    (2026-11-17). Drafts therefore read ONLY their own variables:
+        LK_GPU_RESIDENT_MOE_LAYERS_SPEC        (all spec kinds, wins first)
+        LK_GPU_RESIDENT_MOE_LAYERS_MTP         (mtp / NextN drafts)
+        LK_GPU_RESIDENT_MOE_LAYERS_DSPARK      (dspark drafts)
+    Unset draft variables mean "the draft JOINS the pool".
+    """
     if model_type in ("dspark", "mtp"):
         env_value = get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS_SPEC", None)
-        if env_value is not None:
+        if env_value:
             return env_value
-
         role_env = (
             "LK_GPU_RESIDENT_MOE_LAYERS_MTP"
             if model_type == "mtp"
             else "LK_GPU_RESIDENT_MOE_LAYERS_DSPARK"
         )
-        env_value = get_str_env_var(role_env, None)
-        if env_value is not None:
-            return env_value
+        return get_str_env_var(role_env, None)
 
     return get_str_env_var("LK_GPU_RESIDENT_MOE_LAYERS", None)
 
@@ -434,18 +346,122 @@ def get_lk_pool_layer_set() -> set | None:
 
 def get_pool_slots() -> int:
     # Expert-cache slots per layer. 0 = cache off (prefill is sized
-    # independently: the arena is max(cache, prefill)).
+    # independently: the global region is max(cache, prefill)).
     return get_int_env_var("LK_POOL_SLOTS", 0)
+
+def get_draft_pool_slots() -> int:
+    # Slots DRAFT layers admit to (0 = all of them, like the main layers).
+    # A quantity knob, not a structure knob: the row addressing is shared and
+    # unchanged, only the LRU admission scan stops early. Keep it >= top_k.
+    return get_int_env_var("LK_POOL_DRAFT_SLOTS", 0)
 
 def is_lk_pool_enabled() -> bool:
     return is_lk_moe_feature_enabled() and get_pool_slots() > 0
 
-def is_lk_pool_layer(layer_id: str, model_type: str = "main") -> bool:
-    if model_type != "main":
-        return False
-    if is_lk_moe_gpu_resident_layer(layer_id, model_type):
-        return False
-    return is_lk_pool_enabled()
+_pool_main_layers: list = []
+_pool_draft_layers: list = []
+_pool_ids: dict = {}
+
+
+def is_main_layer(model_type: str) -> bool:
+    return model_type == "main"
+
+
+def is_draft_layer(model_type: str) -> bool:
+    return model_type != "main"
+
+
+def regist_lk_pool_member(layer_name: str, model_type: str) -> None:
+    # The key is the layer's NAME (prefix), never its model-local index: the
+    # draft model restarts the index at 0, and two layers sharing a key would
+    # hand one member id to both -- the C++ registry then declines the
+    # second instance ("the registry gave one layer two numbers").
+    lid = str(layer_name)
+    if lid in _pool_ids:
+        return
+    _pool_ids[lid] = len(_pool_main_layers) + len(_pool_draft_layers)
+    if get_pool_log() > 0:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "[pool] registry-add %s type=%s id=%d (main=%d draft=%d)",
+            lid, model_type, _pool_ids[lid],
+            len(_pool_main_layers), len(_pool_draft_layers))
+    (_pool_main_layers if is_main_layer(model_type)
+     else _pool_draft_layers).append(lid)
+
+
+def lk_pool_id(layer_name: str) -> int:
+    # THE pool-registry key: the member id the registry handed out at
+    # registration (keyed by layer name, unique across main and draft). Main
+    # and draft layers take their numbers from this one counter, so ids are
+    # dense, unique, and no consumer can tell the two kinds apart.
+    # -1 = not a member.
+    return _pool_ids.get(str(layer_name), -1)
+
+
+_member_map_logged: tuple = ()
+
+
+def log_pool_member_map() -> None:
+    # The pump's per-layer lines name themselves with the CENSUS ORDINAL
+    # ("[pool] L43 ..."), which only python can turn back into a layer. Dump
+    # the ordinal -> layer map once the registry is complete (called after the
+    # draft worker exists; re-dumped if it grew), and say which end of the
+    # counter is whose: that split is exactly what an aggregate hit rate hides.
+    # Gated on LK_POOL_LOG: it exists to be read together with the pump lines.
+    global _member_map_logged
+    if get_pool_log() <= 0:
+        return
+    snap = (len(_pool_main_layers), len(_pool_draft_layers))
+    if snap == _member_map_logged:
+        return
+    _member_map_logged = snap
+    logger.info(
+        "[pool] registry: %d member layers = %d main (L0..L%d) + %d draft "
+        "(L%d..L%d); draft layers are %s",
+        sum(snap), snap[0], max(snap[0] - 1, 0), snap[1],
+        snap[0], max(snap[0] + snap[1] - 1, 0),
+        _pool_draft_layers or "none",
+    )
+
+
+_spec_draft_moe_layers: int = 0
+
+
+def record_spec_draft_moe_layers(n: int) -> None:
+    # The draft worker records its MoE layer count from ITS OWN draft config
+    # (tp_worker's ModelConfig), because the first lk_moe ctor -- the one that
+    # sizes the pool's global region -- can run before any draft FusedMoE
+    # exists. Idempotent (recorded twice: draft config is parsed twice).
+    global _spec_draft_moe_layers
+    import os as _os
+    if get_pool_log() > 0:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "[pool] registry-spec record n=%d pid=%d (was %d)", int(n),
+            _os.getpid(), _spec_draft_moe_layers)
+    _spec_draft_moe_layers = max(_spec_draft_moe_layers, int(n))
+
+
+def get_pool_member_layers() -> int:
+    # How many layers have an expert cache. Draft layers are counted at their own
+    # member id like any other member: adding a draft layer adds cache rows,
+    # never a different kind of memory.
+    _n = len(_pool_main_layers) + max(len(_pool_draft_layers),
+                                      _spec_draft_moe_layers)
+    if get_pool_log() > 0:
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "[pool] registry-count main=%d draft=%d spec_declared=%d -> %d",
+            len(_pool_main_layers), len(_pool_draft_layers),
+            _spec_draft_moe_layers, _n)
+    return _n
+
+
+def is_lk_pool_layer(layer_name: str) -> bool:
+    # Membership by the SAME key as the registry: the layer name.
+    return str(layer_name) in _pool_main_layers or \
+        str(layer_name) in _pool_draft_layers
 
 def lk_route_probe_enabled() -> bool:
     return is_lk_pool_enabled() and get_bool_env_var("LK_ROUTE_PROBE")
@@ -455,6 +471,9 @@ def is_lk_pool_decode_enabled() -> bool:
         return False
     return get_bool_env_var("LK_POOL_DECODE",
                             "true" if is_lk_pool_enabled() else "false")
+
+def is_lk_pool_decode_layer(layer_name: str) -> bool:
+    return is_lk_pool_decode_enabled() and is_lk_pool_layer(layer_name)
 
 def is_pool_mbox_split() -> bool:
     # Split the mailbox early-start path into "ring the doorbell" (on the pool

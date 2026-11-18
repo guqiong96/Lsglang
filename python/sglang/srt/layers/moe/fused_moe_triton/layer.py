@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_t
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.awq import AWQMoEMethod
+from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Method
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod 
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import Mxfp4FlashinferTrtllmMoEMethod
@@ -106,10 +107,8 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
-_LK_PP_DEBUG = os.getenv("LK_PP_DEBUG", "0") not in ("", "0")
-_LK_PP_DEBUG_EVERY = int(os.getenv("LK_PP_DEBUG_EVERY", "0"))
 
-from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_resident, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_enabled, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, get_gpu_prefill_quant, resolve_gpu_prefill_quant
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, is_lk_pool_enabled, get_pool_log, get_verify_pump, get_verify_resident, get_hf_mbox, get_pool_inflight, is_lk_prefill_debug, is_lk_moe_gpu_resident_layer, get_gpu_prefill_min_tokens, get_gpu_prefill_engine, get_pool_window, get_super_chunk_size, get_bool_env_var, is_lk_gpu_prefill_enabled, get_model_type_from_layer_name, is_lk_pool_layer, get_pool_slots, is_lk_pool_decode_layer, lk_route_probe_enabled, is_pool_mbox_split, get_prefill_wave_experts, get_prefill_d_slots, is_prefill_w4a4, get_pool_member_layers, regist_lk_pool_member, lk_pool_id, is_draft_layer, get_draft_pool_slots, get_pp_debug_every, is_lk_pool_det_split, is_lk_pool_split_probe
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsFusedMoEMethod
 from sglang.srt.model_executor.runner import get_is_capture_mode
 if is_lk_moe_feature_enabled():
@@ -117,32 +116,23 @@ if is_lk_moe_feature_enabled():
     import triton
     from lk_moe._hybrid_gemv_kernel import (
         gather_rows, slot_table_fill, moe_gateup, reduce_gate, moe_down, reduce_down)
+    # 16-bit pool GEMV lives in a newer wheel than some deployments run. Absent,
+    # bf16/fp16 simply have no kernel_caps and the pool decode declines for them
+    # (safe fallback), so the import must not turn an older wheel into a boot
+    # failure -- that is exactly what it did when this A/B first ran.
+    try:
+        from lk_moe._hybrid_gemv_16b import moe_gateup_16, moe_down_16
+    except ImportError:          # old wheel: no 16-bit pool GEMV at all
+        moe_gateup_16 = moe_down_16 = None
 else:
-    # Off is the default, and nothing failed here: the master switch simply is
-    # not set (a real import error raises instead of reaching this branch).
-    # Keep it at debug so a plain sglang start stays quiet; the helpers above
-    # stay undefined on purpose -- every use site is gated on the master.
     logger.debug(
         "lk_moe hybrid MoE path disabled (LK_MOE_HYBRID_ENABLED not set); "
         "using the regular fused MoE implementation"
     )
 
-# Pool-decode determinism: publish the claimed batch and make the GPU half
-# stream-wait on that batch's copy fence before reading slots. Diagnostic
-# probe logs the exact frozen split (claim/ready/snapshot) per pool layer.
-_LK_POOL_DET_SPLIT = bool(
-    is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_DET_SPLIT")
-)
-# Doorbell/join split of the mailbox early-start path (see lk_moe_env); the two
-# call sites are in _pool_decode_launch (mode=1) and _cpu_decode (mode=2) and must
-# agree, so the decision is made once per step and passed down.
-_LK_POOL_MBOX_SPLIT = is_pool_mbox_split()
-_LK_POOL_SPLIT_PROBE = bool(
-    is_lk_moe_feature_enabled() and get_bool_env_var("LK_POOL_SPLIT_PROBE")
-)
 _LK_POOL_PROBE_N = 0
 if is_lk_moe_feature_enabled():
-    if _LK_POOL_DET_SPLIT:
+    if is_lk_pool_det_split():
         # A build that cannot publish the flag would leave python waiting on
         # fences C++ never claims; raise instead of half-enabling the knob.
         lk_moe.pool_set_det_split(True)
@@ -347,7 +337,91 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
         )
 
 
-_DSPP = [0]
+def _pool_kernel_geometry(H, I, k, caps):
+    SB = caps["stride_n"]
+    PK = caps["packed_k_per_iter"]
+    ITERS = 16
+    NB_GATEUP, NB_DOWN = I // SB, H // SB
+    total_iters = (H // PK) // ITERS
+    NGK = next(cand for cand in (16, 8, 4, 2, 1)
+               if total_iters % cand == 0
+               and k * NB_GATEUP * cand <= 2048)
+    return {"NB_GATEUP": NB_GATEUP, "NB_DOWN": NB_DOWN,
+            "NGK": NGK, "KS": total_iters // NGK, "ITERS": ITERS}
+
+
+def _pool_decode_rows(max_real_tokens, k, rows_per_token):
+    # sizing vs coverage: a verify batch really carries max_real_tokens*
+    # rows_per_token expert rows whether or not the draft rows are covered
+    # (LK_VERIFY_RESIDENT only decides that); conflating them made the buffer
+    # size decide coverage, and a DSPARK block overshot max_real_tokens -> pool
+    # refused the batch, every expert ran on CPU.
+    # The 8-draft floor exists because DSPARK width may still read 1 at init
+    # while graph capture (no allocations allowed) needs the final size.
+    max_rows_per_token = max(rows_per_token if rows_per_token > 1 else 1, 8)
+    return max_real_tokens * k * max_rows_per_token, max_real_tokens * max_rows_per_token
+
+
+def _pool_shared_grow(name, shape, dev, fill=0.0, dtype=torch.float32):
+    """Grow (never shrink) one shared decode buffer.
+
+    Every pooled layer shares these buffers and reads them back with ITS OWN
+    geometry, so the only sound rule is: a later layer may raise any dimension,
+    nobody may lower one, and every dimension must be checked. Comparing `rows`
+    alone (what this did) let a layer with a wider `I`, a bigger `NGK` or a
+    taller `H` write past the end of a buffer sized by the first layer; the
+    shared shapes are per (H, I, k), and a draft is free to differ from the
+    target (see DRAFT_I in lk_moe/tests/test_two_weight_types.py).
+    """
+    cur = getattr(FusedMoE, name, None)
+    if cur is not None and all(c >= n for c, n in zip(cur.shape, shape)):
+        return
+    new = torch.zeros(shape, dtype=dtype, device=dev)
+    if fill:
+        new.fill_(fill)
+    setattr(FusedMoE, name, new)
+
+
+def _pool_alloc_shared(max_real_tokens, rows, gout_rows, H, I, NGK):
+    # Sized from the concurrency limit: every decode batch is covered by
+    # construction, no runtime growth path. A later layer may raise a dimension
+    # (growth), never shrink one under an earlier layer; see _pool_shared_grow.
+    dev = torch.cuda.current_device()
+    if not hasattr(FusedMoE, "pool_hbuf"):
+        FusedMoE._max_real_tokens = max_real_tokens
+        FusedMoE.pool_stream = torch.cuda.Stream()
+        try:
+            from lk_moe.prefill_triton import TritonPrefill
+            if TritonPrefill._pool_stream is None:
+                TritonPrefill._pool_stream = FusedMoE.pool_stream
+        except ImportError:
+            # pre-2.9 wheel: the staging module is still prefill_staging and has
+            # no pool-stream hook. Such a wheel has no pool GEMV either, so this
+            # path is only reachable from a unit test -- it must not turn that
+            # into an ImportError.
+            pass
+    _pool_shared_grow("pool_hbuf", (rows, 2 * I), dev)
+    _pool_shared_grow("pool_gout", (gout_rows, H), dev)
+    _pool_shared_grow("pool_hpart", (NGK, rows, 2 * I), dev)
+    _pool_shared_grow("pool_gout_part", (rows, H), dev)
+    _pool_shared_grow("pool_slot_tab", (rows,), dev,
+                      fill=-1, dtype=torch.int32)
+    _pool_shared_grow("pool_gathered_ids", (rows,), dev, dtype=torch.int32)
+    _pool_shared_grow("pool_gathered_weights", (rows,), dev)
+
+
+def _pool_rowmajor_swizzled_addrs(info):
+    # fix-4a: row-major+swizzled pools merge gate+up into ONE w13 region, so
+    # weight rows shift by row_base*kp while scale rows are placed by ABSOLUTE
+    # row -- the up half swizzles row_base+row, carried as rb_up. Native pools
+    # bake nothing.
+    if bool(int(info.get("rowmajor_swizzled") or 0)):
+        rb = [int(v) for v in info["rowmajor_swizzled_row_base"]]
+        ckp = [int(v) for v in info["rowmajor_swizzled_kp"]]
+        return ([int(info["weight_addr"][i]) + rb[i] * ckp[i] for i in range(3)],
+                [int(v) for v in info["scale_addr"]], rb[1], "rowmajor_swizzled")
+    return ([int(v) for v in info["weight_addr"]],
+            [int(v) for v in info["scale_addr"]], 0, "native")
 
 
 class FusedMoE(torch.nn.Module):
@@ -382,17 +456,6 @@ class FusedMoE(torch.nn.Module):
     scheme = None
 
     _skip_aiter_moe_shuffle: bool = False
-
-    # Verify-batch row multiplier (NEXTN draft rows per real token) agreed
-    # across pool layers at init; single source of truth for decode sizing.
-    _pool_verify_rows_mult = 1
-    _pool_verify_all_rows = False
-
-    # Stream-order event for the mailbox doorbell/join split (see _cpu_decode).
-    # Per layer, not shared: one graph records it once per pool layer, and a single
-    # handle reused across layers is a question nobody needs to answer. It stays
-    # None for a layer first seen inside capture, which keeps that layer unsplit.
-    _pool_join_ev = None
 
     def __init__(
         self,
@@ -611,21 +674,27 @@ class FusedMoE(torch.nn.Module):
         self.prefill_wave_experts = get_prefill_wave_experts()
         self.prefill_d_slots = get_prefill_d_slots()
         self.lk_moe = None
+        self.lk_weight_format = ""
         self.lk_moe_config = None 
         self.model_type = get_model_type_from_layer_name(self.layer_name)
 
 
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id, self.model_type)
-        # Prefill membership is NOT role-gated: a draft instance runs the
-        # draft-extend pass at full prefill sizes, and the staging ring needs
-        # no pool content (its snapshot is an all-zero table -> everything
-        # stages). The DECODE half stays main-only via is_pool_layer.
         self.is_gpu_prefill_layer = is_lk_gpu_prefill_enabled()
         
-
-        self.is_pool_layer = is_lk_pool_layer(self.layer_id, self.model_type)
+ 
+        if is_lk_pool_enabled() and not self.is_gpu_resident_layer:
+            regist_lk_pool_member(self.layer_name, self.model_type)
+        self.is_pool_layer = is_lk_pool_layer(self.layer_name)
         self.route_probe = lk_route_probe_enabled()
-        self.pool_decode = is_lk_pool_decode_enabled() and self.is_pool_layer
+        self.pool_det_split = is_lk_pool_det_split()
+        self.pool_split_probe = is_lk_pool_split_probe()
+        self.mbox_split = is_pool_mbox_split()
+        self._pool_verify_all_rows = get_verify_resident()
+        # Per-layer stream-order event for the mailbox doorbell/join split;
+        # lazily created on the first eager step. A layer first seen inside
+        # capture keeps None and stays unsplit.
+        self._pool_join_ev = None
 
         self._gpu_prefill_driver = None
         self._pool_layer_info = None
@@ -2003,7 +2072,7 @@ class FusedMoE(torch.nn.Module):
         ``server_args.speculative_num_draft_tokens`` is read into the attribute
         at __init__, but the DSPARK block size is only resolved later: every
         layer built before that caches None, which made a verify batch look like
-        bs real tokens, overshoot the decode cap, and drop the pool for good.
+        bs real tokens, overshoot max_real_tokens, and drop the pool for good.
         The runtime spec object is the live value -- the attention backends
         already read it that way.
         """
@@ -2024,30 +2093,42 @@ class FusedMoE(torch.nn.Module):
     def _do_process_weights_after_loading(self) -> bool:
         if (isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE)) \
           or isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) :
+            self.lk_weight_format = "nvfp4"
             need_reciprocal_global_scale = isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
             self._process_nvfp4(need_reciprocal_global_scale)
             return True
         if isinstance(self.quant_method, Mxfp4MarlinMoEMethod) or isinstance(self.quant_method, Mxfp4FlashinferTrtllmMoEMethod) or isinstance(self.quant_method, Mxfp4FlashinferCutlassMoEMethod):
+            self.lk_weight_format = "mxfp4"
             self._process_mxfp4()
             return True
             
         if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsWNA16MoE):
+            self.lk_weight_format = "wna16"
+            self._process_wna16()
+            return True
+
+        if isinstance(self.quant_method, MoeWNA16Method):
+            self.lk_weight_format = "wna16"
             self._process_wna16()
             return True
         
         if isinstance(self.quant_method, AWQMoEMethod):
+            self.lk_weight_format = "awq"
             self._process_awq()
             return True
             
         if isinstance(self.quant_method, Fp8MoEMethod):
+            self.lk_weight_format = "fp8"
             self._process_fp8(self.quant_method.block_quant)
             return True
             
         if hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE):
+            self.lk_weight_format = "fp8"
             self._process_fp8(False)
             return True
             
         if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
+            self.lk_weight_format = "bf16"
             self._process_bf6_fp16()
             return True 
         return False
@@ -2090,42 +2171,31 @@ class FusedMoE(torch.nn.Module):
         return self.moe_tp_size, self.moe_tp_rank, torch.cuda.current_device()
 
     def _fill_lk_cfg(self, cfg):
-        # Geometry + tuning surface, ONE definition shared by all five
-        # format builders; groupN/groupK (scale groups) are format facts
-        # and stay in the builders.
         cfg.layer_id = self.layer_id
         cfg.route_probe = self.route_probe
-        # pool = infra MEMBERSHIP (cache OR prefill staging); pool_cache says
-        # whether this instance's slots are real (main) or a pure prefill
-        # shell with an all-zero snapshot (draft).
-        # No membership flag on cfg: pool_slots>0 + a cache/prefill half is
-        # the single derivation of pool membership.
         cfg.pool_cache = self.is_pool_layer
-        # Slab sizing: one contiguous pool allocation per weight type.
-        # Members = non-resident layers; the pool tier off means zero rows.
-        cfg.pool_member_layers = 0
-        if is_lk_pool_enabled():
-            # Composite/multimodal configs keep num_hidden_layers on the text
-            # sub-config (Qwen4Exp & co.); reading only the top level yields 0
-            # and leaves the pool slab at zero rows, so prefill staging has
-            # no tier to join.
-            model_cfg = process_model_config()
-            text_cfg = getattr(model_cfg, "hf_text_config", None)
-            if text_cfg is None:
-                text_cfg = model_cfg.hf_config
-            n_layers = int(getattr(text_cfg, "num_hidden_layers", 0))
-            cfg.pool_member_layers = sum(
-                1 for i in range(n_layers)
-                if not is_lk_moe_gpu_resident_layer(i))
-        cfg.gpu_prefill_engine = (get_gpu_prefill_engine()
-                                  if self.is_gpu_prefill_layer else "")
-        cfg.role_draft = self.model_type != "main"
-        # Ride-share: draft verify rows may read the residency the real tokens
-        # built, but they never feed the admission ledger (a cache sized for
-        # real-token working sets cannot hold a verify batch, and pumping it
-        # would evict what it just brought in).
-        cfg.verify_pump = get_bool_env_var("LK_VERIFY_PUMP", "false")
-        cfg.pool_decode = self.pool_decode
+        cfg.pool_member_layers = get_pool_member_layers()
+        cfg.gpu_prefill_engine = get_gpu_prefill_engine()
+        # 16-bit expert weights have no whole-window prefill kernel: cutlass is
+        # the only format-agnostic engine (its dequant covers bf16/fp16 too).
+        # A recipe that asks for flashinfer/triton would otherwise be refused at
+        # C++ tier init ("engine X has no GPU kernels for this weight format"),
+        # which is exactly how the 5060Ti recipe stopped booting on 2026-11-17:
+        # its draft layer is bf16 and the recipe sets LK_GPU_PREFILL_ENGINE=
+        # flashinfer. The 16-bit member's prefill therefore always rides cutlass;
+        # cutlass then handles it like every other format, so this is a routing
+        # default, not a fallback to CPU.
+        if (cfg.gpu_prefill_engine not in ("", "cutlass")
+                and getattr(self, "w13_weight", None) is not None
+                and self.w13_weight.dtype in (torch.bfloat16, torch.float16)):
+            logger.info(
+                "layer %s: 16-bit experts, GPU prefill rides cutlass "
+                "(the recipe asked for %s, which has no kernel for this format)",
+                self.layer_name, cfg.gpu_prefill_engine)
+            cfg.gpu_prefill_engine = "cutlass"
+        cfg.is_draft = is_draft_layer(self.model_type)
+        cfg.verify_pump = get_verify_pump()
+        cfg.pool_decode = is_lk_pool_decode_layer(self.layer_name)
         cfg.pool_slots = get_pool_slots()
         cfg.pool_log = get_pool_log()
         cfg.verify_resident = get_verify_resident()
@@ -2150,11 +2220,35 @@ class FusedMoE(torch.nn.Module):
         cfg.prefill_min_tokens = self.gpu_prefill_min_tokens
         cfg.prefill_wave_experts = self.prefill_wave_experts
         cfg.prefill_d_slots = self.prefill_d_slots
-        # 1 = W4A4 block-scaled prefill, 0 = the W4A16 dequant path. The C++
-        # object COPIES this struct at construction, so the decision has to be
-        # made here (see _resolve_prefill_quant_early) -- arming the driver later
-        # in _init_pool is too late for the engine to see it.
-        cfg.prefill_quant = 1 if self._resolve_prefill_quant_early() == "w4a4" else 0
+        cfg.prefill_w4a4 = is_prefill_w4a4(self._prefill_weight_format())
+        # The member id is this layer's pool-registry key: one counter
+        # for main and draft layers alike. Drafts may additionally admit to
+        # fewer slots -- a quantity knob, never a different layout.
+        cfg.pool_layer_id = lk_pool_id(self.layer_name)
+        if cfg.pool_layer_id < 0 and is_lk_pool_enabled() \
+                and not self.is_gpu_resident_layer:
+            # A pool world that cannot find this layer in its own registry is
+            # a member-id wiring bug, not a legitimate non-member: say it
+            # once, loudly, with both sides of the key.
+            if not getattr(FusedMoE, "_lk_pool_registry_warned", False):
+                FusedMoE._lk_pool_registry_warned = True
+                logger.warning(
+                    "lk_moe pool: registry has NO entry for layer_name=%r "
+                    "(layer_id=%s); this layer runs pool-OFF",
+                    self.layer_name, self.layer_id)
+        if cfg.is_draft:
+            cfg.pool_slot_cap = get_draft_pool_slots()
+        # flashinfer's static demand (expert mirror + max-bucket workspace)
+        # must be on cfg BEFORE the first ctor books the global region. A
+        # draft never books it: a same-type draft shares the main layer's
+        # tier (already booked), and a different-type draft falls to the
+        # cutlass engine, which has no mirror or flashinfer workspace at all.
+        if (cfg.gpu_prefill_engine == "flashinfer" and self.is_gpu_prefill_layer
+                and not cfg.is_draft):
+            from lk_moe.prefill_flashinfer import fi_reserve_bytes
+            cfg.fi_mirror_bytes, cfg.fi_ws_bytes = fi_reserve_bytes(
+                cfg.hidden_size, cfg.intermediate_size, cfg.expert_num,
+                cfg.top_k, cfg.max_batch_size, bool(cfg.prefill_w4a4))
         cfg.pool_window = get_pool_window()
         cfg.pool_inflight = get_pool_inflight()
         cfg.pool_log = get_pool_log()
@@ -2178,18 +2272,18 @@ class FusedMoE(torch.nn.Module):
                   
     def _process_wna16(self): 
         
-        is_transposed = isinstance(self.scheme, CompressedTensorsWNA16MoE)
+        is_transposed = hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsWNA16MoE)
          
-        if(is_transposed):
+        if is_transposed:
             w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
             w2_weight = self.w2_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
             w13_scale = self.w13_weight_scale.cpu().transpose(1, 2).contiguous()
             w2_scale = self.w2_weight_scale.cpu().transpose(1, 2).contiguous() 
         else:
-            w13_weight = self.w13_weight_packed.cpu().contiguous().view(torch.uint8) 
-            w2_weight = self.w2_weight_packed.cpu().contiguous().view(torch.uint8) 
-            w13_scale = self.w13_weight_scale.cpu().contiguous()
-            w2_scale = self.w2_weight_scale.cpu().contiguous() 
+            w13_weight = self.w13_qweight.cpu().contiguous().view(torch.uint8) 
+            w2_weight = self.w2_qweight.cpu().contiguous().view(torch.uint8) 
+            w13_scale = self.w13_scales.cpu().contiguous()
+            w2_scale = self.w2_scales.cpu().contiguous() 
     
          
         
@@ -2447,44 +2541,57 @@ class FusedMoE(torch.nn.Module):
                 requires_grad=False
             ).contiguous()
 
-        self._init_pool()
+        if self.is_pool_layer or self.is_gpu_prefill_layer:
+            self._init_pool()
 
     def _init_pool(self):
-        if not (self.is_pool_layer or self.is_gpu_prefill_layer):
-            return
         self._gpu_prefill_driver = None
         if self.is_gpu_prefill_layer:
             # Engine selector (LK_GPU_PREFILL_ENGINE, default cutlass): a GPU-
             # prefill layer that cannot go GPU is a broken boot, not a CPU
-            # layer -- probe failure raises and the boot dies with it.
-            if get_gpu_prefill_engine() == "cutlass":
+            # layer -- probe failure raises and the boot dies with it. Read the
+            # value the ctor RECORDED on the C++ cfg: the engines' own family
+            # tests read that same field, and re-reading the env here would let
+            # python pick a driver the C++ side does not believe it has.
+            engine = self.lk_moe.cfg.gpu_prefill_engine
+            if engine == "cutlass":
                 from lk_moe.prefill_cutlass import CutlassPrefill
                 drv = CutlassPrefill.probe(self.lk_moe)
                 if drv is None:
                     raise RuntimeError(
                         f"GPU-prefill layer {self.layer_name}: cutlass engine "
-                        f"probe failed (build lacks gpu_prefill or arena not "
+                        f"probe failed (build lacks gpu_prefill or the global "
+                        f"region is not "
                         f"initialised -- check cfg.gpu_prefill_engine)")
-            elif get_gpu_prefill_engine() == "flashinfer":
+            elif engine == "flashinfer":
                 from lk_moe.prefill_flashinfer import FlashinferPrefill
                 drv = FlashinferPrefill.probe(self.lk_moe)
                 if drv is None:
-                    raise RuntimeError(
-                        f"GPU-prefill layer {self.layer_name}: flashinfer "
-                        f"engine probe failed (SM120 NVFP4 only; see the "
-                        f"warning above for the reason)")
+                    if not is_draft_layer(self.model_type):
+                        raise RuntimeError(
+                            f"GPU-prefill layer {self.layer_name}: flashinfer "
+                            f"engine probe failed (SM120 NVFP4 only; see the "
+                            f"warning above for the reason)")
+                    # A draft the SM12x kernels cannot serve rides the cutlass
+                    # engine -- the format-agnostic default -- not the CPU
+                    # path; only if cutlass also declines does the draft keep
+                    # its historical CPU baseline.
+                    from lk_moe.prefill_cutlass import CutlassPrefill
+                    drv = CutlassPrefill.probe(self.lk_moe)
+                    if drv is None:
+                        logger.warning(
+                            "GPU-prefill draft layer %s: neither flashinfer "
+                            "nor cutlass serves this format -> prefill stays "
+                            "CPU", self.layer_name)
             else:
-                from lk_moe.prefill_staging import StagingPrefill
-                drv = StagingPrefill.probe(self.lk_moe)
+                from lk_moe.prefill_triton import TritonPrefill
+                drv = TritonPrefill.probe(self.lk_moe)
             self._gpu_prefill_driver = drv
             # Quantization-level knob: armed at the spot where the engine was
-            # just chosen -- no quant-method-side arm hook. The engine answers
-            # with the modes it implements for (arch, weight format); the
-            # policy (auto order, warn-and-degrade) lives in lk_moe_env.
-            self._arm_prefill_quant(drv)
-        self._pool_layer_info = None
+            # just chosen. lk_moe_env.is_prefill_w4a4 owns the decision.
+            self._arm_prefill_quant()
         self.lk_moe.pool_gpu_report(False)
-        if self.pool_decode:
+        if is_lk_pool_decode_layer(self.layer_name):
             self._init_pool_decode()
 
     def _init_pool_decode(self):
@@ -2503,90 +2610,21 @@ class FusedMoE(torch.nn.Module):
             return
         cfg = self.lk_moe.cfg
         H, I, k = cfg.hidden_size, cfg.intermediate_size, cfg.top_k
-        SB = caps["stride_n"]
-        PK = caps["packed_k_per_iter"]
-        SSZ = int(caps.get("scale_size", 1))
-        ITERS = 16
-        NB_GATEUP, NB_DOWN = I // SB, H // SB
-        total_iters = (H // PK) // ITERS
-        NGK = next(cand for cand in (16, 8, 4, 2, 1)
-                   if total_iters % cand == 0
-                   and k * NB_GATEUP * cand <= 2048)
-        KS = total_iters // NGK
-        # Sized ONCE from the concurrency limit: every decode batch is
-        # covered by construction, no runtime growth path.
-        cap = max(1, self.max_running_requests)
-        # Two different questions, two different inputs -- they used to share
-        # one, which made the buffer size decide whether verify was "covered" at
-        # all: with LK_VERIFY_RESIDENT=0 the (correct) sizing mult was 1, so
-        # real_tokens = bs (6 for DSPARK block 5) exceeded the decode cap, the
-        # pool refused the batch, and a spec step ran every expert on the CPU.
-        #
-        #   sizing:  rows = cap * k * rpt0 -- a verify batch really does carry
-        #            bs = cap * rpt0 rows, whether or not we cover the draft ones;
-        #   coverage: LK_VERIFY_RESIDENT decides whether the DRAFT rows' resident
-        #            experts also run on the GPU (a fidelity tradeoff); the real
-        #            row is covered either way.
-        rpt0 = self._draft_tokens_per_req()
-        mult = rpt0 if rpt0 > 1 else 1
-        # This runs at model init, when the DSPARK width may still read as 1, and
-        # the buffers are also needed during graph capture (where nothing may be
-        # allocated). Size them for a fixed 8-draft headroom: it costs ~2 MB of
-        # pinned scratch and keeps ride-share (draft rows reading slots) inside
-        # the allocation for any block size we run.
-        mult = max(mult, 8)
-        FusedMoE._pool_verify_rows_mult = max(FusedMoE._pool_verify_rows_mult, mult)
-        FusedMoE._pool_verify_all_rows = bool(get_verify_resident())
-        rows = cap * k * FusedMoE._pool_verify_rows_mult
-        dev = torch.cuda.current_device()
-        if not hasattr(FusedMoE, "pool_hbuf"):
-            FusedMoE._pool_k = k
-            FusedMoE._pool_decode_cap = cap
-            FusedMoE.pool_hbuf = torch.zeros((rows, 2 * I), dtype=torch.float32, device=dev)
-            FusedMoE.pool_gout = torch.zeros(
-                (cap * FusedMoE._pool_verify_rows_mult, H), dtype=torch.float32, device=dev)
-            FusedMoE.pool_slot_tab = torch.full((rows,), -1, dtype=torch.int32, device=dev)
-            FusedMoE.pool_gathered_ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
-            FusedMoE.pool_gathered_weights = torch.zeros((rows,), dtype=torch.float32, device=dev)
-            FusedMoE.pool_stream = torch.cuda.Stream()
-            from lk_moe.prefill_staging import StagingPrefill
-            if StagingPrefill._pool_stream is None:
-                StagingPrefill._pool_stream = FusedMoE.pool_stream
-        if (not hasattr(FusedMoE, "pool_hpart")
-                or FusedMoE.pool_hpart.shape != (NGK, rows, 2 * I)):
-            FusedMoE.pool_hpart = torch.zeros((NGK, rows, 2 * I), dtype=torch.float32, device=dev)
-            FusedMoE.pool_gout_part = torch.zeros((rows, H), dtype=torch.float32, device=dev)
-        # fix-4a canonical pool slots: gate and up share ONE merged w13 region,
-        # so each set carries a row offset. Weights are linear in that offset
-        # (row_base * kp); scale rows are not -- a canonical scale row is placed
-        # by its ABSOLUTE row inside the plane, so the up half has to swizzle
-        # row_base + row, which is what RB_UP carries below. A per-set 128
-        # alignment is NOT required (setup_canonical only requires the merged
-        # 2*I rows to fill whole 128-row blocks). Native pools bake nothing and
-        # flag native.
-        canon = bool(int(info.get("canonical") or 0))
-        if canon:
-            rb = [int(v) for v in info["canon_row_base"]]
-            ckp = [int(v) for v in info["canon_kp"]]
-            wa = [int(info["weight_addr"][i]) + rb[i] * ckp[i] for i in range(3)]
-            sa = [int(v) for v in info["scale_addr"]]
-            rb_up = rb[1]
-        else:
-            wa = [int(v) for v in info["weight_addr"]]
-            sa = [int(v) for v in info["scale_addr"]]
-            rb_up = 0
+        max_real_tokens = max(1, self.max_running_requests)
+        rows, gout_rows = _pool_decode_rows(max_real_tokens, k, self._draft_tokens_per_req())
+        geo = _pool_kernel_geometry(H, I, k, caps)
+        _pool_alloc_shared(max_real_tokens, rows, gout_rows, H, I, geo["NGK"])
+        wa, sa, rb_up, layout = _pool_rowmajor_swizzled_addrs(info)
         self._pool_layer_info = dict(
             layer=info["layer"],
             snapshot_addr=info["snapshot_addr"],
             weight_addr=wa, scale_addr=sa,
-            layout="canonical" if canon else "native",
-            rb_up=rb_up,
+            layout=layout, rb_up=rb_up,
             slot_bytes=info["slot_weight_bytes"],
             slot_scale_bytes=info["slot_scale_bytes"],
             gateup_gds=gds["gateup_global_scale_addr"],
             down_gds=gds["down_global_scale_addr"],
-            H=H, I=I, k=k, NB_GATEUP=NB_GATEUP, NB_DOWN=NB_DOWN,
-            NGK=NGK, KS=KS, ITERS=ITERS, **caps,
+            H=H, I=I, k=k, **geo, **caps,
         )
         # The resident half is the GEMV trio (the SM12x alternative measured no
         # better than it and cost a fill-time CPU repack, so it is gone).
@@ -2596,7 +2634,7 @@ class FusedMoE(torch.nn.Module):
                          real_tokens=None, rows_per_token=1, mbox_split=False):
         global _LK_POOL_PROBE_N
         geo = self._pool_layer_info
-        if (_LK_POOL_SPLIT_PROBE and not get_is_capture_mode()
+        if (self.pool_split_probe and not get_is_capture_mode()
                 and topk_ids.numel() <= 32):
             try:
                 ids = topk_ids.flatten().tolist()
@@ -2628,7 +2666,7 @@ class FusedMoE(torch.nn.Module):
         # which only covers the MAIN stream -- queue the resident half there when
         # draft rows participate instead of on the pool's side stream.
         all_rows = (rows_per_token > 1
-                    and FusedMoE._pool_verify_all_rows)
+                    and self._pool_verify_all_rows)
         # The resident half stays on the pool's side stream even when draft rows
         # ride the residency: the CPU half must run beside it, not behind it.
         # Safety comes from ordering, not from serialising the streams -- the
@@ -2650,7 +2688,7 @@ class FusedMoE(torch.nn.Module):
             gathered_ids, gathered_weights = topk_ids, topk_weights
         if side_stream is not torch.cuda.current_stream():
             side_stream.wait_stream(torch.cuda.current_stream())
-        if _LK_POOL_DET_SPLIT:
+        if self.pool_det_split:
             # No guard: a fence we fail to wait on silently voids the very
             # determinism this knob exists for, so a missing geo["layer"] or a
             # failing wait must kill the step, not slip past an `except: pass`.
@@ -2684,36 +2722,62 @@ class FusedMoE(torch.nn.Module):
                 gathered_ids, geo["snapshot_addr"], slot_tab, n_slots,
                 BLOCK=triton.next_power_of_2(n_slots))
             gout_part.zero_()
-            moe_gateup[(n_slots, geo["NB_GATEUP"], geo["NGK"])](
-                gathered_ids, slot_tab,
-                geo["weight_addr"][0], geo["scale_addr"][0],
-                geo["weight_addr"][1], geo["scale_addr"][1], geo["gateup_gds"],
-                hpart, hidden_states, n_slots, k, rows_per_token,
-                GDS_COLS=2 if geo["has_gate"] else 1,
-                NCOL=I, K_PER_BLOCK=H // PK, SCALE_GROUPS_BLK=H // SG,
-                SLOT_BYTES=geo["slot_bytes"][0],
-                SLOT_SCALE_BYTES=geo["slot_scale_bytes"][0],
-                HIDDEN=H, ITERS=geo["ITERS"], SCALE_GROUP=SG,
-                FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
-                HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
-                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
-                KS=geo["KS"], NGK=geo["NGK"], LAYOUT=geo["layout"],
-                RB_UP=geo["rb_up"])
-            reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
-                hpart, hbuf, n_slots * 2 * I, NGK=geo["NGK"], BLOCK=1024)
-            moe_down[(n_slots, geo["NB_DOWN"])](
-                gathered_ids, slot_tab, gathered_weights,
-                geo["weight_addr"][2], geo["scale_addr"][2], geo["down_gds"],
-                hbuf, gout_part, n_slots,
-                NCOL=H, N_PARTIAL=I, K_PER_BLOCK=I // PK,
-                SCALE_GROUPS_BLK=I // SG,
-                SLOT_BYTES=geo["slot_bytes"][2],
-                SLOT_SCALE_BYTES=geo["slot_scale_bytes"][2],
-                ITERS=geo["ITERS"], SCALE_GROUP=SG,
-                FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
-                HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
-                ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
-                LAYOUT=geo["layout"])
+            if geo["format"] in ("bf16", "fp16"):
+                # 16-bit experts: plain dot products over pool rows, NO scales.
+                # hpart holds geo["NGK"] planes; this kernel writes plane 0 only,
+                # and the reduce is launched with NGK=1 so the unused planes are
+                # never summed (they hold whatever the allocator left behind).
+                BN16, BK16 = 32, 128
+                moe_gateup_16[(n_slots, triton.cdiv(I, BN16))](
+                    gathered_ids, slot_tab,
+                    geo["weight_addr"][0], geo["weight_addr"][1],
+                    hpart, hidden_states, n_slots, k, rows_per_token,
+                    N=I, HIDDEN=H, SLOT_BYTES=geo["slot_bytes"][0],
+                    STRIDE=geo["stride_n"],
+                    BLOCK_N=BN16, BLOCK_K=BK16, HAS_GATE=geo["has_gate"])
+                reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
+                    hpart, hbuf, n_slots * 2 * I, NGK=1, BLOCK=1024)
+                moe_down_16[(n_slots, triton.cdiv(H, BN16))](
+                    gathered_ids, slot_tab, gathered_weights,
+                    geo["weight_addr"][2],
+                    hbuf, gout_part, n_slots,
+                    HIDDEN=H, NPARTIAL=I, SLOT_BYTES=geo["slot_bytes"][2],
+                    STRIDE=geo["stride_n"],
+                    BLOCK_N=BN16, BLOCK_K=BK16,
+                    ACTIVATION=geo["activation"],
+                    ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
+                    HAS_GATE=geo["has_gate"])
+            else:
+                    moe_gateup[(n_slots, geo["NB_GATEUP"], geo["NGK"])](
+                    gathered_ids, slot_tab,
+                    geo["weight_addr"][0], geo["scale_addr"][0],
+                    geo["weight_addr"][1], geo["scale_addr"][1], geo["gateup_gds"],
+                    hpart, hidden_states, n_slots, k, rows_per_token,
+                    GDS_COLS=2 if geo["has_gate"] else 1,
+                    NCOL=I, K_PER_BLOCK=H // PK, SCALE_GROUPS_BLK=H // SG,
+                    SLOT_BYTES=geo["slot_bytes"][0],
+                    SLOT_SCALE_BYTES=geo["slot_scale_bytes"][0],
+                    HIDDEN=H, ITERS=geo["ITERS"], SCALE_GROUP=SG,
+                    FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
+                    HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
+                    ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
+                    KS=geo["KS"], NGK=geo["NGK"], LAYOUT=geo["layout"],
+                    RB_UP=geo["rb_up"])
+                    reduce_gate[(triton.cdiv(n_slots * 2 * I, 1024),)](
+                    hpart, hbuf, n_slots * 2 * I, NGK=geo["NGK"], BLOCK=1024)
+                    moe_down[(n_slots, geo["NB_DOWN"])](
+                    gathered_ids, slot_tab, gathered_weights,
+                    geo["weight_addr"][2], geo["scale_addr"][2], geo["down_gds"],
+                    hbuf, gout_part, n_slots,
+                    NCOL=H, N_PARTIAL=I, K_PER_BLOCK=I // PK,
+                    SCALE_GROUPS_BLK=I // SG,
+                    SLOT_BYTES=geo["slot_bytes"][2],
+                    SLOT_SCALE_BYTES=geo["slot_scale_bytes"][2],
+                    ITERS=geo["ITERS"], SCALE_GROUP=SG,
+                    FORMAT=geo["format"], FORMAT_PACKED_K=PK, SCALE_SIZE=SSZ,
+                    HAS_GATE=geo["has_gate"], ACTIVATION=geo["activation"],
+                    ALPHA=geo["swiglu_alpha"], LIMIT=geo["swiglu_limit"],
+                    LAYOUT=geo["layout"])
             reduce_down[(triton.cdiv(H, 1024),)](
                 gout_part, gout[:real_tokens], slot_tab, HIDDEN=H,
                 SLOTS_PER_TOKEN=k, BATCH=real_tokens, BLOCK=1024,
@@ -2726,19 +2790,18 @@ class FusedMoE(torch.nn.Module):
         bs = hidden_states.size(0)
 
         draft_tokens = self._draft_tokens_per_req()
-        mult = draft_tokens if draft_tokens > 1 else 1
-        rows_per_token = mult if (mult > 1 and bs % mult == 0) else 1
+        rows_per_token = draft_tokens if (draft_tokens > 1 and bs % draft_tokens == 0) else 1
         real_tokens = bs // rows_per_token
 
         covered = (self._pool_layer_info is not None
-                 and real_tokens <= FusedMoE._pool_decode_cap)
+                 and real_tokens <= FusedMoE._max_real_tokens)
 
         # The doorbell half of the mailbox path can go on the pool stream only if
         # the join below will be moved to after the GPU half; the two halves of the
         # split are one decision, made here and passed down. An event object is not
         # something to allocate mid-capture, so a layer that is captured before it
         # ever ran eagerly simply stays on the unsplit path.
-        split = _LK_POOL_MBOX_SPLIT and covered
+        split = self.mbox_split and covered
         if split and self._pool_join_ev is None and not get_is_capture_mode():
             self._pool_join_ev = torch.cuda.Event()
         split = split and self._pool_join_ev is not None
@@ -2781,12 +2844,26 @@ class FusedMoE(torch.nn.Module):
             # current stream, and during capture waiting on a stream with no
             # captured work is illegal (cudaErrorStreamCaptureIsolation).
             torch.cuda.current_stream().wait_stream(FusedMoE.pool_stream)
+            # `t[:n]` with n past the end truncates silently, so an undersized
+            # buffer would drop expert rows without one error. Sizing is by
+            # construction (max_real_tokens * k * rows_per_token); a violation
+            # of that contract must be loud.
+            needed = (real_tokens * rows_per_token
+                      if (rows_per_token > 1 and self._pool_verify_all_rows)
+                      else real_tokens)
+            if needed > FusedMoE.pool_gout.shape[0]:
+                raise RuntimeError(
+                    f"pool decode produced {needed} rows but the shared gout "
+                    f"buffer holds {FusedMoE.pool_gout.shape[0]} "
+                    f"(real_tokens={real_tokens}, "
+                    f"rows_per_token={rows_per_token}): sizing and launch "
+                    f"disagree")
             if rows_per_token == 1:
                 FusedMoE.output_gpu[:real_tokens].add_(
                     FusedMoE.pool_gout[:real_tokens])
-            elif FusedMoE._pool_verify_all_rows:
+            elif self._pool_verify_all_rows:
                 # Only the all-rows (LK_VERIFY_RESIDENT) mode writes gout for
-                # every row; the sizing mult is now always rpt0, so testing it
+                # every row; sizing always used max_rows_per_token, so testing
                 # here would add rows the GPU half never computed.
                 n_rows = real_tokens * rows_per_token
                 FusedMoE.output_gpu[:n_rows].add_(FusedMoE.pool_gout[:n_rows])
@@ -2832,130 +2909,49 @@ class FusedMoE(torch.nn.Module):
     _PREFILL_QUANT_LOGGED = set()
 
     def _prefill_weight_format(self) -> str:
-        """Expert-weight format of THIS layer: nvfp4 / mxfp4 / fp8 / bf16.
+        return self.lk_weight_format
 
-        NVFP4 and MXFP4 share the fp4 data type and differ only in the scale
-        element (e4m3 at 16-element blocks vs e8m0 at 32-element blocks), which
-        is exactly what decides whether an activation pair is fp4/fp8/mxfp8.
-        """
-        # ModelOpt NVFP4 keeps `w13_weight_scale` (e4m3) + `..._scale_2`
-        # (fp32 global); MXFP4 keeps `w13_weight_scale_inv` (e8m0). Check both
-        # spellings before falling back to the quant method's name.
-        for attr in ("w13_weight_scale", "w13_weight_scale_inv"):
-            scale = getattr(self, attr, None)
-            if scale is None:
-                continue
-            if scale.dtype == torch.float8_e8m0fnu:
-                return "mxfp4"
-            if scale.dtype == torch.float8_e4m3fn:
-                return "nvfp4"
-        if getattr(self, "w13_weight_scale_2", None) is not None:
-            return "nvfp4"
-        name = ""
-        if self.quant_config is not None:
-            try:
-                name = (self.quant_config.get_name() or "").lower()
-            except Exception:  # noqa: BLE001
-                name = ""
-        if "mxfp4" in name:
-            return "mxfp4"
-        if "nvfp4" in name or "w4a4" in name:
-            return "nvfp4"
-        weight = getattr(self, "w13_weight", None)
-        if weight is not None and weight.dtype == torch.float8_e4m3fn:
-            return "fp8"
-        return "bf16"
+    def _arm_prefill_quant(self) -> None:
+        """Arm W4A4 for this layer, or not.
 
-    def _resolve_prefill_quant_early(self) -> str:
-        """The precision this layer's C++ object will be built with.
-
-        Runs before the engine exists, so it cannot ask the driver; it only
-        mirrors the driver's capability statically (cutlass W4A4 is the
-        experiment switch on an SM120 device; flashinfer arms itself later and
-        does not read cfg.prefill_quant).
+        lk_moe_env.is_prefill_w4a4 owns the whole decision (legality table +
+        the 4-bit weight fact); this function only acts on its bool.
         """
         fmt = self._prefill_weight_format()
-        supported = {"w4a16"}
-        try:
-            import torch as _t
-            sm12 = _t.cuda.get_device_capability()[0] == 12
-        except Exception:  # noqa: BLE001
-            sm12 = False
-        # One table, one knob: lk_moe_env owns the (engine x mode) validity
-        # matrix and the "auto" policy. No capability probing here.
-        return resolve_gpu_prefill_quant(
-            get_gpu_prefill_quant(), get_gpu_prefill_engine(), fmt, sm12)
-
-    def _arm_prefill_quant(self, drv) -> None:
-        """Resolve LK_GPU_PREFILL_QUANT for this layer and arm the engine.
-
-        The engine claims what it implements (``w4a4_support`` today; the
-        w4a8/mxfp8 siblings plug in here); the request/fallback policy is
-        lk_moe_env.resolve_gpu_prefill_quant. A mode the engine lacks degrades
-        with one warning -- precision is a speed setting, not correctness.
-        """
-        fmt = self._prefill_weight_format()
-        requested = get_gpu_prefill_quant()
-        try:
-            import torch as _t
-            sm12 = _t.cuda.get_device_capability()[0] == 12
-        except Exception:  # noqa: BLE001
-            sm12 = False
-        mode = resolve_gpu_prefill_quant(
-            requested, get_gpu_prefill_engine(), fmt, sm12)
-        self.prefill_quant_mode = mode
-        if mode == "w4a4":
+        w4a4 = is_prefill_w4a4(fmt)
+        if w4a4:
             self.lk_moe_arm_w4a4()
-        key = (requested, fmt, mode)
+        key = (fmt, w4a4)
         if key not in FusedMoE._PREFILL_QUANT_LOGGED:
             FusedMoE._PREFILL_QUANT_LOGGED.add(key)
-            logger.info(
-                "[prefill] quant=%s (requested %s, weights %s)", mode, requested, fmt
-            )
+            logger.info("[prefill] w4a4=%s (weights %s)", w4a4, fmt)
 
     def lk_moe_arm_w4a4(self):
         """Hand this checkpoint's calibrated FP4 activation multipliers
-        (1 / input_scale) to the engine driver, for every batch inside the
-        tier's gate. The env + SM120-family factors live in
-        ``is_gpu_prefill_sm120_w4a4_enabled`` (checked by the single caller,
-        ``_init_pool``); the engine answers for itself via w4a4_support().
+        (1 / input_scale) to the engine driver. The legality decision was
+        already made by is_prefill_w4a4 (single caller, _arm_prefill_quant);
+        the engine answers for itself via w4a4_support().
 
-        Which attributes carry the calibration is a property of the
-        quantization method, and every format this repo loads is a named
-        class (see ``_do_process_weights_after_loading``), so dispatch on
-        those names instead of probing for attributes:
+        Which formats carry an input_scale is a fact of the quantization
+        method, and it was already classified once by the format dispatch in
+        _do_process_weights_after_loading -- read the recorded lk_weight_format
+        instead of re-deriving it from isinstance:
 
-        * ``ModelOptNvFp4FusedMoEMethod`` and ``CompressedTensors`` with the
-          ``CompressedTensorsW4A4Nvfp4MoE`` scheme -- NVFP4, e4m3 scales at
-          16-element blocks -- carry ``w13/w2_input_scale`` (the calibrated
-          per-layer activation scales) plus ``w13_weight_scale_2``, which is
-          what the gate/up ratio below is read from.
-        * The MXFP4 methods (``Mxfp4MarlinMoEMethod``,
-          ``Mxfp4FlashinferTrtllmMoEMethod``, ``Mxfp4FlashinferCutlassMoEMethod``)
-          -- e8m0 scales at 32-element blocks -- carry ``w13_weight_scale_inv``
-          and NO input_scale: MXFP4 derives the activation scale per block, so
-          the engine discards the global multiplier for it (lk_moe
-          csrc/cuda/moe_v2_gpu_quant.cuh, "global_scale is ignored for MXFP4").
-          Nothing to arm, so nothing to read.
-        * Every other format (WNA16, AWQ, FP8, unquantized) never resolves to
-          w4a4 in the quant matrix at all.
-
-        Reading the NVFP4 names unconditionally booted the first MXFP4 W4A4
-        attempt into AttributeError: 'w13_weight_scale_2' inside
-        process_weights_after_loading (2026-11-10, DeepSeek-V4-Flash-0731).
+        * "nvfp4": carries w13/w2_input_scale (calibrated per-layer activation
+          scales) plus w13_weight_scale_2 (the gate/up ratio below).
+        * "mxfp4": derives the activation scale per e8m0 block and has NO
+          input_scale -- the engine discards the global multiplier for it
+          (csrc/cuda/moe_v2_gpu_quant.cuh, "global_scale is ignored for
+          MXFP4"). Nothing to arm. Reading the NVFP4 names unconditionally
+          booted the first MXFP4 W4A4 attempt into AttributeError:
+          'w13_weight_scale_2' (2026-11-10, DeepSeek-V4-Flash-0731).
+        * Every other format cannot reach here: is_prefill_w4a4 admits only
+          the 4-bit families.
         """
         drv = self._gpu_prefill_driver
         if drv is None or not drv.w4a4_support():
             return
-        if not (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-            or (
-                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
-                and isinstance(
-                    getattr(self, "scheme", None), CompressedTensorsW4A4Nvfp4MoE
-                )
-            )
-        ):
+        if self.lk_weight_format != "nvfp4":
             return
         one = torch.ones((), dtype=torch.float32)
         gs13 = self.w13_weight_scale_2.detach().to(torch.float32)
@@ -2975,7 +2971,7 @@ class FusedMoE(torch.nn.Module):
         out = gout.to(hidden_states.dtype)
         if self.check_nan_in_output:
             torch.nan_to_num(out, nan=0.0, out=out)
-        if _LK_PP_DEBUG:
+        if is_lk_prefill_debug():
             # Diagnostic only (LK_PP_DEBUG=1): compare the GPU-tier result to
             # the CPU tier. Keyed by (layer, M) and not just layer: the tier's
             # cost path depends on M (M > 8192/topk walks the chunk loop), so
@@ -2995,8 +2991,9 @@ class FusedMoE(torch.nn.Module):
             # chunk period.
             n_ = getattr(self, "_ppdbg_calls", 0) + 1
             self._ppdbg_calls = n_
-            if _LK_PP_DEBUG_EVERY:
-                fire = n_ % _LK_PP_DEBUG_EVERY == 0
+            every = get_pp_debug_every()
+            if every:
+                fire = n_ % every == 0
             else:
                 fire = (self.layer_id, M_) not in seen
             if fire:

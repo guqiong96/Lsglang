@@ -473,6 +473,8 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
         )
+        if self.is_draft_worker:
+            _record_draft_pool_members(self.model_config)
 
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
@@ -774,3 +776,67 @@ class TpModelWorker(BaseTpWorker):
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result
+
+
+def _record_draft_pool_members(model_config) -> None:
+    # The draft's MoE layers must be COUNTED for the pool's global region
+    # before they are constructed: the target model's first lk_moe ctor -- the
+    # one that sizes the region -- runs during the target's weight
+    # post-processing, and the draft's FusedMoE instances are born only when
+    # the draft worker loads. The count comes from the SAME config the draft
+    # model class itself reads, per draft kind -- the algorithm chose the
+    # arch before this config was built (model_config's draft rewrite), so
+    # the arch name says which derivation is truth:
+    #   *...DSpark -> one platform stage == one MoE layer (dspark_stage_count)
+    #   *...NextN  -> the num_nextn_predict_layers the rewrite stamped
+    # Other spec drafts (eagle etc.) stay on the registry-only path they had.
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        dspark_stage_count,
+        parse_dspark_draft_config,
+    )
+
+    arch = ((getattr(model_config.hf_config, "architectures", None)
+             or [""])[0])
+    try:
+        from sglang.srt.utils.lk_moe_env import get_pool_log as _gpl
+        if _gpl() > 0:
+            import logging as _lg
+            _lg.getLogger(__name__).info(
+                "[pool] registry-spec-probe arch=%r archs=%r nextn=%r type=%s",
+                arch, getattr(model_config.hf_config, "architectures", None),
+                getattr(model_config.hf_config, "num_nextn_predict_layers", None),
+                type(model_config.hf_config).__name__)
+    except Exception as _e:      # a probe must never change the run
+        import logging as _lg
+        _lg.getLogger(__name__).info("[pool] registry-spec-probe failed: %s", _e)
+    # The COUNT is the number of draft MoE layers that will actually JOIN the
+    # pool: a layer in the role's resident list is never registered as a member
+    # (regist_lk_pool_member is skipped for residents), so counting it would
+    # reserve a cell nobody ever claims -- bytes wasted for the process lifetime.
+    # This is not hypothetical: the production Qwen3.6 recipe keeps
+    # LK_GPU_RESIDENT_MOE_LAYERS=0-1,33-34 with NO role variable, and
+    # get_gpu_resident_env_var() falls back to the main list for drafts; the MTP
+    # draft restarts its layer ids at 0, so id 0 is "resident" and the draft
+    # never joins -- while the count still reserved one cell (measured
+    # 2026-11-17: 37 cells for 36 memberships).
+    from sglang.srt.utils.lk_moe_env import (
+        is_lk_moe_gpu_resident_layer,
+        record_spec_draft_moe_layers,
+    )
+    hf = model_config.hf_config
+    if arch.endswith("DSpark"):
+        n = dspark_stage_count(parse_dspark_draft_config(draft_hf_config=hf), hf)
+        role = "dspark"
+    elif arch.endswith("NextN"):
+        n = int(getattr(hf, "num_nextn_predict_layers", 1) or 1)
+        role = "mtp"
+    elif arch.endswith("MTP"):
+        n = int(getattr(hf, "num_nextn_predict_layers", None)
+                or getattr(hf, "num_hidden_layers", None) or 1)
+        role = "mtp"
+    else:
+        return                      # eagle/ngram: registry-only path, as before
+    joining = sum(1 for i in range(max(0, n))
+                  if not is_lk_moe_gpu_resident_layer(i, role))
+    record_spec_draft_moe_layers(joining)
+

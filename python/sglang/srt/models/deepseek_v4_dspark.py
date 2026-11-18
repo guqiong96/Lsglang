@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    dspark_stage_count,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -731,10 +732,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
-        if dspark_config.target_layer_ids is not None:
-            self.num_stages = len(dspark_config.target_layer_ids)
-        else:
-            self.num_stages = int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+        self.num_stages = dspark_stage_count(dspark_config, config)
 
         target_num_layers = (
             int(dspark_config.num_target_layers)
