@@ -119,8 +119,17 @@ def _verify_commit_outputs_kernel(
     valid = row < BS
     accepted = tl.load(accept_lens + row * ACCEPT_STRIDE, valid, other=1).to(tl.int64)
     length = tl.load(seq_lens + row * SEQ_STRIDE, valid, other=0).to(tl.int64)
+    # `accepted - 1` is the column of the LAST accepted token, and the served path
+    # always has accepted >= 1. The WARMUP path (prewarm_draft_step_path) feeds
+    # torch.zeros for accept_lens, so accepted == 0 -> column -1 -> an address
+    # BEFORE accept_index. With page-aligned VMM allocations that read lands on an
+    # unmapped page: NVRM Xid 31 / FAULT_PDE / VIRT_READ, blamed on whichever
+    # kernel launches next (measured repeatedly on the q38 MTP world, 2026-11-17).
+    # Clamp the COLUMN index only; `accepted` itself keeps its value for the
+    # arithmetic below (a zero row legitimately means "nothing accepted").
+    accepted_col = tl.maximum(accepted, 1)
     idx = tl.load(
-        accept_index + row * INDEX_STRIDE_0 + (accepted - 1) * INDEX_STRIDE_1,
+        accept_index + row * INDEX_STRIDE_0 + (accepted_col - 1) * INDEX_STRIDE_1,
         valid,
         other=0,
     ).to(tl.int64)
