@@ -116,10 +116,7 @@ if is_lk_moe_feature_enabled():
     import triton
     from lk_moe._hybrid_gemv_kernel import (
         gather_rows, slot_table_fill, moe_gateup, reduce_gate, moe_down, reduce_down)
-    # 16-bit pool GEMV lives in a newer wheel than some deployments run. Absent,
-    # bf16/fp16 simply have no kernel_caps and the pool decode declines for them
-    # (safe fallback), so the import must not turn an older wheel into a boot
-    # failure -- that is exactly what it did when this A/B first ran.
+    # Older wheels have no 16-bit pool GEMV; the pool decode declines, not boots.
     try:
         from lk_moe._hybrid_gemv_16b import moe_gateup_16, moe_down_16
     except ImportError:          # old wheel: no 16-bit pool GEMV at all
@@ -335,6 +332,28 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
         )
+
+
+# The two NVFP4 loaders name the same facts differently and disagree on
+# orientation, so name lookup lives here instead of at each site.
+def _nvfp4_gate_up_global_scale(layer):
+    # compressed-tensors stores the reciprocal of the modelopt weight scale.
+    if hasattr(layer, "w13_weight_global_scale"):
+        return 1.0 / layer.w13_weight_global_scale
+    return layer.w13_weight_scale_2
+
+
+def _nvfp4_activation_mults(layer):
+    cfg = getattr(getattr(layer, "quant_method", None), "quant_config", None)
+    if getattr(cfg, "use_per_token_activation", False):
+        # Dynamic per-token scales: no static multiplier to read.
+        return (torch.ones_like(layer.w13_input_scale, dtype=torch.float32),
+                torch.ones_like(layer.w2_input_scale, dtype=torch.float32))
+    if hasattr(layer, "w13_input_global_scale"):
+        # compressed-tensors stores the multiplier where modelopt stores its
+        # reciprocal.
+        return layer.w13_input_global_scale, layer.w2_input_global_scale
+    return 1.0 / layer.w13_input_scale, 1.0 / layer.w2_input_scale
 
 
 def _pool_kernel_geometry(H, I, k, caps):
@@ -2086,10 +2105,6 @@ class FusedMoE(torch.nn.Module):
                 n = None
         return n or 1
 
-    def _zero_tensor(self, tensor: torch.Tensor):
-        if tensor is not None:
-            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
-            
     def _do_process_weights_after_loading(self) -> bool:
         if (isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE)) \
           or isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) :
@@ -2145,7 +2160,7 @@ class FusedMoE(torch.nn.Module):
                     logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
                     return
                 
-                self._initialize_cuda_graph_buffers()
+                self._initialize_gpu_resource()
                 logger.info(f"Initialized lk_moe with {self.moe_runner_config.num_local_experts} experts for layer {self.layer_id} [" + 
                 ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
         except Exception:
@@ -2176,15 +2191,7 @@ class FusedMoE(torch.nn.Module):
         cfg.pool_cache = self.is_pool_layer
         cfg.pool_member_layers = get_pool_member_layers()
         cfg.gpu_prefill_engine = get_gpu_prefill_engine()
-        # 16-bit expert weights have no whole-window prefill kernel: cutlass is
-        # the only format-agnostic engine (its dequant covers bf16/fp16 too).
-        # A recipe that asks for flashinfer/triton would otherwise be refused at
-        # C++ tier init ("engine X has no GPU kernels for this weight format"),
-        # which is exactly how the 5060Ti recipe stopped booting on 2026-11-17:
-        # its draft layer is bf16 and the recipe sets LK_GPU_PREFILL_ENGINE=
-        # flashinfer. The 16-bit member's prefill therefore always rides cutlass;
-        # cutlass then handles it like every other format, so this is a routing
-        # default, not a fallback to CPU.
+        # 16-bit experts have no whole-window prefill kernel: ride cutlass.
         if (cfg.gpu_prefill_engine not in ("", "cutlass")
                 and getattr(self, "w13_weight", None) is not None
                 and self.w13_weight.dtype in (torch.bfloat16, torch.float16)):
@@ -2221,15 +2228,11 @@ class FusedMoE(torch.nn.Module):
         cfg.prefill_wave_experts = self.prefill_wave_experts
         cfg.prefill_d_slots = self.prefill_d_slots
         cfg.prefill_w4a4 = is_prefill_w4a4(self._prefill_weight_format())
-        # The member id is this layer's pool-registry key: one counter
-        # for main and draft layers alike. Drafts may additionally admit to
-        # fewer slots -- a quantity knob, never a different layout.
+        # Pool-registry key: one counter for main and draft layers.
         cfg.pool_layer_id = lk_pool_id(self.layer_name)
         if cfg.pool_layer_id < 0 and is_lk_pool_enabled() \
                 and not self.is_gpu_resident_layer:
-            # A pool world that cannot find this layer in its own registry is
-            # a member-id wiring bug, not a legitimate non-member: say it
-            # once, loudly, with both sides of the key.
+            # Not a member is a wiring bug: say it once, with both sides.
             if not getattr(FusedMoE, "_lk_pool_registry_warned", False):
                 FusedMoE._lk_pool_registry_warned = True
                 logger.warning(
@@ -2527,10 +2530,8 @@ class FusedMoE(torch.nn.Module):
         
         return batch_size
   
-    def _initialize_cuda_graph_buffers(self): 
+    def _initialize_gpu_resource(self): 
         if not hasattr(FusedMoE, 'cuda_graphs'):
-            # Decode rows, not a token batch: self.max_num_seqs is max_running_requests
-            # (times 1+draft with speculative decoding), see _get_max_num_seqs().
             decode_batch_size = self.max_num_seqs
             current_device = torch.cuda.current_device()
              
@@ -2541,58 +2542,48 @@ class FusedMoE(torch.nn.Module):
                 requires_grad=False
             ).contiguous()
 
+        self.lk_moe.set_gpu_decode_live(False)
         if self.is_pool_layer or self.is_gpu_prefill_layer:
-            self._init_pool()
-
-    def _init_pool(self):
+            self._init_gpu_prefill_driver()
+        if is_lk_pool_decode_layer(self.layer_name):
+            self._init_pool_decode()
+        
+    def _init_gpu_prefill_driver(self):
         self._gpu_prefill_driver = None
-        if self.is_gpu_prefill_layer:
-            # Engine selector (LK_GPU_PREFILL_ENGINE, default cutlass): a GPU-
-            # prefill layer that cannot go GPU is a broken boot, not a CPU
-            # layer -- probe failure raises and the boot dies with it. Read the
-            # value the ctor RECORDED on the C++ cfg: the engines' own family
-            # tests read that same field, and re-reading the env here would let
-            # python pick a driver the C++ side does not believe it has.
-            engine = self.lk_moe.cfg.gpu_prefill_engine
-            if engine == "cutlass":
+        if not self.is_gpu_prefill_layer:
+            return
+        engine = self.lk_moe.cfg.gpu_prefill_engine
+        if engine == "cutlass":
+            from lk_moe.prefill_cutlass import CutlassPrefill
+            drv = CutlassPrefill.probe(self.lk_moe)
+            if drv is None:
+                raise RuntimeError(
+                    f"GPU-prefill layer {self.layer_name}: cutlass engine "
+                    f"probe failed (build lacks gpu_prefill or the global "
+                    f"region is not "
+                    f"initialised -- check cfg.gpu_prefill_engine)")
+        elif engine == "flashinfer":
+            from lk_moe.prefill_flashinfer import FlashinferPrefill
+            drv = FlashinferPrefill.probe(self.lk_moe)
+            if drv is None:
+                if not is_draft_layer(self.model_type):
+                    raise RuntimeError(
+                        f"GPU-prefill layer {self.layer_name}: flashinfer "
+                        f"engine probe failed (SM120 NVFP4 only; see the "
+                        f"warning above for the reason)")
                 from lk_moe.prefill_cutlass import CutlassPrefill
                 drv = CutlassPrefill.probe(self.lk_moe)
                 if drv is None:
-                    raise RuntimeError(
-                        f"GPU-prefill layer {self.layer_name}: cutlass engine "
-                        f"probe failed (build lacks gpu_prefill or the global "
-                        f"region is not "
-                        f"initialised -- check cfg.gpu_prefill_engine)")
-            elif engine == "flashinfer":
-                from lk_moe.prefill_flashinfer import FlashinferPrefill
-                drv = FlashinferPrefill.probe(self.lk_moe)
-                if drv is None:
-                    if not is_draft_layer(self.model_type):
-                        raise RuntimeError(
-                            f"GPU-prefill layer {self.layer_name}: flashinfer "
-                            f"engine probe failed (SM120 NVFP4 only; see the "
-                            f"warning above for the reason)")
-                    # A draft the SM12x kernels cannot serve rides the cutlass
-                    # engine -- the format-agnostic default -- not the CPU
-                    # path; only if cutlass also declines does the draft keep
-                    # its historical CPU baseline.
-                    from lk_moe.prefill_cutlass import CutlassPrefill
-                    drv = CutlassPrefill.probe(self.lk_moe)
-                    if drv is None:
-                        logger.warning(
-                            "GPU-prefill draft layer %s: neither flashinfer "
-                            "nor cutlass serves this format -> prefill stays "
-                            "CPU", self.layer_name)
-            else:
-                from lk_moe.prefill_triton import TritonPrefill
-                drv = TritonPrefill.probe(self.lk_moe)
-            self._gpu_prefill_driver = drv
-            # Quantization-level knob: armed at the spot where the engine was
-            # just chosen. lk_moe_env.is_prefill_w4a4 owns the decision.
-            self._arm_prefill_quant()
-        self.lk_moe.pool_gpu_report(False)
-        if is_lk_pool_decode_layer(self.layer_name):
-            self._init_pool_decode()
+                    logger.warning(
+                        "GPU-prefill draft layer %s: neither flashinfer "
+                        "nor cutlass serves this format -> prefill stays "
+                        "CPU", self.layer_name)
+        else:
+            from lk_moe.prefill_triton import TritonPrefill
+            drv = TritonPrefill.probe(self.lk_moe)
+        self._gpu_prefill_driver = drv
+        # The legality table lives in lk_moe_env.is_prefill_w4a4.
+        self._configure_prefill_quant()
 
     def _init_pool_decode(self):
         info = self.lk_moe.pool_layer_info()
@@ -2628,7 +2619,7 @@ class FusedMoE(torch.nn.Module):
         )
         # The resident half is the GEMV trio (the SM12x alternative measured no
         # better than it and cost a fill-time CPU repack, so it is gone).
-        self.lk_moe.pool_gpu_report(True)
+        self.lk_moe.set_gpu_decode_live(True)
 
     def _pool_decode_launch(self, hidden_states, topk_ids, topk_weights,
                          real_tokens=None, rows_per_token=1, mbox_split=False):
@@ -2807,7 +2798,7 @@ class FusedMoE(torch.nn.Module):
         split = split and self._pool_join_ev is not None
 
         if covered:
-            self.lk_moe.pool_gpu_report(True)
+            self.lk_moe.set_gpu_decode_live(True)
             self._pool_decode_launch(hidden_states, topk_ids, topk_weights,
                                   real_tokens=real_tokens,
                                   rows_per_token=rows_per_token,
@@ -2816,7 +2807,7 @@ class FusedMoE(torch.nn.Module):
             # Sticky flag: an uncovered batch must clear it or the C++ side keeps
             # skipping the resident experts it believes the GPU half covered,
             # while this batch's GPU half never ran -> silently dropped experts.
-            self.lk_moe.pool_gpu_report(False)
+            self.lk_moe.set_gpu_decode_live(False)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         if split:
             # The resident half is queued on the pool stream behind the doorbell;
@@ -2911,58 +2902,33 @@ class FusedMoE(torch.nn.Module):
     def _prefill_weight_format(self) -> str:
         return self.lk_weight_format
 
-    def _arm_prefill_quant(self) -> None:
-        """Arm W4A4 for this layer, or not.
-
-        lk_moe_env.is_prefill_w4a4 owns the whole decision (legality table +
-        the 4-bit weight fact); this function only acts on its bool.
-        """
+    def _configure_prefill_quant(self) -> None:
         fmt = self._prefill_weight_format()
         w4a4 = is_prefill_w4a4(fmt)
         if w4a4:
-            self.lk_moe_arm_w4a4()
+            self.lk_moe_enable_w4a4()
         key = (fmt, w4a4)
         if key not in FusedMoE._PREFILL_QUANT_LOGGED:
             FusedMoE._PREFILL_QUANT_LOGGED.add(key)
             logger.info("[prefill] w4a4=%s (weights %s)", w4a4, fmt)
 
-    def lk_moe_arm_w4a4(self):
+    def lk_moe_enable_w4a4(self):
         """Hand this checkpoint's calibrated FP4 activation multipliers
-        (1 / input_scale) to the engine driver. The legality decision was
-        already made by is_prefill_w4a4 (single caller, _arm_prefill_quant);
-        the engine answers for itself via w4a4_support().
-
-        Which formats carry an input_scale is a fact of the quantization
-        method, and it was already classified once by the format dispatch in
-        _do_process_weights_after_loading -- read the recorded lk_weight_format
-        instead of re-deriving it from isinstance:
-
-        * "nvfp4": carries w13/w2_input_scale (calibrated per-layer activation
-          scales) plus w13_weight_scale_2 (the gate/up ratio below).
-        * "mxfp4": derives the activation scale per e8m0 block and has NO
-          input_scale -- the engine discards the global multiplier for it
-          (csrc/cuda/moe_v2_gpu_quant.cuh, "global_scale is ignored for
-          MXFP4"). Nothing to arm. Reading the NVFP4 names unconditionally
-          booted the first MXFP4 W4A4 attempt into AttributeError:
-          'w13_weight_scale_2' (2026-11-10, DeepSeek-V4-Flash-0731).
-        * Every other format cannot reach here: is_prefill_w4a4 admits only
-          the 4-bit families.
+        (1 / input_scale) to the engine driver, which answers for itself.
         """
         drv = self._gpu_prefill_driver
         if drv is None or not drv.w4a4_support():
             return
+        # mxfp4 has no global activation multiplier (per-block e8m0 scales).
         if self.lk_weight_format != "nvfp4":
             return
-        one = torch.ones((), dtype=torch.float32)
-        gs13 = self.w13_weight_scale_2.detach().to(torch.float32)
-        ratio = one
-        if gs13.dim() > 1 and gs13.shape[-1] >= 2:
-            gate, up = gs13[..., 0], gs13[..., 1]
+        gate_up = _nvfp4_gate_up_global_scale(self)
+        ratio = 1.0
+        if gate_up.dim() > 1 and gate_up.shape[-1] >= 2:
+            gate, up = gate_up[..., 0], gate_up[..., 1]
             ratio = torch.where(gate > 0, up / gate, torch.ones_like(up)).amax()
-        drv.enable_w4a4(
-            one / self.w13_input_scale.detach().to(torch.float32).amax(),
-            one / (ratio * self.w2_input_scale.detach().to(torch.float32).amax()),
-        )
+        a13, a2 = _nvfp4_activation_mults(self)
+        drv.enable_w4a4(a13.amax(), a2.amax() / ratio)
 
     def _gpu_prefill(self, hidden_states, topk_weights, topk_ids):
         ev, gout = self._gpu_prefill_driver.prefill_gpu(

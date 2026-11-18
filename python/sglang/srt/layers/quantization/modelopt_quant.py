@@ -2791,7 +2791,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
             # The lk_moe tiers never reach the backend-specific preparation
             # below; the W4A4 arm lives with the engine, at driver creation
-            # in FusedMoE._init_pool.
+            # in FusedMoE._init_gpu_prefill_driver.
             return None
         """Transform packed FP4 MoE weights and scales for the selected backend."""
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(

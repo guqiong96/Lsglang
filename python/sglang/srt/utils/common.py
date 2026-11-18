@@ -125,15 +125,12 @@ from sglang.srt.utils.env_vars import (
     set_int_env_var,
 )
 from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
-    LkMoeConfig,
     enabled_layerwise_load,
     get_gpu_prefill_engine,
     get_gpu_prefill_min_tokens,
     get_gpu_resident_env_var,
     get_hf_mbox,
-    get_lk_moe_config,
     get_lk_ple_probe_dump_path,
-    get_lk_pool_layer_set,
     get_model_type_from_layer_name,
     is_pool_mbox_split,
     get_pool_inflight,
@@ -149,7 +146,6 @@ from sglang.srt.utils.lk_moe_env import (  # noqa: F401  (compat re-export)
     get_verify_resident,
     get_gpu_prefill_quant,
     is_prefill_w4a4,
-    resolve_prefill_quant,
     is_lk_gpu_prefill_enabled,
     is_lk_moe_feature_enabled,
     is_lk_moe_gpu_resident_layer,

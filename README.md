@@ -146,7 +146,7 @@ LK_MOE_HYBRID_ENABLED=1                     master
  ├─ GPU prefill on     LK_GPU_PREFILL_MIN_TOKENS (e.g. 1024)   (dual knob, same rule)
  │   ├─ engine         LK_GPU_PREFILL_ENGINE=cutlass|triton|flashinfer (default cutlass; triton = opt-out;
  │   │                                             flashinfer = SM120/SM121 + NVFP4 checkpoints only)
- │   ├─ precision      LK_GPU_PREFILL_QUANT=auto|w4a4|w4a8|w4a16|w8a8  (see the engine table below)
+ │   ├─ precision      LK_GPU_PREFILL_QUANT=w4a16|w4a4  (default w4a16; see the engine table below)
  │   ├─ wave           LK_GPU_PREFILL_WAVE_EXPERTS (cutlass only; -1 auto / 0 single-shot / >0 cap)
  │   └─ super mix      LK_GPU_PREFILL_SUB_M (e.g. 16384)  (>0 super-chunk staging; 0 = per-chunk)
  ├─ nvme filler on    LK_NVME_DIRECT=1          (needs the feature's own backend flag: --ple-offload-backend nvme / engram host table;
@@ -188,48 +188,46 @@ LK_MOE_HYBRID_ENABLED=0  →  every branch above unreachable = original sglang
 |--------|------|--------|------|
 | `LK_GPU_PREFILL_MIN_TOKENS` | prefill | 1024 (on) | **tier switch AND batch gate**: the value itself switches (e.g. 1024 turns the tier on; `0` = pure CPU prefill) = minimum token batch for the GPU path. On by default; set `0` for pure CPU prefill (16 GB cards) |
 | `LK_GPU_PREFILL_ENGINE` | prefill | `cutlass` | which GPU prefill path runs above the token gate. `cutlass`: fastest on long prompts, works with every pooled dtype; rounds activations to bf16 — long-context logits can shift and borderline EOS can flip; `triton`: output bit-matches the CPU reference, slightly slower; `flashinfer` (SM120/SM121 + **NVFP4 checkpoints only** — the CuTe kernels are NVFP4-only, an fp8/mxfp4 pool layer fails its init probe and the boot aborts by design): stages the weights as FP4 and runs the FP4 tensor cores — works standalone at W4A16 (CPU-matching) numerics; `LK_GPU_PREFILL_QUANT=w4a4` runs its activations in FP4 too; forwarded via cfg, the C++ library itself does not read this env |
-| `LK_GPU_PREFILL_QUANT` | prefill | `auto` | prefill precision, resolved per layer against the engine table below: `auto` keeps W4A16 for now, an explicit `w4a4` / `w4a8` / `w4a16` / `w8a8` is a request; a mode the engine lacks **warns and degrades** (precision is a speed setting, never a correctness one). Replaces the retired `LK_GPU_PREFILL_SM120_W4A4`, which now raises |
+| `LK_GPU_PREFILL_QUANT` | prefill | `w4a16` | prefill precision, resolved per layer against the legality table below: `w4a4` runs FP4 activations, `w4a16` keeps them in bf16; a (device, engine, mode) pair the table does not carry **aborts startup** instead of silently running another mode |
 | `LK_GPU_PREFILL_WAVE_EXPERTS` | prefill | `-1` auto | tier wave width, ONE geometry for all three engines, frozen at init: `-1`/unset = one wave over all E experts (the gate-tested default), `>0` = W experts per wave - a per-wave gemm loop only the cutlass engine has, so `0 < W < E` on a staging engine (triton/flashinfer) aborts at init; appears as `wave=` in the `[tier]` boot line |
 | `LK_GPU_PREFILL_D_SLOTS` | prefill | 0 = off | tier activation window in slot rows, frozen at init (the `act_rows=` figure in the `[tier]` boot line); **all three engines** pace their prefill passes to hold it, at the cost of extra kernel launches, result unchanged. The two staging engines never walk more than their built-in 8192-slot block, so the knob only *tightens* their walk: a value at or above that block (and `0`) leaves them byte-identical to before, and the triton scratch follows a tighter walk. The staging arena still reports `act 0 B` -- its activations live in the driver buffers, not in the arena. `0` = one window per pass (cutlass) |
 | `LK_GPU_PREFILL_SUB_M` | prefill | 0 | super-mix staging size (tokens); only meaningful while the tier is on (`LK_GPU_PREFILL_MIN_TOKENS > 0`): `>0` enables super-chunk staging (e.g. 65536), `0` = per-chunk staging; the super-chunk attention wrapper only arms when SUB_M exceeds `--chunked-prefill-size`. Bigger values move more of each expert's weights per token (faster) but raise the token budget of a single forward - the `CAP=` in the `Super-chunk prefill wrapper active` boot line - and with it the scratch that scales with that budget, incl. a pre-reserved output buffer of ~ SUB_M × hidden × 4 bytes per rank that is already counted against the KV budget; halving it roughly halves that scratch |
 
 #### Prefill precision: `LK_GPU_PREFILL_QUANT` x `LK_GPU_PREFILL_ENGINE`
 
-Two tables, one per device family: the same (engine, mode) pair resolves
-differently because the block-scaled CUTLASS family is SM120-only and
-flashinfer's CuTe kernels are SM12x-only. Source of truth:
-`_PREFILL_QUANT_MATRIX` in `srt/utils/lk_moe_env.py`.
+Source of truth: `_LK_PREFILL_QUANT_OK` in `srt/utils/lk_moe_env.py`, a set of
+`(device family, engine, mode)` keys. The family comes from the CUDA capability,
+not from an env var: the block-scaled CUTLASS collectives are SM120-only and
+flashinfer's CuTe kernels are SM12x-only, so the same (engine, mode) pair is
+legal on one family and not the other. `test/srt/test_lk_prefill_quant.py` is
+the executable copy of these two tables.
 
 **SM120** (RTX 5060 Ti, RTX PRO, B-series GeForce)
 
-| engine \ mode | `auto` | `w4a4` | `w4a8` | `w4a16` | `w8a8` |
-|---|---|---|---|---|---|
-| `cutlass` | -> `w4a16` | yes (NVFP4 and MXFP4) | - | yes | - |
-| `triton` | -> `w4a16` | - | - | yes | - |
-| `flashinfer` | -> `w4a16` | yes (NVFP4) | - | yes | - |
+| engine \ mode | `w4a4` | `w4a16` |
+|---|---|---|
+| `cutlass` | yes (NVFP4 and MXFP4) | yes |
+| `triton` | raises | yes |
+| `flashinfer` | yes (NVFP4) | yes |
 
 **sm8x / SM90 and older** (RTX 3090, A100/H100)
 
-| engine \ mode | `auto` | `w4a4` | `w4a8` | `w4a16` | `w8a8` |
-|---|---|---|---|---|---|
-| `cutlass` | -> `w4a16` | - | - | yes | - |
-| `triton` | -> `w4a16` | - | - | yes | - |
-| `flashinfer` | - | - | - | - | - |
+| engine \ mode | `w4a4` | `w4a16` |
+|---|---|---|
+| `cutlass` | raises | yes |
+| `triton` | raises | yes |
+| `flashinfer` | raises | raises |
 
-`yes` = implemented on that engine and device, `-` = not implemented.
-
-- **A missing pair is not an error.** An explicit request for a mode the engine
-  does not implement warns once and falls back to **the safe mode for those
-  weights (`w4a16`)** -- never sideways into another 4-bit experiment. Only an
-  invalid value (or a mode that cannot exist for the weight format) raises.
-- **`auto` still resolves to `w4a16`.** W4A4 is opt-in via the explicit value;
-  graduating it is a one-line policy change, not another env var.
+- **A pair the table does not carry aborts startup.** It used to warn and fall
+  back to `w4a16`; that hid which engine actually ran, so it now follows the
+  same rule as every other illegal `LK_*` value.
+- **W4A16 is the default.** W4A4 is opt-in through the explicit value.
 - **`w4a4` covers both 4-bit weight families.** NVFP4 keeps e4m3 scales at
   16-element blocks; MXFP4 (the DeepSeek-V4.1 / 0731 experts) stores e8m0 scales
-  at 32-element blocks, which the `cutlass` engine now repacks into the dense
-  layout the block-scaled GEMM reads. `flashinfer` stays NVFP4-only.
-- `w4a8` / `w8a8` are reserved: CUTLASS has kernels for both, the engine wiring
-  is not done, so they degrade today.
+  at 32-element blocks, which the `cutlass` engine repacks into the dense layout
+  the block-scaled GEMM reads. `flashinfer` stays NVFP4-only.
+- `w4a8` / `w8a8` are not in the table: upstream has the kernels, the engine
+  wiring does not, so asking for either raises.
 - Measured (Qwen3.8-Flash-Next, 2x5060Ti, cold prefix cache, 32K prompt):
   `flashinfer`+`w4a4` **2195 t/s**, `cutlass`+`w4a16` **1406-1421 t/s**,
   `cutlass`+`w4a4` **1410 t/s** — on SM120 the cutlass engine's staging cost
@@ -245,8 +243,7 @@ flashinfer's CuTe kernels are SM12x-only. Source of truth:
 | `LK_POOL_MBOX_SPLIT` | pool | 0 = off | Start the decode GPU half before joining the CPU half instead of in one step. Nothing measured at one or two rows per step (7.43 vs 7.07-7.35 ms/step at one row), so the `launch/` recipes no longer set it |
 | `LK_POOL_WINDOW` | pool | 32 | Expected-reuse window in steps: an evicted expert is pumped back only if it is seen again within the window; illegal values clamp to min `8`, never disables |
 | `LK_POOL_INFLIGHT` | pool | `16` | in-flight DMA jobs / event-ring depth (backpressure cap = 8x; lower values false-positive under small batches) |
-| `LK_POOL_LAYERS` | pool | -- | RETIRED: pool membership is global (`LK_POOL_SLOTS` > 0); the parser is dead code and per-layer mixing with GPU prefill is not supported |
-| `LK_POOL_NO_STAGE` | pool | 1 | Fill path for an admitted expert. `1` (default): each NUMA fragment is DMA'd straight from the pinned host pages into its slot -- on an 8-node host that is ~16 async copies and no host copy (1.1 ms -> 0.13 ms per admission here). `0`: the coalesced staging ring (`LK_POOL_STAGE`), which memcpys the whole expert into pinned scratch first. **Which one wins depends on what the step waits on**: 0731/DSPARK prefers the default, dsv4.1/3090 the slab -- see [fill path](#gpu-pool-expert-cache) |
+| `LK_POOL_NO_STAGE` | pool | 1 | Fill path for an admitted expert, read by the C++ pool. `1` (default): each NUMA fragment is DMA'd straight from the pinned host pages into its slot -- on an 8-node host that is ~16 async copies and no host copy (1.1 ms -> 0.13 ms per admission here). `0`: the coalesced pinned-slab path, which memcpys the whole expert into scratch first. **Which one wins depends on what the step waits on**: 0731/DSPARK prefers the default, dsv4.1/3090 the slab -- see [fill path](#gpu-pool-expert-cache) |
 | `LK_VERIFY_RESIDENT` | spec | 1 | Ride-share for verify batches: the draft rows read the residency the real tokens built (resident expert -> GPU half, miss -> CPU). Their ids never enter the admission ledger unless `LK_VERIFY_PUMP` is set. `0` = draft rows always run on the CPU |
 
 **Fill path (`LK_POOL_NO_STAGE`).** Both paths are correctness-equivalent; the winner follows what the step waits on. Measured here on the same build: DeepSeek-V4-Flash-0731 / DSPARK prefers the default per-fragment DMA (an admission's host memcpy was the cost: 1.1 ms -> 0.13 ms, gather 1669-2494 -> 0 us); DeepSeek-V4.1-Flash-1017 TP2/3090 prefers the slab -- decode median **27.0 -> 21.1 tok/s** with the per-fragment default, **26.0** back with `LK_POOL_NO_STAGE=0` (same recipe, same log, 284 vs 11 samples). The three `launch/sglang_serve_dsv41_*.sh` recipes therefore pin `LK_POOL_NO_STAGE=0`; leave it unset (default `1`) everywhere else.
