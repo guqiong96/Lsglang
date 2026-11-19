@@ -131,9 +131,18 @@ class FullComponent(TreeComponent):
         node = result.best_match_node
         root_node = self.tree_core.root_node
         while node is not result.last_device_node and node is not root_node:
-            full_host = node.component_data[ct].host_value
-            if full_host is not None:
-                kv_host_hit += len(full_host)
+            cd = node.component_data[ct]
+            # An evicted node with a host copy -- not merely a node that HAS a
+            # host copy. A write-through leaves host_value behind even while the
+            # device value is still resident (a locked island, or Full-only
+            # residue under host-only auxiliary state), and the LOAD_BACK spec
+            # below stops at the first device-resident node. Counting those tokens
+            # here promises H2D that the spec never commits, and the scheduler's
+            # all-or-none load-back guard aborts the request (github issue 40:
+            # promised=105216 loaded=101632 -- the 3,584-token delta was exactly
+            # one such resident-and-host-backed prefix).
+            if cd.value is None and cd.host_value is not None:
+                kv_host_hit += len(cd.host_value)
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(

@@ -68,7 +68,15 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     result.best_match_node_id, node.id, result.last_device_node_id
                 )
             });
-            kv_host_hit += node.host_value_len(FULL);
+            // An evicted node with a host copy -- not merely a node that HAS a
+            // host copy. A write-through leaves host_value behind even while the
+            // device value is still resident, and the LOAD_BACK spec stops at the
+            // first device-resident node, so counting a coexisting copy promises
+            // H2D that is never transferred and the scheduler's all-or-none
+            // load-back guard aborts the request (github issue 40).
+            if !node.has_device_value(FULL) {
+                kv_host_hit += node.host_value_len(FULL);
+            }
             node_idx = parent;
         }
         if kv_host_hit > 0 {
