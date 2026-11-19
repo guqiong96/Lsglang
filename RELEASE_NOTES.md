@@ -1,3 +1,62 @@
+# lsglang 1.7.8 (from 1.7.7)
+
+Needs lk_moe 2.9.0 -- the two ship as a pair, and everything below is what
+1.7.8 together with 2.9.0 does.
+
+```
+pip install lsglang==1.7.8
+```
+
+## The draft model now uses the expert cache
+
+A speculative draft used to be kept out of the expert cache: its layer was pinned
+resident. On the Qwen3.8 MTP recipe the draft loaded 1.96 GB per rank, and 0.74 GB of
+that was its 512 experts sitting in private VRAM and contributing nothing to the hit
+rate. A draft now registers in the same cache as the real layers: its experts are
+cached, filled and evicted exactly like a real layer's, and instead of a private
+0.74 GB it takes one layer's worth of slots inside the region the real layers already
+book -- the same cache cost as one more ordinary layer.
+
+Booted both ways on one machine, same recipe: the draft's weight load went from
+1.96 GB to 1.22 GB per rank, the shared cache grew by that one layer's slots
+(4.26 -> 4.35 GiB, 48 pool layers becoming 49), the KV pool kept the same 524,288
+tokens, and the VRAM left at the end of boot went from 2.20 GB to 2.86 GB per rank.
+That margin is what long prompts were dying on.
+
+## BF16 drafts cost no extra VRAM
+
+16-bit experts take the expert cache like every other weight type now, so a draft
+whose experts are plain BF16 lives in the shared cache instead of asking for memory
+on the side. Before, 16-bit experts could not be pooled at all, so a BF16 draft cost
+its own expert weights in VRAM on top of everything the real layers use.
+
+## Bug fixes
+
+- **A partly host-cached prefix no longer aborts the request.** With
+  `--enable-hierarchical-cache`, a long request whose prefix had been backed up to
+  host memory while some of its nodes stayed on the GPU was promised back in full but
+  could only be loaded back in part. The mismatch refused the request and took the
+  scheduler process down with it. Measured on the DeepSeek-V4.1 recipe: 105,216 tokens
+  promised against 101,632 the load-back could commit, a gap of 3,584. The promise now
+  counts only the host copies that actually need a transfer back, so the request is
+  admitted and served.
+- **Starting a draft model no longer reports a spurious device fault.** With MTP
+  speculative decoding, the startup warmup ran the accepted-token path with zero
+  accepted tokens, which read one column before the index table -- a page that
+  page-aligned allocations leave unmapped, so the fault (`NVRM Xid 31`) was blamed on
+  whichever kernel launched next. Real requests always accept at least one token and
+  were never affected.
+
+## Knobs
+
+- Three knobs are retired and are not read any more: `LK_POOL_LAYERS` (pool membership
+  is global -- `LK_POOL_SLOTS`), `LK_POOL_STAGE` (the fill path is `LK_POOL_NO_STAGE`
+  alone) and `LK_GPU_PREFILL_SM120_W4A4` (use `LK_GPU_PREFILL_QUANT=w4a4`). Setting
+  them has no effect and prints nothing.
+- `LK_GPU_PREFILL_QUANT` no longer picks a different precision for you: a (GPU, engine,
+  precision) combination the legality table does not carry aborts startup with the
+  combination in the message, where it used to warn and run something else.
+
 # lsglang 1.7.7 (from 1.7.6)
 
 Needs lk_moe 2.8.5.
